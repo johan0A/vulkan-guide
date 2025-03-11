@@ -1,0 +1,22 @@
+.{
+    .name = .vulkan_tutorial,
+    .version = "0.0.0",
+    .fingerprint = 0xe6a82ece1521df,
+    .dependencies = .{
+        .vulkan = .{
+            .url = "git+https://github.com/Snektron/vulkan-zig#dcd538828c513919c3abf0bd55afacdce0576c61",
+            .hash = "vulkan-0.0.0-r7Ytxy5bAwASnqFlLMD4V42z3LolS8n7xv3RlbXhAhv0",
+        },
+        .glfw = .{
+            .url = "git+https://github.com/johan0A/glfw#c84032ef73a0656f7580af694753cea133830ffe",
+            .hash = "glfw-0.0.0-HH3dDq2oGQBW3QvYcHJRqcQhal4ZVpSPR8VKSr2awoVf",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}
