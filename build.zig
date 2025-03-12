@@ -17,18 +17,22 @@ pub fn build(b: *std.Build) void {
     });
     root_module.addImport("vulkan", vulkan.module("vulkan-zig"));
 
-    const glfw = b.dependency("glfw", .{
+    const sdl_dep = b.dependency("sdl", .{
         .target = target,
         .optimize = optimize,
+        .preferred_link_mode = .static,
     });
-    root_module.linkLibrary(glfw.artifact("glfw"));
+    root_module.linkLibrary(sdl_dep.artifact("SDL3"));
 
     const c_translate = b.addTranslateC(.{
-        .root_source_file = b.addWriteFiles().add("c.c", "#include <GLFW/glfw3.h>"),
+        .root_source_file = b.addWriteFiles().add("c.c",
+            \\#include <SDL3/SDL.h>
+            \\#include <SDL3/SDL_vulkan.h>
+        ),
         .target = target,
         .optimize = optimize,
     });
-    c_translate.addIncludePath(glfw.path("include"));
+    c_translate.addIncludePath(sdl_dep.path("include"));
     root_module.addImport("c", c_translate.createModule());
 
     {

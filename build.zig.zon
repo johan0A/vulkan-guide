@@ -7,9 +7,9 @@
             .url = "git+https://github.com/Snektron/vulkan-zig#dcd538828c513919c3abf0bd55afacdce0576c61",
             .hash = "vulkan-0.0.0-r7Ytxy5bAwASnqFlLMD4V42z3LolS8n7xv3RlbXhAhv0",
         },
-        .glfw = .{
-            .url = "git+https://github.com/johan0A/glfw#c84032ef73a0656f7580af694753cea133830ffe",
-            .hash = "glfw-0.0.0-HH3dDq2oGQBW3QvYcHJRqcQhal4ZVpSPR8VKSr2awoVf",
+        .sdl = .{
+            .url = "git+https://github.com/castholm/SDL#dbb1b96360658f5845ff6fac380c4f13d7276dc2",
+            .hash = "sdl-0.2.0+3.2.8-7uIn9FxHfQE325TK7b0qpgt10G3x1xl-3ZMOfTzxUg3C",
         },
     },
     .paths = .{
