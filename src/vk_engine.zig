@@ -27,10 +27,10 @@ pub const Dispatch = struct {
     pub const Base = vk.BaseWrapper(apis);
     pub const Instance = vk.InstanceWrapper(apis);
     pub const Device = vk.DeviceWrapper(apis);
-    base: Base,
-    instance: Instance,
-    device: Device,
 };
+
+const InstanceProxy = vk.InstanceProxy(apis);
+const DeviceProxy = vk.DeviceProxy(apis);
 
 const SwapChain = struct {
     vk_handle: vk.SwapchainKHR,
@@ -40,10 +40,10 @@ const SwapChain = struct {
     image_views: []vk.ImageView,
     extent: vk.Extent2D,
 
-    fn deinit(self: SwapChain, alloc: Allocator, device: vk.Device, device_dispatch: Dispatch.Device) void {
-        device_dispatch.destroySwapchainKHR(device, self.vk_handle, null);
+    fn deinit(self: SwapChain, alloc: Allocator, device: DeviceProxy) void {
+        device.destroySwapchainKHR(self.vk_handle, null);
         for (self.image_views) |image_view| {
-            device_dispatch.destroyImageView(device, image_view, null);
+            device.destroyImageView(image_view, null);
         }
         alloc.free(self.images);
         alloc.free(self.image_views);
@@ -53,7 +53,10 @@ const SwapChain = struct {
 pub const VulkanEngine = struct {
     window: *c.SDL_Window,
 
-    dispatch: Dispatch,
+    base_dispatch: Dispatch.Base,
+
+    instance_proxy: InstanceProxy,
+    device_proxy: DeviceProxy,
 
     instance: vk.Instance, // Vulkan library handle
     debug_messenger: vk.DebugUtilsMessengerEXT, // Vulkan debug output handle
@@ -74,35 +77,36 @@ pub const VulkanEngine = struct {
         const base_dispatch = try Dispatch.Base.load(@as(vk.PfnGetInstanceProcAddr, @ptrCast(c.SDL_Vulkan_GetVkGetInstanceProcAddr())));
 
         const instance = try vk_init.createVkInstance(base_dispatch, allocator);
-        const instance_dispatch = try Dispatch.Instance.load(instance, base_dispatch.dispatch.vkGetInstanceProcAddr);
+        const instance_dispatch = try allocator.create(Dispatch.Instance);
+        instance_dispatch.* = try Dispatch.Instance.load(instance, base_dispatch.dispatch.vkGetInstanceProcAddr);
+        const instance_proxy = InstanceProxy.init(instance, instance_dispatch);
 
         var surface: vk.SurfaceKHR = undefined;
         if (!c.SDL_Vulkan_CreateSurface(window, @ptrFromInt(@intFromEnum(instance)), null, @ptrCast(&surface))) return error.engine_init_failure;
 
-        const physical_device = try vk_init.pickPhysicalDevice(instance, instance_dispatch, surface, allocator);
-        const queue_family_indices = try vk_init.findQueueFamilies(physical_device, instance_dispatch, surface, allocator);
+        const physical_device = try vk_init.pickPhysicalDevice(instance_proxy, surface, allocator);
+        const queue_family_indices = try vk_init.findQueueFamilies(physical_device, instance_dispatch.*, surface, allocator);
 
-        const device = try vk_init.createLogicalDevice(physical_device, queue_family_indices, instance_dispatch);
-        const device_dispatch = try Dispatch.Device.load(device, instance_dispatch.dispatch.vkGetDeviceProcAddr);
+        const device = try vk_init.createLogicalDevice(physical_device, instance_dispatch.*, queue_family_indices);
+        const device_dispatch = try allocator.create(Dispatch.Device);
+        device_dispatch.* = try Dispatch.Device.load(device, instance_dispatch.dispatch.vkGetDeviceProcAddr);
+        const device_proxy = DeviceProxy.init(device, device_dispatch);
 
         return .{
             .window = window,
 
-            .dispatch = Dispatch{
-                .base = base_dispatch,
-                .device = device_dispatch,
-                .instance = instance_dispatch,
-            },
+            .base_dispatch = base_dispatch,
+            .instance_proxy = instance_proxy,
+            .device_proxy = device_proxy,
 
             .swapchain = try vk_init.createSwapchain(
                 allocator,
                 physical_device,
-                device,
+                device_proxy,
                 surface,
                 window_width,
                 window_height,
-                instance_dispatch,
-                device_dispatch,
+                instance_dispatch.*,
             ),
             .instance = instance,
             .debug_messenger = .null_handle,
@@ -113,11 +117,14 @@ pub const VulkanEngine = struct {
     }
 
     pub fn deinit(self: VulkanEngine, allocator: Allocator) void {
-        self.swapchain.deinit(allocator, self.device, self.dispatch.device);
+        self.swapchain.deinit(allocator, self.device_proxy);
 
-        self.dispatch.device.destroyDevice(self.device, null);
-        self.dispatch.instance.destroySurfaceKHR(self.instance, self.surface, null);
-        self.dispatch.instance.destroyInstance(self.instance, null);
+        self.device_proxy.destroyDevice(null);
+        self.instance_proxy.destroySurfaceKHR(self.surface, null);
+        self.instance_proxy.destroyInstance(null);
+
+        allocator.destroy(self.device_proxy.wrapper);
+        allocator.destroy(self.instance_proxy.wrapper);
     }
 
     fn init_vulkan() void {}
@@ -179,15 +186,15 @@ const vk_init = struct {
         }
     }
 
-    pub fn pickPhysicalDevice(instance: vk.Instance, instance_dispatch: Dispatch.Instance, surface: vk.SurfaceKHR, alloc: Allocator) !vk.PhysicalDevice {
-        const devices = try instance_dispatch.enumeratePhysicalDevicesAlloc(instance, alloc);
-        defer alloc.free(devices);
+    pub fn pickPhysicalDevice(instance: InstanceProxy, surface: vk.SurfaceKHR, alloc: Allocator) !vk.PhysicalDevice {
+        const physical_devices = try instance.enumeratePhysicalDevicesAlloc(alloc);
+        defer alloc.free(physical_devices);
 
-        if (devices.len == 0) return error.NoPhysicalDeviceFound;
+        if (physical_devices.len == 0) return error.NoPhysicalDeviceFound;
 
-        for (devices) |device| {
-            if (try isPhysicalDeviceSuitable(device, instance_dispatch, surface, alloc)) {
-                return device;
+        for (physical_devices) |physical_device| {
+            if (try isPhysicalDeviceSuitable(physical_device, instance.wrapper.*, surface, alloc)) {
+                return physical_device;
             }
         }
 
@@ -263,7 +270,7 @@ const vk_init = struct {
         return true;
     }
 
-    pub fn createLogicalDevice(physical_device: vk.PhysicalDevice, queue_family_indices: QueueFamilyIndices, instance_dispatch: Dispatch.Instance) !vk.Device {
+    pub fn createLogicalDevice(physical_device: vk.PhysicalDevice, instance_dispatch: Dispatch.Instance, queue_family_indices: QueueFamilyIndices) !vk.Device {
         const indices = [_]u32{
             queue_family_indices.graphics_family.?,
             queue_family_indices.present_family.?,
@@ -299,9 +306,6 @@ const vk_init = struct {
             .p_next = @ptrCast(&device_features_vk12),
             .p_queue_create_infos = queue_create_infos.items.ptr,
             .queue_create_info_count = @intCast(queue_create_infos.items.len),
-            // TODO: apparently validation layers for device have been deprecated so should remove ?
-            .pp_enabled_layer_names = if (enable_validation_layers) @ptrCast(&validation_layers) else null,
-            .enabled_layer_count = if (enable_validation_layers) @intCast(validation_layers.len) else 0,
             .pp_enabled_extension_names = @ptrCast(&required_device_extensions),
             .enabled_extension_count = required_device_extensions.len,
         };
@@ -312,12 +316,11 @@ const vk_init = struct {
     fn createSwapchain(
         allocator: std.mem.Allocator,
         physical_device: vk.PhysicalDevice,
-        device: vk.Device,
+        device: DeviceProxy,
         surface: vk.SurfaceKHR,
         window_width: u32,
         window_height: u32,
         instance_dispatch: Dispatch.Instance,
-        device_dispatch: Dispatch.Device,
     ) !SwapChain {
         const surface_capabilities = try instance_dispatch.getPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface);
         // Get surface formats
@@ -387,12 +390,12 @@ const vk_init = struct {
             .old_swapchain = .null_handle,
         };
 
-        const vk_handle = try device_dispatch.createSwapchainKHR(device, &swapchain_create_info, null);
-        errdefer device_dispatch.destroySwapchainKHR(device, vk_handle, null);
+        const vk_handle = try device.createSwapchainKHR(&swapchain_create_info, null);
+        errdefer device.destroySwapchainKHR(vk_handle, null);
 
         // Get swapchain images
         var swapchain_image_count: u32 = 0;
-        _ = try device_dispatch.getSwapchainImagesKHR(device, vk_handle, &swapchain_image_count, null);
+        _ = try device.getSwapchainImagesKHR(vk_handle, &swapchain_image_count, null);
 
         // Allocate arrays for images and image views
         const images = try allocator.alloc(vk.Image, swapchain_image_count);
@@ -402,7 +405,7 @@ const vk_init = struct {
         errdefer allocator.free(image_views);
 
         // Get the swapchain images
-        _ = try device_dispatch.getSwapchainImagesKHR(device, vk_handle, &swapchain_image_count, images.ptr);
+        _ = try device.getSwapchainImagesKHR(vk_handle, &swapchain_image_count, images.ptr);
 
         // Create image views for each swapchain image
         const subresource_range = vk.ImageSubresourceRange{
@@ -429,11 +432,11 @@ const vk_init = struct {
 
             errdefer {
                 for (image_views[0..i]) |view| {
-                    device_dispatch.destroyImageView(device, view, null);
+                    device.destroyImageView(view, null);
                 }
             }
 
-            image_views[i] = try device_dispatch.createImageView(device, &image_view_create_info, null);
+            image_views[i] = try device.createImageView(&image_view_create_info, null);
         }
 
         return .{
