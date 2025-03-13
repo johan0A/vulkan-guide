@@ -50,6 +50,17 @@ const SwapChain = struct {
     }
 };
 
+const FrameData = struct {
+    const FRAME_OVERLAP = 2;
+
+    command_pool: vk.CommandPool,
+    main_command_buffer: vk.CommandBuffer,
+
+    swapchain_semaphore: vk.Semaphore,
+    render_semaphore: vk.Semaphore,
+    render_fence: vk.Fence,
+};
+
 pub const VulkanEngine = struct {
     window: *c.SDL_Window,
 
@@ -65,6 +76,79 @@ pub const VulkanEngine = struct {
     surface: vk.SurfaceKHR, // Vulkan window surface
 
     swapchain: SwapChain,
+
+    graphics_queue: vk.Queue,
+    graphics_queue_family: u32,
+
+    frame_number: u64,
+    frames: [FrameData.FRAME_OVERLAP]FrameData,
+
+    pub fn draw(self: *VulkanEngine) !void {
+        _ = try self.device_proxy.waitForFences(1, (&self.currentFrame().render_fence)[0..1], vk.TRUE, 1e9);
+        _ = try self.device_proxy.resetFences(1, (&self.currentFrame().render_fence)[0..1]);
+
+        const swapchain_image_index: u32 = (try self.device_proxy.acquireNextImageKHR(
+            self.swapchain.vk_handle,
+            1e9,
+            self.currentFrame().swapchain_semaphore,
+            .null_handle,
+        )).image_index;
+
+        //naming it cmd for shorter writing
+        const cmd: vk.CommandBuffer = self.currentFrame().main_command_buffer;
+
+        // now that we are sure that the commands finished executing, we can safely
+        // reset the command buffer to begin recording again.
+        try self.device_proxy.resetCommandBuffer(cmd, .{});
+
+        // begin the command buffer recording. We will use this command buffer exactly once, so we want to let vulkan know that
+        try self.device_proxy.beginCommandBuffer(cmd, &.{ .flags = .{ .one_time_submit_bit = true } });
+        {
+            //make the swapchain image into writeable mode before rendering
+            vk_image.transition_image(self.device_proxy, cmd, self.swapchain.images[swapchain_image_index], .undefined, .general);
+
+            const flash = @abs(std.math.sin(@as(f32, @floatFromInt(self.frame_number)) / 120));
+            var clear_value: vk.ClearColorValue = .{ .float_32 = .{ 0, 0, flash, 1 } };
+
+            const clear_range: vk.ImageSubresourceRange = vk_init.imageSubresourceRange(.{ .color_bit = true });
+
+            self.device_proxy.cmdClearColorImage(cmd, self.swapchain.images[swapchain_image_index], .general, &clear_value, 1, (&clear_range)[0..1]);
+
+            //make the swapchain image into presentable mode
+            vk_image.transition_image(self.device_proxy, cmd, self.swapchain.images[swapchain_image_index], .general, .present_src_khr);
+        }
+        try self.device_proxy.endCommandBuffer(cmd);
+
+        //prepare the submission to the queue.
+        //we want to wait on the _presentSemaphore, as that semaphore is signaled when the swapchain is ready
+        //we will signal the _renderSemaphore, to signal that rendering has finished
+        {
+            const cmd_info: vk.CommandBufferSubmitInfo = vk_init.commandBufferSubmitInfo(cmd);
+            const wait_info: vk.SemaphoreSubmitInfo = vk_init.semaphoreSubmitInfo(.{ .color_attachment_output_bit = true }, self.currentFrame().swapchain_semaphore);
+            const signal_info: vk.SemaphoreSubmitInfo = vk_init.semaphoreSubmitInfo(.{ .all_graphics_bit = true }, self.currentFrame().render_semaphore);
+
+            const submit_info = vk_init.submitInfo(&cmd_info, &signal_info, &wait_info);
+
+            //submit command buffer to the queue and execute it.
+            // _render_fence will now block until the graphic commands finish execution
+            try self.device_proxy.queueSubmit2(self.graphics_queue, 1, (&submit_info)[0..1], self.currentFrame().render_fence);
+        }
+
+        const present_info: vk.PresentInfoKHR = .{
+            .p_swapchains = (&self.swapchain.vk_handle)[0..1],
+            .swapchain_count = 1,
+            .p_wait_semaphores = (&self.currentFrame().render_semaphore)[0..1],
+            .wait_semaphore_count = 1,
+            .p_image_indices = (&swapchain_image_index)[0..1],
+        };
+        _ = try self.device_proxy.queuePresentKHR(self.graphics_queue, &present_info);
+
+        self.frame_number += 1;
+    }
+
+    pub inline fn currentFrame(self: *VulkanEngine) *FrameData {
+        return &self.frames[self.frame_number % FrameData.FRAME_OVERLAP];
+    }
 
     pub fn init(allocator: Allocator) !VulkanEngine {
         if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.engine_init_failure;
@@ -92,13 +176,15 @@ pub const VulkanEngine = struct {
         device_dispatch.* = try Dispatch.Device.load(device, instance_dispatch.dispatch.vkGetDeviceProcAddr);
         const device_proxy = DeviceProxy.init(device, device_dispatch);
 
+        var frames: [FrameData.FRAME_OVERLAP]FrameData = undefined;
+        try vk_init.initFramesCommands(device_proxy, queue_family_indices.graphics_family.?, &frames);
+        try vk_init.initFramesSyncStructures(device_proxy, &frames);
+
         return .{
             .window = window,
-
             .base_dispatch = base_dispatch,
             .instance_proxy = instance_proxy,
             .device_proxy = device_proxy,
-
             .swapchain = try vk_init.createSwapchain(
                 allocator,
                 physical_device,
@@ -113,10 +199,25 @@ pub const VulkanEngine = struct {
             .chosen_gpu = physical_device,
             .device = device,
             .surface = surface,
+
+            .graphics_queue = device_proxy.getDeviceQueue(queue_family_indices.graphics_family.?, 0),
+            .graphics_queue_family = queue_family_indices.graphics_family.?,
+
+            .frame_number = 0,
+            .frames = frames,
         };
     }
 
     pub fn deinit(self: VulkanEngine, allocator: Allocator) void {
+        self.device_proxy.deviceWaitIdle() catch @panic(""); // TODO
+
+        for (0..self.frames.len) |i| {
+            self.device_proxy.destroyCommandPool(self.frames[i].command_pool, null);
+            self.device_proxy.destroyFence(self.frames[i].render_fence, null);
+            self.device_proxy.destroySemaphore(self.frames[i].swapchain_semaphore, null);
+            self.device_proxy.destroySemaphore(self.frames[i].render_semaphore, null);
+        }
+
         self.swapchain.deinit(allocator, self.device_proxy);
 
         self.device_proxy.destroyDevice(null);
@@ -129,11 +230,106 @@ pub const VulkanEngine = struct {
 
     fn init_vulkan() void {}
     fn init_swapchain() void {}
-    fn init_commands() void {}
     fn init_sync_structures() void {}
 };
 
+const vk_image = struct {
+    fn transition_image(device: DeviceProxy, cmd: vk.CommandBuffer, image: vk.Image, currentLayout: vk.ImageLayout, newLayout: vk.ImageLayout) void {
+        const imageBarrier: vk.ImageMemoryBarrier2 = .{
+            .src_stage_mask = .{ .all_commands_bit = true },
+            .src_access_mask = .{ .memory_write_bit = true },
+            .dst_stage_mask = .{ .all_commands_bit = true },
+            .dst_access_mask = .{
+                .memory_write_bit = true,
+                .memory_read_bit = true,
+            },
+            .old_layout = currentLayout,
+            .new_layout = newLayout,
+            .subresource_range = vk_init.imageSubresourceRange(
+                if (newLayout == .depth_attachment_optimal) .{ .depth_bit = true } else .{ .color_bit = true },
+            ),
+            .image = image,
+            .src_queue_family_index = 0,
+            .dst_queue_family_index = 0,
+        };
+
+        const dep_info: vk.DependencyInfo = .{
+            .image_memory_barrier_count = 1,
+            .p_image_memory_barriers = (&imageBarrier)[0..1],
+        };
+
+        device.cmdPipelineBarrier2(cmd, &dep_info);
+    }
+};
+
 const vk_init = struct {
+    fn semaphoreSubmitInfo(stage_mask: vk.PipelineStageFlags2, semaphore: vk.Semaphore) vk.SemaphoreSubmitInfo {
+        return vk.SemaphoreSubmitInfo{
+            .semaphore = semaphore,
+            .stage_mask = stage_mask,
+            .device_index = 0,
+            .value = 1,
+        };
+    }
+
+    fn commandBufferSubmitInfo(cmd: vk.CommandBuffer) vk.CommandBufferSubmitInfo {
+        return vk.CommandBufferSubmitInfo{
+            .command_buffer = cmd,
+            .device_mask = 0,
+        };
+    }
+
+    fn submitInfo(cmd: *const vk.CommandBufferSubmitInfo, signal_semaphore_info: ?*const vk.SemaphoreSubmitInfo, wait_semaphore_info: ?*const vk.SemaphoreSubmitInfo) vk.SubmitInfo2 {
+        return vk.SubmitInfo2{
+            .wait_semaphore_info_count = if (wait_semaphore_info == null) 0 else 1,
+            .p_wait_semaphore_infos = if (wait_semaphore_info) |info| info[0..1] else null,
+
+            .signal_semaphore_info_count = if (signal_semaphore_info == null) 0 else 1,
+            .p_signal_semaphore_infos = if (signal_semaphore_info) |info| info[0..1] else null,
+
+            .command_buffer_info_count = 1,
+            .p_command_buffer_infos = cmd[0..1],
+        };
+    }
+
+    fn imageSubresourceRange(aspect_mask: vk.ImageAspectFlags) vk.ImageSubresourceRange {
+        const subImage: vk.ImageSubresourceRange = .{
+            .aspect_mask = aspect_mask,
+            .base_mip_level = 0,
+            .level_count = vk.REMAINING_MIP_LEVELS,
+            .base_array_layer = 0,
+            .layer_count = vk.REMAINING_ARRAY_LAYERS,
+        };
+
+        return subImage;
+    }
+
+    fn initFramesCommands(device: DeviceProxy, graphics_queue_family_index: u32, frames: *[FrameData.FRAME_OVERLAP]FrameData) !void {
+        const command_pool_info: vk.CommandPoolCreateInfo = .{
+            .flags = .{ .reset_command_buffer_bit = true },
+            .queue_family_index = graphics_queue_family_index,
+        };
+
+        for (0..frames.len) |i| {
+            frames[i].command_pool = try device.createCommandPool(&command_pool_info, null);
+
+            const cmd_alloc_info: vk.CommandBufferAllocateInfo = .{
+                .command_pool = frames[i].command_pool,
+                .command_buffer_count = 1,
+                .level = .primary,
+            };
+            try device.allocateCommandBuffers(&cmd_alloc_info, (&frames[i].main_command_buffer)[0..1]);
+        }
+    }
+
+    fn initFramesSyncStructures(device: DeviceProxy, frames: *[FrameData.FRAME_OVERLAP]FrameData) !void {
+        for (0..frames.len) |i| {
+            frames[i].render_fence = try device.createFence(&.{ .flags = .{ .signaled_bit = true } }, null);
+            frames[i].swapchain_semaphore = try device.createSemaphore(&.{}, null);
+            frames[i].render_semaphore = try device.createSemaphore(&.{}, null);
+        }
+    }
+
     pub fn createVkInstance(base_dispatch: Dispatch.Base, alloc: Allocator) !vk.Instance {
         const appinfo = vk.ApplicationInfo{
             .p_application_name = "Vulkan Tutorial",
@@ -287,7 +483,7 @@ const vk_init = struct {
             queue_create_infos.appendAssumeCapacity(.{
                 .queue_family_index = indice,
                 .queue_count = 1,
-                .p_queue_priorities = @ptrCast(&queue_prioritie),
+                .p_queue_priorities = (&queue_prioritie)[0..1],
             });
         }
 
@@ -297,13 +493,13 @@ const vk_init = struct {
         };
 
         var device_features_vk12 = vk.PhysicalDeviceVulkan12Features{
-            .p_next = @ptrCast(&device_features_vk13),
+            .p_next = (&device_features_vk13)[0..1],
             .buffer_device_address = vk.TRUE,
             .descriptor_indexing = vk.TRUE,
         };
 
         const create_info = vk.DeviceCreateInfo{
-            .p_next = @ptrCast(&device_features_vk12),
+            .p_next = (&device_features_vk12)[0..1],
             .p_queue_create_infos = queue_create_infos.items.ptr,
             .queue_create_info_count = @intCast(queue_create_infos.items.len),
             .pp_enabled_extension_names = @ptrCast(&required_device_extensions),
@@ -379,7 +575,11 @@ const vk_init = struct {
             .image_color_space = swapchain_image_color_space,
             .image_extent = swapchain_extent,
             .image_array_layers = 1,
-            .image_usage = .{ .color_attachment_bit = true },
+            .image_usage = .{
+                .transfer_src_bit = true,
+                .color_attachment_bit = true,
+                .transfer_dst_bit = true,
+            },
             .image_sharing_mode = .exclusive,
             .queue_family_index_count = 0,
             .p_queue_family_indices = null,

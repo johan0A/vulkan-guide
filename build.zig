@@ -19,7 +19,7 @@ pub fn build(b: *std.Build) void {
 
     const sdl_dep = b.dependency("sdl", .{
         .target = target,
-        .optimize = optimize,
+        .optimize = .ReleaseFast, // TODO: change to `optimize` when SDL dep is fixed https://github.com/castholm/SDL/issues/9
         .preferred_link_mode = .static,
     });
     root_module.linkLibrary(sdl_dep.artifact("SDL3"));
@@ -37,6 +37,7 @@ pub fn build(b: *std.Build) void {
 
     {
         const exe = b.addExecutable(.{ .name = name orelse "zig-exe-template", .root_module = root_module });
+        // exe.subsystem = .Windows;
 
         b.installArtifact(exe);
         const run_cmd = b.addRunArtifact(exe);
