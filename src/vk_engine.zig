@@ -33,7 +33,7 @@ const InstanceProxy = vk.InstanceProxy(apis);
 const DeviceProxy = vk.DeviceProxy(apis);
 
 const SwapChain = struct {
-    vk_handle: vk.SwapchainKHR,
+    handle: vk.SwapchainKHR,
     image_format: vk.Format,
     image_color_space: vk.ColorSpaceKHR,
     images: []vk.Image,
@@ -41,7 +41,7 @@ const SwapChain = struct {
     extent: vk.Extent2D,
 
     fn deinit(self: SwapChain, alloc: Allocator, device: DeviceProxy) void {
-        device.destroySwapchainKHR(self.vk_handle, null);
+        device.destroySwapchainKHR(self.handle, null);
         for (self.image_views) |image_view| {
             device.destroyImageView(image_view, null);
         }
@@ -66,13 +66,11 @@ pub const VulkanEngine = struct {
 
     base_dispatch: Dispatch.Base,
 
-    instance_proxy: InstanceProxy,
-    device_proxy: DeviceProxy,
+    instance: InstanceProxy,
+    device: DeviceProxy,
 
-    instance: vk.Instance, // Vulkan library handle
     debug_messenger: vk.DebugUtilsMessengerEXT, // Vulkan debug output handle
     chosen_gpu: vk.PhysicalDevice, // GPU chosen as the default device
-    device: vk.Device, // Vulkan device for commands
     surface: vk.SurfaceKHR, // Vulkan window surface
 
     swapchain: SwapChain,
@@ -84,11 +82,11 @@ pub const VulkanEngine = struct {
     frames: [FrameData.FRAME_OVERLAP]FrameData,
 
     pub fn draw(self: *VulkanEngine) !void {
-        _ = try self.device_proxy.waitForFences(1, (&self.currentFrame().render_fence)[0..1], vk.TRUE, 1e9);
-        _ = try self.device_proxy.resetFences(1, (&self.currentFrame().render_fence)[0..1]);
+        _ = try self.device.waitForFences(1, (&self.currentFrame().render_fence)[0..1], vk.TRUE, 1e9);
+        _ = try self.device.resetFences(1, (&self.currentFrame().render_fence)[0..1]);
 
-        const swapchain_image_index: u32 = (try self.device_proxy.acquireNextImageKHR(
-            self.swapchain.vk_handle,
+        const swapchain_image_index: u32 = (try self.device.acquireNextImageKHR(
+            self.swapchain.handle,
             1e9,
             self.currentFrame().swapchain_semaphore,
             .null_handle,
@@ -99,25 +97,25 @@ pub const VulkanEngine = struct {
 
         // now that we are sure that the commands finished executing, we can safely
         // reset the command buffer to begin recording again.
-        try self.device_proxy.resetCommandBuffer(cmd, .{});
+        try self.device.resetCommandBuffer(cmd, .{});
 
         // begin the command buffer recording. We will use this command buffer exactly once, so we want to let vulkan know that
-        try self.device_proxy.beginCommandBuffer(cmd, &.{ .flags = .{ .one_time_submit_bit = true } });
+        try self.device.beginCommandBuffer(cmd, &.{ .flags = .{ .one_time_submit_bit = true } });
         {
             //make the swapchain image into writeable mode before rendering
-            vk_image.transition_image(self.device_proxy, cmd, self.swapchain.images[swapchain_image_index], .undefined, .general);
+            vk_image.transition_image(self.device, cmd, self.swapchain.images[swapchain_image_index], .undefined, .general);
 
             const flash = @abs(std.math.sin(@as(f32, @floatFromInt(self.frame_number)) / 120));
             var clear_value: vk.ClearColorValue = .{ .float_32 = .{ 0, 0, flash, 1 } };
 
             const clear_range: vk.ImageSubresourceRange = vk_init.imageSubresourceRange(.{ .color_bit = true });
 
-            self.device_proxy.cmdClearColorImage(cmd, self.swapchain.images[swapchain_image_index], .general, &clear_value, 1, (&clear_range)[0..1]);
+            self.device.cmdClearColorImage(cmd, self.swapchain.images[swapchain_image_index], .general, &clear_value, 1, (&clear_range)[0..1]);
 
             //make the swapchain image into presentable mode
-            vk_image.transition_image(self.device_proxy, cmd, self.swapchain.images[swapchain_image_index], .general, .present_src_khr);
+            vk_image.transition_image(self.device, cmd, self.swapchain.images[swapchain_image_index], .general, .present_src_khr);
         }
-        try self.device_proxy.endCommandBuffer(cmd);
+        try self.device.endCommandBuffer(cmd);
 
         //prepare the submission to the queue.
         //we want to wait on the _presentSemaphore, as that semaphore is signaled when the swapchain is ready
@@ -131,17 +129,17 @@ pub const VulkanEngine = struct {
 
             //submit command buffer to the queue and execute it.
             // _render_fence will now block until the graphic commands finish execution
-            try self.device_proxy.queueSubmit2(self.graphics_queue, 1, (&submit_info)[0..1], self.currentFrame().render_fence);
+            try self.device.queueSubmit2(self.graphics_queue, 1, (&submit_info)[0..1], self.currentFrame().render_fence);
         }
 
         const present_info: vk.PresentInfoKHR = .{
-            .p_swapchains = (&self.swapchain.vk_handle)[0..1],
+            .p_swapchains = (&self.swapchain.handle)[0..1],
             .swapchain_count = 1,
             .p_wait_semaphores = (&self.currentFrame().render_semaphore)[0..1],
             .wait_semaphore_count = 1,
             .p_image_indices = (&swapchain_image_index)[0..1],
         };
-        _ = try self.device_proxy.queuePresentKHR(self.graphics_queue, &present_info);
+        _ = try self.device.queuePresentKHR(self.graphics_queue, &present_info);
 
         self.frame_number += 1;
     }
@@ -183,8 +181,8 @@ pub const VulkanEngine = struct {
         return .{
             .window = window,
             .base_dispatch = base_dispatch,
-            .instance_proxy = instance_proxy,
-            .device_proxy = device_proxy,
+            .instance = instance_proxy,
+            .device = device_proxy,
             .swapchain = try vk_init.createSwapchain(
                 allocator,
                 physical_device,
@@ -194,10 +192,8 @@ pub const VulkanEngine = struct {
                 window_height,
                 instance_dispatch.*,
             ),
-            .instance = instance,
             .debug_messenger = .null_handle,
             .chosen_gpu = physical_device,
-            .device = device,
             .surface = surface,
 
             .graphics_queue = device_proxy.getDeviceQueue(queue_family_indices.graphics_family.?, 0),
@@ -209,23 +205,23 @@ pub const VulkanEngine = struct {
     }
 
     pub fn deinit(self: VulkanEngine, allocator: Allocator) void {
-        self.device_proxy.deviceWaitIdle() catch @panic(""); // TODO
+        self.device.deviceWaitIdle() catch @panic(""); // TODO
 
         for (0..self.frames.len) |i| {
-            self.device_proxy.destroyCommandPool(self.frames[i].command_pool, null);
-            self.device_proxy.destroyFence(self.frames[i].render_fence, null);
-            self.device_proxy.destroySemaphore(self.frames[i].swapchain_semaphore, null);
-            self.device_proxy.destroySemaphore(self.frames[i].render_semaphore, null);
+            self.device.destroyCommandPool(self.frames[i].command_pool, null);
+            self.device.destroyFence(self.frames[i].render_fence, null);
+            self.device.destroySemaphore(self.frames[i].swapchain_semaphore, null);
+            self.device.destroySemaphore(self.frames[i].render_semaphore, null);
         }
 
-        self.swapchain.deinit(allocator, self.device_proxy);
+        self.swapchain.deinit(allocator, self.device);
 
-        self.device_proxy.destroyDevice(null);
-        self.instance_proxy.destroySurfaceKHR(self.surface, null);
-        self.instance_proxy.destroyInstance(null);
+        self.device.destroyDevice(null);
+        self.instance.destroySurfaceKHR(self.surface, null);
+        self.instance.destroyInstance(null);
 
-        allocator.destroy(self.device_proxy.wrapper);
-        allocator.destroy(self.instance_proxy.wrapper);
+        allocator.destroy(self.device.wrapper);
+        allocator.destroy(self.instance.wrapper);
     }
 
     fn init_vulkan() void {}
@@ -590,12 +586,12 @@ const vk_init = struct {
             .old_swapchain = .null_handle,
         };
 
-        const vk_handle = try device.createSwapchainKHR(&swapchain_create_info, null);
-        errdefer device.destroySwapchainKHR(vk_handle, null);
+        const swapchain_handle = try device.createSwapchainKHR(&swapchain_create_info, null);
+        errdefer device.destroySwapchainKHR(swapchain_handle, null);
 
         // Get swapchain images
         var swapchain_image_count: u32 = 0;
-        _ = try device.getSwapchainImagesKHR(vk_handle, &swapchain_image_count, null);
+        _ = try device.getSwapchainImagesKHR(swapchain_handle, &swapchain_image_count, null);
 
         // Allocate arrays for images and image views
         const images = try allocator.alloc(vk.Image, swapchain_image_count);
@@ -605,7 +601,7 @@ const vk_init = struct {
         errdefer allocator.free(image_views);
 
         // Get the swapchain images
-        _ = try device.getSwapchainImagesKHR(vk_handle, &swapchain_image_count, images.ptr);
+        _ = try device.getSwapchainImagesKHR(swapchain_handle, &swapchain_image_count, images.ptr);
 
         // Create image views for each swapchain image
         const subresource_range = vk.ImageSubresourceRange{
@@ -640,7 +636,7 @@ const vk_init = struct {
         }
 
         return .{
-            .vk_handle = vk_handle,
+            .handle = swapchain_handle,
             .image_format = swapchain_image_format,
             .image_color_space = swapchain_image_color_space,
             .images = images,
