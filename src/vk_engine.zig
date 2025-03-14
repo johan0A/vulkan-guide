@@ -29,6 +29,31 @@ pub const Dispatch = struct {
     pub const Device = vk.DeviceWrapper(apis);
 };
 
+const DeletionQueue = struct {
+    const QueueItem = union(enum) {
+        fn deinit(self: QueueItem) void {
+            switch (self) {}
+        }
+    };
+
+    queue: std.ArrayListUnmanaged(QueueItem),
+
+    pub const init: DeletionQueue = .{
+        .queue = .empty,
+    };
+
+    pub fn flush(self: *DeletionQueue) void {
+        for (self.queue.items) |item| {
+            item.deinit();
+        }
+        self.queue.clearRetainingCapacity();
+    }
+
+    pub fn append(self: *DeletionQueue, alloc: Allocator, item: QueueItem) !void {
+        try self.queue.append(alloc, item);
+    }
+};
+
 const InstanceProxy = vk.InstanceProxy(apis);
 const DeviceProxy = vk.DeviceProxy(apis);
 
@@ -59,6 +84,8 @@ const FrameData = struct {
     swapchain_semaphore: vk.Semaphore,
     render_semaphore: vk.Semaphore,
     render_fence: vk.Fence,
+
+    deletion_queue: DeletionQueue,
 };
 
 pub const VulkanEngine = struct {
@@ -80,6 +107,8 @@ pub const VulkanEngine = struct {
 
     frame_number: u64,
     frames: [FrameData.FRAME_OVERLAP]FrameData,
+
+    main_deletion_queue: DeletionQueue,
 
     pub fn draw(self: *VulkanEngine) !void {
         _ = try self.device.waitForFences(1, (&self.currentFrame().render_fence)[0..1], vk.TRUE, 1e9);
@@ -175,8 +204,9 @@ pub const VulkanEngine = struct {
         const device_proxy = DeviceProxy.init(device, device_dispatch);
 
         var frames: [FrameData.FRAME_OVERLAP]FrameData = undefined;
-        try vk_init.initFramesCommands(device_proxy, queue_family_indices.graphics_family.?, &frames);
-        try vk_init.initFramesSyncStructures(device_proxy, &frames);
+        for (&frames) |*frame| {
+            frame.* = try vk_init.initFrame(device_proxy, queue_family_indices.graphics_family.?);
+        }
 
         return .{
             .window = window,
@@ -201,18 +231,25 @@ pub const VulkanEngine = struct {
 
             .frame_number = 0,
             .frames = frames,
+
+            .main_deletion_queue = .init,
         };
     }
 
-    pub fn deinit(self: VulkanEngine, allocator: Allocator) void {
+    pub fn deinit(self: *VulkanEngine, allocator: Allocator) void {
         self.device.deviceWaitIdle() catch @panic(""); // TODO
 
         for (0..self.frames.len) |i| {
             self.device.destroyCommandPool(self.frames[i].command_pool, null);
+
             self.device.destroyFence(self.frames[i].render_fence, null);
             self.device.destroySemaphore(self.frames[i].swapchain_semaphore, null);
             self.device.destroySemaphore(self.frames[i].render_semaphore, null);
+
+            self.frames[i].deletion_queue.flush();
         }
+
+        self.main_deletion_queue.flush();
 
         self.swapchain.deinit(allocator, self.device);
 
@@ -300,30 +337,30 @@ const vk_init = struct {
         return subImage;
     }
 
-    fn initFramesCommands(device: DeviceProxy, graphics_queue_family_index: u32, frames: *[FrameData.FRAME_OVERLAP]FrameData) !void {
+    fn initFrame(device: DeviceProxy, graphics_queue_family_index: u32) !FrameData {
         const command_pool_info: vk.CommandPoolCreateInfo = .{
             .flags = .{ .reset_command_buffer_bit = true },
             .queue_family_index = graphics_queue_family_index,
         };
 
-        for (0..frames.len) |i| {
-            frames[i].command_pool = try device.createCommandPool(&command_pool_info, null);
+        const command_pool = try device.createCommandPool(&command_pool_info, null);
 
-            const cmd_alloc_info: vk.CommandBufferAllocateInfo = .{
-                .command_pool = frames[i].command_pool,
-                .command_buffer_count = 1,
-                .level = .primary,
-            };
-            try device.allocateCommandBuffers(&cmd_alloc_info, (&frames[i].main_command_buffer)[0..1]);
-        }
-    }
+        var main_command_buffer: vk.CommandBuffer = undefined;
+        const cmd_alloc_info: vk.CommandBufferAllocateInfo = .{
+            .command_pool = command_pool,
+            .command_buffer_count = 1,
+            .level = .primary,
+        };
+        try device.allocateCommandBuffers(&cmd_alloc_info, (&main_command_buffer)[0..1]);
 
-    fn initFramesSyncStructures(device: DeviceProxy, frames: *[FrameData.FRAME_OVERLAP]FrameData) !void {
-        for (0..frames.len) |i| {
-            frames[i].render_fence = try device.createFence(&.{ .flags = .{ .signaled_bit = true } }, null);
-            frames[i].swapchain_semaphore = try device.createSemaphore(&.{}, null);
-            frames[i].render_semaphore = try device.createSemaphore(&.{}, null);
-        }
+        return .{
+            .command_pool = command_pool,
+            .render_fence = try device.createFence(&.{ .flags = .{ .signaled_bit = true } }, null),
+            .swapchain_semaphore = try device.createSemaphore(&.{}, null),
+            .render_semaphore = try device.createSemaphore(&.{}, null),
+            .main_command_buffer = main_command_buffer,
+            .deletion_queue = .init,
+        };
     }
 
     pub fn createVkInstance(base_dispatch: Dispatch.Base, alloc: Allocator) !vk.Instance {
