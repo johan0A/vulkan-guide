@@ -24,16 +24,24 @@ pub fn build(b: *std.Build) void {
     });
     root_module.linkLibrary(sdl_dep.artifact("SDL3"));
 
+    const vma = b.dependency("VulkanMemoryAllocator", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    root_module.linkLibrary(vma.artifact("VulkanMemoryAllocator"));
+
     const c_translate = b.addTranslateC(.{
-        .root_source_file = b.addWriteFiles().add("c.c",
+        .root_source_file = b.addWriteFiles().add("c.h",
             \\#include <SDL3/SDL.h>
             \\#include <SDL3/SDL_vulkan.h>
+            \\#include <vk_mem_alloc.h>
         ),
         .target = target,
         .optimize = optimize,
     });
     c_translate.addIncludePath(sdl_dep.path("include"));
     root_module.addImport("c", c_translate.createModule());
+    c_translate.addIncludePath(vma.artifact("VulkanMemoryAllocator").getEmittedIncludeTree());
 
     {
         const exe = b.addExecutable(.{ .name = name orelse "zig-exe-template", .root_module = root_module });

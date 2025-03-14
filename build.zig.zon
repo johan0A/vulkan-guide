@@ -11,6 +11,10 @@
             .url = "git+https://github.com/castholm/SDL#dbb1b96360658f5845ff6fac380c4f13d7276dc2",
             .hash = "sdl-0.2.0+3.2.8-7uIn9FxHfQE325TK7b0qpgt10G3x1xl-3ZMOfTzxUg3C",
         },
+        .VulkanMemoryAllocator = .{
+            .url = "git+https://github.com/johan0A/VulkanMemoryAllocator#821650428f4feb8ff5f62e49980e2bc1577dff95",
+            .hash = "VulkanMemoryAllocator-3.2.1-eK3SgUURAABfCEdIYXFAn8ynKeayws04KW7vwzlSN85z",
+        },
     },
     .paths = .{
         "build.zig",
