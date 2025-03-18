@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const name = b.option([]const u8, "name", "set the name of the emitted binary");
@@ -27,8 +27,13 @@ pub fn build(b: *std.Build) void {
     const vma = b.dependency("VulkanMemoryAllocator", .{
         .target = target,
         .optimize = optimize,
+        .macro_static_vulkan_functions = false,
+        .macro_dynamic_vulkan_functions = true,
+        .@"install-vulkan-headers" = true,
     });
-    root_module.linkLibrary(vma.artifact("VulkanMemoryAllocator"));
+
+    const vma_lib = vma.artifact("VulkanMemoryAllocator");
+    root_module.linkLibrary(vma_lib);
 
     const c_translate = b.addTranslateC(.{
         .root_source_file = b.addWriteFiles().add("c.h",

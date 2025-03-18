@@ -12,8 +12,8 @@
             .hash = "sdl-0.2.0+3.2.8-7uIn9FxHfQE325TK7b0qpgt10G3x1xl-3ZMOfTzxUg3C",
         },
         .VulkanMemoryAllocator = .{
-            .url = "git+https://github.com/johan0A/VulkanMemoryAllocator#821650428f4feb8ff5f62e49980e2bc1577dff95",
-            .hash = "VulkanMemoryAllocator-3.2.1-eK3SgUURAABfCEdIYXFAn8ynKeayws04KW7vwzlSN85z",
+            .url = "git+https://github.com/johan0A/VulkanMemoryAllocator#be6c5d6ef9b4db59f5690bf586c91c78f5b42085",
+            .hash = "VulkanMemoryAllocator-3.2.1-eK3SgawSAABzHzL3WtsUG1RrWiU1wTS4Jc9s8GWj80WP",
         },
     },
     .paths = .{
