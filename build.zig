@@ -31,9 +31,7 @@ pub fn build(b: *std.Build) !void {
         .macro_dynamic_vulkan_functions = true,
         .@"install-vulkan-headers" = true,
     });
-
-    const vma_lib = vma.artifact("VulkanMemoryAllocator");
-    root_module.linkLibrary(vma_lib);
+    root_module.linkLibrary(vma.artifact("VulkanMemoryAllocator"));
 
     const c_translate = b.addTranslateC(.{
         .root_source_file = b.addWriteFiles().add("c.h",
@@ -45,12 +43,16 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
     });
     c_translate.addIncludePath(sdl_dep.path("include"));
-    root_module.addImport("c", c_translate.createModule());
     c_translate.addIncludePath(vma.artifact("VulkanMemoryAllocator").getEmittedIncludeTree());
+    root_module.addImport("c", c_translate.createModule());
 
     {
         const exe = b.addExecutable(.{ .name = name orelse "zig-exe-template", .root_module = root_module });
-        // exe.subsystem = .Windows;
+        exe.subsystem = if (b.option(
+            bool,
+            "no-console",
+            "on Windows: disables console output and opening a console window with the app window",
+        )) |option| (if (option) .Windows else null) else null;
 
         b.installArtifact(exe);
         const run_cmd = b.addRunArtifact(exe);
