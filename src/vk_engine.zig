@@ -1,6 +1,8 @@
 const std = @import("std");
 const vk = @import("vulkan");
 const c = @import("c");
+const tracy = @import("tracy");
+const shaders = @import("shaders");
 
 const enable_validation_layers = true;
 const validation_layers = [_][:0]const u8{"VK_LAYER_KHRONOS_validation"};
@@ -37,6 +39,9 @@ pub const Dispatch = struct {
     pub const Device = vk.DeviceWrapper(apis);
 };
 
+const InstanceProxy = vk.InstanceProxy(apis);
+const DeviceProxy = vk.DeviceProxy(apis);
+
 const DeletionQueue = struct {
     const DeinitContext = struct {
         device: DeviceProxy,
@@ -47,12 +52,20 @@ const DeletionQueue = struct {
         vma_allocator: c.VmaAllocator,
         image_view: vk.ImageView,
         vma_allocated_image: struct { image: vk.Image, allocation: c.VmaAllocation },
+        descriptor_allocator: DescriptorAllocator,
+        descriptor_set_layout: vk.DescriptorSetLayout,
+        pipeline_layout: vk.PipelineLayout,
+        pipeline: vk.Pipeline,
 
         fn deinit(self: QueueItem, context: DeinitContext) void {
             switch (self) {
                 .vma_allocator => |item| c.vmaDestroyAllocator(item),
                 .image_view => |item| context.device.destroyImageView(item, null),
                 .vma_allocated_image => |item| c.vmaDestroyImage(context.vma_allocator, @ptrFromInt(@intFromEnum(item.image)), item.allocation),
+                .descriptor_allocator => |item| item.destroyPool(context.device),
+                .descriptor_set_layout => |item| context.device.destroyDescriptorSetLayout(item, null),
+                .pipeline_layout => |item| context.device.destroyPipelineLayout(item, null),
+                .pipeline => |item| context.device.destroyPipeline(item, null),
             }
         }
     };
@@ -80,8 +93,53 @@ const DeletionQueue = struct {
     }
 };
 
-const InstanceProxy = vk.InstanceProxy(apis);
-const DeviceProxy = vk.DeviceProxy(apis);
+const DescriptorAllocator = struct {
+    const PoolSizeRatio = struct {
+        type: vk.DescriptorType,
+        ratio: f32,
+    };
+
+    pool: vk.DescriptorPool,
+
+    pub fn initPool(temp: Allocator, device: DeviceProxy, max_sets: u32, pool_ratios: []const PoolSizeRatio) !DescriptorAllocator {
+        const pool_sizes = try temp.alloc(vk.DescriptorPoolSize, pool_ratios.len);
+        for (pool_sizes, pool_ratios) |*size, ratio| {
+            size.* = vk.DescriptorPoolSize{
+                .type = ratio.type,
+                .descriptor_count = @intFromFloat(ratio.ratio * @as(f32, @floatFromInt(max_sets))),
+            };
+        }
+
+        const pool_info: vk.DescriptorPoolCreateInfo = .{
+            .max_sets = max_sets,
+            .pool_size_count = @intCast(pool_sizes.len),
+            .p_pool_sizes = pool_sizes.ptr,
+        };
+
+        return .{
+            .pool = try device.createDescriptorPool(&pool_info, null),
+        };
+    }
+
+    pub fn clearDescriptors(self: DescriptorAllocator, device: DeviceProxy) void {
+        device.resetDescriptorPool(self.pool, .{});
+    }
+
+    pub fn destroyPool(self: DescriptorAllocator, device: DeviceProxy) void {
+        device.destroyDescriptorPool(self.pool, null);
+    }
+
+    pub fn allocate(self: DescriptorAllocator, device: DeviceProxy, layout: vk.DescriptorSetLayout) !vk.DescriptorSet {
+        const alloc_info: vk.DescriptorSetAllocateInfo = .{
+            .descriptor_pool = self.pool,
+            .descriptor_set_count = 1,
+            .p_set_layouts = (&layout)[0..1],
+        };
+        var ds: vk.DescriptorSet = undefined;
+        try device.allocateDescriptorSets(&alloc_info, (&ds)[0..1]);
+        return ds;
+    }
+};
 
 const SwapChain = struct {
     handle: vk.SwapchainKHR,
@@ -144,17 +202,30 @@ pub const VulkanEngine = struct {
     draw_image: AllocatedImage,
     draw_extent: vk.Extent2D,
 
+    draw_image_descriptors: vk.DescriptorSet,
+    draw_image_descriptor_set_layout: vk.DescriptorSetLayout,
+
+    globalDescriptorAllocator: DescriptorAllocator,
+
+    gradient_pipeline: vk.Pipeline,
+    gradient_pipeline_layout: vk.PipelineLayout,
+
     pub fn draw(self: *VulkanEngine) !void {
         const local = struct {
             fn drawBackground(engine: *VulkanEngine, cmd: vk.CommandBuffer) void {
-                //make a clear-color from frame number. This will flash with a 120 frame period.
-                const flash = @abs(std.math.sin(@as(f32, @floatFromInt(engine.frame_number)) / 120));
-                var clear_value: vk.ClearColorValue = .{ .float_32 = .{ 0, 0, flash, 1 } };
+                // bind the gradient drawing compute pipeline
+                engine.device.cmdBindPipeline(cmd, .compute, engine.gradient_pipeline);
 
-                const clear_range: vk.ImageSubresourceRange = vk_init.imageSubresourceRange(.{ .color_bit = true });
+                // bind the descriptor set containing the draw image for the compute pipeline
+                engine.device.cmdBindDescriptorSets(cmd, .compute, engine.gradient_pipeline_layout, 0, 1, (&engine.draw_image_descriptors)[0..1], 0, null);
 
-                //clear image
-                engine.device.cmdClearColorImage(cmd, engine.draw_image.image, .general, &clear_value, 1, (&clear_range)[0..1]);
+                // execute the compute pipeline dispatch. We are using 16x16 workgroup size so we need to divide by it
+                engine.device.cmdDispatch(
+                    cmd,
+                    std.math.divCeil(u32, engine.draw_extent.width, 16) catch unreachable,
+                    std.math.divCeil(u32, engine.draw_extent.height, 16) catch unreachable,
+                    1,
+                );
             }
         };
 
@@ -192,13 +263,12 @@ pub const VulkanEngine = struct {
             vk_image.transitionImage(self.device, cmd, self.swapchain.images[swapchain_image_index], .undefined, .transfer_dst_optimal);
 
             // execute a copy from the draw image into the swapchain
-            vk_image.copy_image_to_image(self.device, cmd, self.draw_image.image, self.swapchain.images[swapchain_image_index], self.draw_extent, self.swapchain.extent);
+            vk_image.copyImageToImage(self.device, cmd, self.draw_image.image, self.swapchain.images[swapchain_image_index], self.draw_extent, self.swapchain.extent);
 
             // set swapchain image layout to Present so we can show it on the screen
             vk_image.transitionImage(self.device, cmd, self.swapchain.images[swapchain_image_index], .transfer_dst_optimal, .present_src_khr);
-
-            //finalize the command buffer (we can no longer add commands, but it can now be executed)
         }
+        //finalize the command buffer (we can no longer add commands, but it can now be executed)
         try self.device.endCommandBuffer(cmd);
 
         //prepare the submission to the queue.
@@ -233,7 +303,12 @@ pub const VulkanEngine = struct {
     }
 
     pub fn init(allocator: Allocator) !VulkanEngine {
+        const tracy_init_engine = tracy.zoneEx(@src(), .{ .name = "init engine" });
+        defer tracy_init_engine.end();
+
+        const tracy_SDL_Init = tracy.zoneEx(@src(), .{ .name = "SDL_Init" });
         if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.engine_init_failure;
+        tracy_SDL_Init.end();
 
         var init_arena: std.heap.ArenaAllocator = .init(allocator);
         const init_alloc = init_arena.allocator();
@@ -245,24 +320,38 @@ pub const VulkanEngine = struct {
         const window_width = 400;
         const window_height = 400;
 
+        const tracy_SDL_CreateWindow = tracy.zoneEx(@src(), .{ .name = "SDL_CreateWindow" });
         const window = c.SDL_CreateWindow("title", window_width, window_height, c.SDL_WINDOW_VULKAN) orelse return error.engine_init_failure;
+        tracy_SDL_CreateWindow.end();
 
+        const tracy_load_base_dispatch = tracy.zoneEx(@src(), .{ .name = "load base_dispatch" });
         const base_dispatch = try Dispatch.Base.load(@as(vk.PfnGetInstanceProcAddr, @ptrCast(c.SDL_Vulkan_GetVkGetInstanceProcAddr())));
+        tracy_load_base_dispatch.end();
 
         const instance = try vk_init.createVkInstance(base_dispatch, temp_alloc);
         const instance_dispatch = try init_alloc.create(Dispatch.Instance);
-        instance_dispatch.* = try Dispatch.Instance.load(instance, base_dispatch.dispatch.vkGetInstanceProcAddr);
+        {
+            const tracy_load_instance_dispatch = tracy.zoneEx(@src(), .{ .name = "load instance_dispatch" });
+            instance_dispatch.* = try Dispatch.Instance.load(instance, base_dispatch.dispatch.vkGetInstanceProcAddr);
+            tracy_load_instance_dispatch.end();
+        }
         const instance_proxy = InstanceProxy.init(instance, instance_dispatch);
 
+        const tracy_SDL_Vulkan_CreateSurface = tracy.zoneEx(@src(), .{ .name = "SDL_Vulkan_CreateSurface" });
         var surface: vk.SurfaceKHR = undefined;
         if (!c.SDL_Vulkan_CreateSurface(window, @ptrFromInt(@intFromEnum(instance)), null, @ptrCast(&surface))) return error.engine_init_failure;
+        tracy_SDL_Vulkan_CreateSurface.end();
 
         const physical_device = try vk_init.pickPhysicalDevice(instance_proxy, surface, temp_alloc);
         const queue_family_indices = try vk_init.findQueueFamilies(physical_device, instance_dispatch.*, surface, temp_alloc);
 
         const device = try vk_init.createLogicalDevice(physical_device, instance_dispatch.*, queue_family_indices);
         const device_dispatch = try init_alloc.create(Dispatch.Device);
-        device_dispatch.* = try Dispatch.Device.load(device, instance_dispatch.dispatch.vkGetDeviceProcAddr);
+        {
+            const tracy_load_device_dispatch = tracy.zoneEx(@src(), .{ .name = "load device_dispatch" });
+            device_dispatch.* = try Dispatch.Device.load(device, instance_dispatch.dispatch.vkGetDeviceProcAddr);
+            tracy_load_device_dispatch.end();
+        }
         const device_proxy = DeviceProxy.init(device, device_dispatch);
 
         var frames: [FrameData.FRAME_OVERLAP]FrameData = undefined;
@@ -324,7 +413,11 @@ pub const VulkanEngine = struct {
             _ = result; // TODO: handle failure
 
             //build a image-view for the draw image to use for rendering
-            const rview_info: vk.ImageViewCreateInfo = vk_init.imageViewCreateInfo(draw_image_format, draw_image, .{ .color_bit = true });
+            const rview_info: vk.ImageViewCreateInfo = vk_init.imageViewCreateInfo(
+                draw_image_format,
+                draw_image,
+                .{ .color_bit = true },
+            );
 
             const draw_allocated_image: AllocatedImage = .{
                 //hardcoding the draw format to 32 bit float
@@ -341,15 +434,55 @@ pub const VulkanEngine = struct {
             };
 
             //add to deletion queues
-            // main_deletion_queue.append(
-            //     vkDestroyImageView(_device, _drawImage.imageView, nullptr);
-            //     vmaDestroyImage(_allocator, _drawImage.image, _drawImage.allocation);
-            // );
             try main_deletion_queue.append(allocator, .{ .image_view = draw_allocated_image.image_view });
-            try main_deletion_queue.append(allocator, .{ .vma_allocated_image = .{ .image = draw_allocated_image.image, .allocation = draw_allocated_image.allocation } });
+            try main_deletion_queue.append(allocator, .{ .vma_allocated_image = .{
+                .image = draw_allocated_image.image,
+                .allocation = draw_allocated_image.allocation,
+            } });
 
             break :blk draw_allocated_image;
         };
+
+        //create a descriptor pool that will hold 10 sets with 1 image each
+        const sizes: []const DescriptorAllocator.PoolSizeRatio = &.{.{ .type = .storage_image, .ratio = 1 }};
+        const global_descriptor_allocator: DescriptorAllocator = try .initPool(temp_alloc, device_proxy, 10, sizes);
+
+        //make the descriptor set layout for our compute draw
+        var bindings = [_]vk.DescriptorSetLayoutBinding{
+            vk_descriptors.layout.createSetBinding(0, .storage_image),
+        };
+        const draw_image_descriptor_layout = try vk_descriptors.layout.createSet(&bindings, device_proxy, .{ .compute_bit = true }, null, .{});
+
+        const draw_image_descriptors = try global_descriptor_allocator.allocate(device_proxy, draw_image_descriptor_layout);
+
+        const img_info: vk.DescriptorImageInfo = .{
+            .image_layout = .general,
+            .image_view = draw_allocated_image.image_view,
+
+            .sampler = .null_handle,
+        };
+
+        const draw_image_write: vk.WriteDescriptorSet = .{
+            .dst_binding = 0,
+            .dst_set = draw_image_descriptors,
+            .descriptor_count = 1,
+            .descriptor_type = .storage_image,
+            .p_image_info = (&img_info)[0..1],
+            .dst_array_element = 0,
+            // image descriptor, not a buffer or texel buffer: (TODO: is undefined correct here?)
+            .p_buffer_info = undefined,
+            .p_texel_buffer_view = undefined,
+        };
+
+        device_proxy.updateDescriptorSets(1, (&draw_image_write)[0..1], 0, null);
+
+        try main_deletion_queue.append(allocator, .{ .descriptor_set_layout = draw_image_descriptor_layout });
+        try main_deletion_queue.append(allocator, .{ .descriptor_allocator = global_descriptor_allocator });
+
+        const gradient_pipeline_layout, const gradient_pipeline = try initGradientPipeline(draw_image_descriptor_layout, device_proxy);
+
+        try main_deletion_queue.append(allocator, .{ .pipeline_layout = gradient_pipeline_layout });
+        try main_deletion_queue.append(allocator, .{ .pipeline = gradient_pipeline });
 
         return .{
             .init_arena = init_arena,
@@ -384,6 +517,14 @@ pub const VulkanEngine = struct {
 
             .draw_image = draw_allocated_image,
             .draw_extent = .{ .width = 0, .height = 0 },
+
+            .globalDescriptorAllocator = global_descriptor_allocator,
+
+            .draw_image_descriptors = draw_image_descriptors,
+            .draw_image_descriptor_set_layout = draw_image_descriptor_layout,
+
+            .gradient_pipeline_layout = gradient_pipeline_layout,
+            .gradient_pipeline = gradient_pipeline,
         };
     }
 
@@ -414,12 +555,85 @@ pub const VulkanEngine = struct {
         self.instance.destroySurfaceKHR(self.surface, null);
         self.instance.destroyInstance(null);
 
+        c.SDL_DestroyWindow(self.window);
+        c.SDL_Quit();
+
         self.init_arena.deinit();
     }
 
-    fn init_vulkan() void {}
-    fn init_swapchain() void {}
-    fn init_sync_structures() void {}
+    pub fn initGradientPipeline(
+        draw_image_descriptor_layout: vk.DescriptorSetLayout,
+        device: DeviceProxy,
+    ) !struct { vk.PipelineLayout, vk.Pipeline } {
+        const computeLayout: vk.PipelineLayoutCreateInfo = .{
+            .p_set_layouts = (&draw_image_descriptor_layout)[0..1],
+            .set_layout_count = 1,
+        };
+        const gradient_pipeline_layout = try device.createPipelineLayout(&computeLayout, null);
+
+        const computeDrawShader: vk.ShaderModule = try vk_init.loadShaderModule(shaders.comp, device);
+
+        const stageinfo: vk.PipelineShaderStageCreateInfo = .{
+            .stage = .{ .compute_bit = true },
+            .module = computeDrawShader,
+            .p_name = "main",
+        };
+
+        const computePipelineCreateInfo: vk.ComputePipelineCreateInfo = .{
+            .layout = gradient_pipeline_layout,
+            .stage = stageinfo,
+
+            .base_pipeline_index = 0,
+        };
+
+        var gradient_pipeline: vk.Pipeline = undefined;
+        _ = try device.createComputePipelines(.null_handle, 1, (&computePipelineCreateInfo)[0..1], null, (&gradient_pipeline)[0..1]);
+
+        device.destroyShaderModule(computeDrawShader, null);
+
+        return .{ gradient_pipeline_layout, gradient_pipeline };
+    }
+};
+
+const vk_descriptors = struct {
+    const layout = struct {
+        fn createSetBinding(
+            binding: u32,
+            descriptor_type: vk.DescriptorType,
+        ) vk.DescriptorSetLayoutBinding {
+            return .{
+                .binding = binding,
+                .descriptor_count = 1,
+                .descriptor_type = descriptor_type,
+
+                .stage_flags = .{},
+            };
+        }
+
+        pub fn createSet(
+            bindings: []vk.DescriptorSetLayoutBinding,
+            device: DeviceProxy,
+            shader_stages: vk.ShaderStageFlags,
+            p_next: ?*anyopaque,
+            flags: vk.DescriptorSetLayoutCreateFlags,
+        ) !vk.DescriptorSetLayout {
+            for (bindings) |*binding| {
+                @as(*u32, @ptrCast(&binding.stage_flags)).* |= @bitCast(shader_stages);
+            }
+
+            const info: vk.DescriptorSetLayoutCreateInfo = .{
+                .p_next = p_next,
+
+                .p_bindings = bindings.ptr,
+                .binding_count = @intCast(bindings.len),
+                .flags = flags,
+            };
+
+            const set = try device.createDescriptorSetLayout(&info, null);
+
+            return set;
+        }
+    };
 };
 
 const vk_image = struct {
@@ -427,10 +641,10 @@ const vk_image = struct {
         device: DeviceProxy,
         cmd: vk.CommandBuffer,
         image: vk.Image,
-        currentLayout: vk.ImageLayout,
-        newLayout: vk.ImageLayout,
+        current_layout: vk.ImageLayout,
+        new_layout: vk.ImageLayout,
     ) void {
-        const imageBarrier: vk.ImageMemoryBarrier2 = .{
+        const image_barrier: vk.ImageMemoryBarrier2 = .{
             .src_stage_mask = .{ .all_commands_bit = true },
             .src_access_mask = .{ .memory_write_bit = true },
             .dst_stage_mask = .{ .all_commands_bit = true },
@@ -438,10 +652,10 @@ const vk_image = struct {
                 .memory_write_bit = true,
                 .memory_read_bit = true,
             },
-            .old_layout = currentLayout,
-            .new_layout = newLayout,
+            .old_layout = current_layout,
+            .new_layout = new_layout,
             .subresource_range = vk_init.imageSubresourceRange(
-                if (newLayout == .depth_attachment_optimal) .{ .depth_bit = true } else .{ .color_bit = true },
+                if (new_layout == .depth_attachment_optimal) .{ .depth_bit = true } else .{ .color_bit = true },
             ),
             .image = image,
             .src_queue_family_index = 0,
@@ -450,29 +664,29 @@ const vk_image = struct {
 
         const dep_info: vk.DependencyInfo = .{
             .image_memory_barrier_count = 1,
-            .p_image_memory_barriers = (&imageBarrier)[0..1],
+            .p_image_memory_barriers = (&image_barrier)[0..1],
         };
 
         device.cmdPipelineBarrier2(cmd, &dep_info);
     }
 
-    fn copy_image_to_image(
+    fn copyImageToImage(
         device: DeviceProxy,
         cmd: vk.CommandBuffer,
         source: vk.Image,
         destination: vk.Image,
-        srcSize: vk.Extent2D,
-        dstSize: vk.Extent2D,
+        src_size: vk.Extent2D,
+        dst_size: vk.Extent2D,
     ) void {
         const blitRegion: vk.ImageBlit2 = .{
             .src_offsets = .{ .{ .x = 0, .y = 0, .z = 0 }, .{
-                .x = @intCast(srcSize.width),
-                .y = @intCast(srcSize.height),
+                .x = @intCast(src_size.width),
+                .y = @intCast(src_size.height),
                 .z = 1,
             } },
             .dst_offsets = .{ .{ .x = 0, .y = 0, .z = 0 }, .{
-                .x = @intCast(dstSize.width),
-                .y = @intCast(dstSize.height),
+                .x = @intCast(dst_size.width),
+                .y = @intCast(dst_size.height),
                 .z = 1,
             } },
             .src_subresource = .{
@@ -503,6 +717,15 @@ const vk_image = struct {
 };
 
 const vk_init = struct {
+    pub fn loadShaderModule(comptime file: []const u8, device: DeviceProxy) !vk.ShaderModule {
+        const spv align(@alignOf(u32)) = file[0..].*;
+
+        return try device.createShaderModule(&.{
+            .code_size = spv.len,
+            .p_code = @ptrCast(&spv),
+        }, null);
+    }
+
     fn imageCreateInfo(format: vk.Format, usage_flags: vk.ImageUsageFlags, extent: vk.Extent3D) vk.ImageCreateInfo {
         return vk.ImageCreateInfo{
             .image_type = .@"2d",
@@ -616,12 +839,15 @@ const vk_init = struct {
     }
 
     pub fn createVkInstance(base_dispatch: Dispatch.Base, temp_alloc: Allocator) !vk.Instance {
+        const zone = tracy.zone(@src());
+        defer zone.end();
+
         const appinfo = vk.ApplicationInfo{
             .p_application_name = "Vulkan Tutorial",
-            .application_version = vk.makeApiVersion(1, 0, 0, 0),
+            .application_version = @bitCast(vk.makeApiVersion(1, 0, 0, 0)),
             .p_engine_name = "No Engine",
-            .engine_version = vk.makeApiVersion(1, 0, 0, 0),
-            .api_version = vk.makeApiVersion(1, 3, 0, 0),
+            .engine_version = @bitCast(vk.makeApiVersion(1, 0, 0, 0)),
+            .api_version = @bitCast(vk.makeApiVersion(1, 3, 0, 0)),
         };
 
         var glfw_extensions_count: u32 = undefined;
@@ -651,6 +877,9 @@ const vk_init = struct {
     }
 
     pub fn checkValidationLayerSupport(temp_alloc: Allocator, base_dispatch: Dispatch.Base) !void {
+        const zone = tracy.zone(@src());
+        defer zone.end();
+
         const available_layers = try base_dispatch.enumerateInstanceLayerPropertiesAlloc(temp_alloc);
         defer temp_alloc.free(available_layers);
 
@@ -669,6 +898,9 @@ const vk_init = struct {
     }
 
     pub fn pickPhysicalDevice(instance: InstanceProxy, surface: vk.SurfaceKHR, temp_alloc: Allocator) !vk.PhysicalDevice {
+        const zone = tracy.zone(@src());
+        defer zone.end();
+
         const physical_devices = try instance.enumeratePhysicalDevicesAlloc(temp_alloc);
         defer temp_alloc.free(physical_devices);
 
@@ -689,6 +921,9 @@ const vk_init = struct {
         surface: vk.SurfaceKHR,
         temp_alloc: Allocator,
     ) !bool {
+        const zone = tracy.zone(@src());
+        defer zone.end();
+
         const formats = try instance_dispatch.getPhysicalDeviceSurfaceFormatsAllocKHR(physical_device, surface, temp_alloc);
         const present_modes = try instance_dispatch.getPhysicalDeviceSurfacePresentModesAllocKHR(physical_device, surface, temp_alloc);
         return (try findQueueFamilies(physical_device, instance_dispatch, surface, temp_alloc)).graphics_family != null and
@@ -703,6 +938,9 @@ const vk_init = struct {
         surface: vk.SurfaceKHR,
         temp_alloc: Allocator,
     ) !QueueFamilyIndices {
+        const zone = tracy.zone(@src());
+        defer zone.end();
+
         var indices: QueueFamilyIndices = .{
             .graphics_family = null,
             .present_family = null,
@@ -734,6 +972,8 @@ const vk_init = struct {
         instance_dispatch: Dispatch.Instance,
         temp_alloc: Allocator,
     ) !bool {
+        const zone = tracy.zone(@src());
+        defer zone.end();
         const available_extensions = try instance_dispatch.enumerateDeviceExtensionPropertiesAlloc(physical_device, null, temp_alloc);
 
         outer: for (required_device_extensions) |required_device_extension| {
@@ -757,6 +997,9 @@ const vk_init = struct {
         instance_dispatch: Dispatch.Instance,
         queue_family_indices: QueueFamilyIndices,
     ) !vk.Device {
+        const zone = tracy.zone(@src());
+        defer zone.end();
+
         const indices = [_]u32{
             queue_family_indices.graphics_family.?,
             queue_family_indices.present_family.?,
@@ -809,6 +1052,8 @@ const vk_init = struct {
         window_height: u32,
         instance_dispatch: Dispatch.Instance,
     ) !SwapChain {
+        const zone = tracy.zone(@src());
+        defer zone.end();
 
         // Get surface formats
         const surface_formats = try instance_dispatch.getPhysicalDeviceSurfaceFormatsAllocKHR(physical_device, surface, temp_alloc);

@@ -15,6 +15,10 @@
             .url = "git+https://github.com/johan0A/VulkanMemoryAllocator#be6c5d6ef9b4db59f5690bf586c91c78f5b42085",
             .hash = "VulkanMemoryAllocator-3.2.1-eK3SgawSAABzHzL3WtsUG1RrWiU1wTS4Jc9s8GWj80WP",
         },
+        .tracy = .{
+            .url = "git+https://github.com/johan0A/zig-tracy#06f7e1bf96c3213bbe3e34414651b2ef76e023c3",
+            .hash = "tracy-0.11.1-bsH_anHeFgA_A2ponF7NaLtN9Nn7NqVpOqXTPLjjToce",
+        },
     },
     .paths = .{
         "build.zig",

@@ -1,11 +1,13 @@
 const std = @import("std");
+const tracy = @import("tracy");
 const VulkanEngine = @import("vk_engine.zig").VulkanEngine;
 const c = @import("c");
 
 pub fn main() !void {
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
     defer _ = debug_allocator.deinit();
-    const allocator = debug_allocator.allocator();
+    var tracy_allocator = tracy.TracyAllocator.init(debug_allocator.allocator(), "main gpa");
+    const allocator = tracy_allocator.allocator();
 
     var engine = try VulkanEngine.init(allocator);
     defer engine.deinit(allocator);

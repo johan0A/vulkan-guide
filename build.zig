@@ -12,39 +12,55 @@ pub fn build(b: *std.Build) !void {
         .link_libc = true,
     });
 
-    const vulkan = b.dependency("vulkan", .{
-        .registry = b.path("vendor/vk.xml"),
-    });
-    root_module.addImport("vulkan", vulkan.module("vulkan-zig"));
+    const shader_module = shadersModule(b, b.path("./shaders"));
+    root_module.addImport("shaders", shader_module);
 
-    const sdl_dep = b.dependency("sdl", .{
-        .target = target,
-        .optimize = .ReleaseFast, // TODO: change to `optimize` when SDL dep is fixed https://github.com/castholm/SDL/issues/9
-        .preferred_link_mode = .static,
-    });
-    root_module.linkLibrary(sdl_dep.artifact("SDL3"));
+    {
+        const vulkan = b.dependency("vulkan", .{
+            .registry = b.path("vendor/vk.xml"),
+        });
+        root_module.addImport("vulkan", vulkan.module("vulkan-zig"));
 
-    const vma = b.dependency("VulkanMemoryAllocator", .{
-        .target = target,
-        .optimize = optimize,
-        .macro_static_vulkan_functions = false,
-        .macro_dynamic_vulkan_functions = true,
-        .@"install-vulkan-headers" = true,
-    });
-    root_module.linkLibrary(vma.artifact("VulkanMemoryAllocator"));
+        const tracy = b.dependency("tracy", .{
+            .enable_tracing = b.option(bool, "enable_tracing", "Enable Tracy profile markers") orelse false,
+            .enable_fibers = b.option(bool, "enable_fibers", "Enable Tracy fiber support") orelse false,
+            .on_demand = b.option(bool, "on_demand", "Build tracy with TRACY_ON_DEMAND") orelse false,
+            .callstack_support = b.option(bool, "callstack_support", "Builds tracy with TRACY_USE_CALLSTACK") orelse false,
+            .default_callstack_depth = b.option(u32, "default_callstack_depth", "sets TRACY_CALLSTACK to the depth provided") orelse 0,
+        });
+        root_module.addImport("tracy", tracy.module("tracy"));
+    }
 
-    const c_translate = b.addTranslateC(.{
-        .root_source_file = b.addWriteFiles().add("c.h",
-            \\#include <SDL3/SDL.h>
-            \\#include <SDL3/SDL_vulkan.h>
-            \\#include <vk_mem_alloc.h>
-        ),
-        .target = target,
-        .optimize = optimize,
-    });
-    c_translate.addIncludePath(sdl_dep.path("include"));
-    c_translate.addIncludePath(vma.artifact("VulkanMemoryAllocator").getEmittedIncludeTree());
-    root_module.addImport("c", c_translate.createModule());
+    {
+        const sdl_dep = b.dependency("sdl", .{
+            .target = target,
+            .optimize = .ReleaseFast, // TODO: change to `optimize` when SDL dep is fixed https://github.com/castholm/SDL/issues/9
+            .preferred_link_mode = .static,
+        });
+        root_module.linkLibrary(sdl_dep.artifact("SDL3"));
+
+        const vma = b.dependency("VulkanMemoryAllocator", .{
+            .target = target,
+            .optimize = optimize,
+            .macro_static_vulkan_functions = false,
+            .macro_dynamic_vulkan_functions = true,
+            .@"install-vulkan-headers" = true,
+        });
+        root_module.linkLibrary(vma.artifact("VulkanMemoryAllocator"));
+
+        const c_translate = b.addTranslateC(.{
+            .root_source_file = b.addWriteFiles().add("c.h",
+                \\#include <SDL3/SDL.h>
+                \\#include <SDL3/SDL_vulkan.h>
+                \\#include <vk_mem_alloc.h>
+            ),
+            .target = target,
+            .optimize = optimize,
+        });
+        c_translate.addIncludePath(sdl_dep.path("include"));
+        c_translate.addIncludePath(vma.artifact("VulkanMemoryAllocator").getEmittedIncludeTree());
+        root_module.addImport("c", c_translate.createModule());
+    }
 
     {
         const exe = b.addExecutable(.{ .name = name orelse "zig-exe-template", .root_module = root_module });
@@ -84,4 +100,40 @@ pub fn build(b: *std.Build) !void {
         check.dependOn(&exe_check.step);
         check.dependOn(&tests_check.step);
     }
+}
+
+fn shadersModule(
+    b: *std.Build,
+    path: std.Build.LazyPath,
+) *std.Build.Module {
+    const shaders_dir = std.fs.openDirAbsolute(path.getPath2(b, null), .{ .iterate = true }) catch @panic("failed to open shader directory");
+    var shaders_files_it = shaders_dir.iterate();
+
+    var generated_file: std.ArrayListUnmanaged(u8) = .empty;
+
+    const module = b.createModule(.{});
+
+    while (shaders_files_it.next() catch @panic("failed to iterate on shader file")) |shader_file| {
+        if (shader_file.kind != .file) continue;
+        if (!std.mem.eql(u8, std.fs.path.extension(shader_file.name), ".slang")) continue;
+
+        const stem = std.fs.path.stem(shader_file.name);
+        generated_file.appendSlice(
+            b.allocator,
+            std.fmt.allocPrint(b.allocator, "pub const {s} = @embedFile(\"{s}\");\n", .{ stem, stem }) catch @panic("OOM"),
+        ) catch @panic("OOM");
+
+        const system_command = b.addSystemCommand(&.{"./vendor/slang/bin/slangc.exe"}); // TODO support other os
+        system_command.addFileArg(path.join(b.allocator, shader_file.name) catch @panic("OOM"));
+        system_command.addArg("-o");
+        const out_path = system_command.addOutputFileArg("comp.spv");
+
+        module.addAnonymousImport(stem, .{
+            .root_source_file = out_path,
+        });
+    }
+
+    module.root_source_file = b.addWriteFiles().add("shaders.zig", generated_file.items);
+
+    return module;
 }
