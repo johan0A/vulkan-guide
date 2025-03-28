@@ -123,7 +123,10 @@ fn shadersModule(
             std.fmt.allocPrint(b.allocator, "pub const {s} = @embedFile(\"{s}\");\n", .{ stem, stem }) catch @panic("OOM"),
         ) catch @panic("OOM");
 
-        const system_command = b.addSystemCommand(&.{"./vendor/slang/bin/slangc.exe"}); // TODO support other os
+        const slang_path = b.dependency("zig_slang_binaries", .{}).namedLazyPath("binaries");
+        const slang_exe_path = slang_path.join(b.allocator, "bin/slangc") catch @panic("OOM");
+
+        const system_command = b.addSystemCommand(&.{slang_exe_path.getPath2(b, null)});
         system_command.addFileArg(path.join(b.allocator, shader_file.name) catch @panic("OOM"));
         system_command.addArg("-o");
         const out_path = system_command.addOutputFileArg("comp.spv");

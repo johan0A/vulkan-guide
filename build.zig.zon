@@ -19,6 +19,10 @@
             .url = "git+https://github.com/johan0A/zig-tracy#06f7e1bf96c3213bbe3e34414651b2ef76e023c3",
             .hash = "tracy-0.11.1-bsH_anHeFgA_A2ponF7NaLtN9Nn7NqVpOqXTPLjjToce",
         },
+        .zig_slang_binaries = .{
+            .url = "git+https://github.com/johan0A/zig-slang-binaries?ref=v0.1.0+2025.6.3#9b776e868ca613e3c5b5762619f99a31a37e6d97",
+            .hash = "zig_slang_binaries-0.1.0+2025.6.3-nZ4kSOEKAAA41Wh130owX9LYMJfF_0FPNJMokU4EXE7v",
+        },
     },
     .paths = .{
         "build.zig",
