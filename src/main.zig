@@ -24,12 +24,25 @@ pub fn main() !void {
                 c.SDL_EVENT_WINDOW_RESTORED => stop_rendering = false,
                 else => {},
             }
+            _ = c.cImGui_ImplSDL3_ProcessEvent(&e);
         }
 
         if (stop_rendering) {
             std.time.sleep(std.time.ns_per_ms * 100);
-        } else {
-            try engine.draw();
+            continue;
         }
+
+        // imgui new frame
+        c.cImGui_ImplVulkan_NewFrame();
+        c.cImGui_ImplSDL3_NewFrame();
+        c.ImGui_NewFrame();
+
+        //some imgui UI to test
+        c.ImGui_ShowDemoWindow(null);
+
+        //make imgui calculate internal draw structures
+        c.ImGui_Render();
+
+        try engine.draw();
     }
 }

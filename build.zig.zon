@@ -4,8 +4,8 @@
     .fingerprint = 0xe6a82ece1521df,
     .dependencies = .{
         .vulkan = .{
-            .url = "git+https://github.com/Snektron/vulkan-zig#dcd538828c513919c3abf0bd55afacdce0576c61",
-            .hash = "vulkan-0.0.0-r7Ytxy5bAwASnqFlLMD4V42z3LolS8n7xv3RlbXhAhv0",
+            .url = "git+https://github.com/Snektron/vulkan-zig#40ad90a912eafb81581a121e585688fbbd7d8ddf",
+            .hash = "vulkan-0.0.0-r7Ytx1JTAwC3R0cfA3SxaWPGJa6p3EUw3OTXTgSPr_hF",
         },
         .sdl = .{
             .url = "git+https://github.com/castholm/SDL#dbb1b96360658f5845ff6fac380c4f13d7276dc2",
@@ -22,6 +22,10 @@
         .zig_slang_binaries = .{
             .url = "git+https://github.com/johan0A/zig-slang-binaries?ref=v0.1.0+2025.6.3#9b776e868ca613e3c5b5762619f99a31a37e6d97",
             .hash = "zig_slang_binaries-0.1.0+2025.6.3-nZ4kSOEKAAA41Wh130owX9LYMJfF_0FPNJMokU4EXE7v",
+        },
+        .cimgui_zig = .{
+            .url = "git+https://github.com/johan0A/cimgui.zig#f1820e421436e0db1f43f77f7054647ed4569cf2",
+            .hash = "cimgui_zig-1.0.0-2Xubknc2SgD8vB0GhFH68NiPYa8oOA6V_Tu7QJXkuLNE",
         },
     },
     .paths = .{

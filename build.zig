@@ -48,17 +48,29 @@ pub fn build(b: *std.Build) !void {
         });
         root_module.linkLibrary(vma.artifact("VulkanMemoryAllocator"));
 
+        const cimgui_dep = b.dependency("cimgui_zig", .{
+            .target = target,
+            .optimize = optimize,
+            .platform = .SDL3,
+            .renderer = .Vulkan,
+        });
+        root_module.linkLibrary(cimgui_dep.artifact("cimgui"));
+
         const c_translate = b.addTranslateC(.{
             .root_source_file = b.addWriteFiles().add("c.h",
                 \\#include <SDL3/SDL.h>
                 \\#include <SDL3/SDL_vulkan.h>
                 \\#include <vk_mem_alloc.h>
+                \\#include <dcimgui.h>
+                \\#include <backends/dcimgui_impl_sdl3.h>
+                \\#include <backends/dcimgui_impl_vulkan.h>
             ),
             .target = target,
             .optimize = optimize,
         });
         c_translate.addIncludePath(sdl_dep.path("include"));
         c_translate.addIncludePath(vma.artifact("VulkanMemoryAllocator").getEmittedIncludeTree());
+        c_translate.addIncludePath(cimgui_dep.artifact("cimgui").getEmittedIncludeTree());
         root_module.addImport("c", c_translate.createModule());
     }
 

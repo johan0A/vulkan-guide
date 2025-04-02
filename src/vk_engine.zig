@@ -1,4 +1,6 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
+
 const vk = @import("vulkan");
 const c = @import("c");
 const tracy = @import("tracy");
@@ -17,34 +19,14 @@ const AllocatedImage = struct {
     image_format: vk.Format,
 };
 
-const Allocator = std.mem.Allocator;
-
-pub const apis: []const vk.ApiInfo = &.{
-    vk.features.version_1_3,
-    vk.features.version_1_2,
-    vk.features.version_1_1,
-    vk.features.version_1_0,
-    vk.extensions.khr_surface,
-    vk.extensions.khr_swapchain,
-};
-
 pub const QueueFamilyIndices = struct {
     graphics_family: ?u32,
     present_family: ?u32,
 };
 
-pub const Dispatch = struct {
-    pub const Base = vk.BaseWrapper(apis);
-    pub const Instance = vk.InstanceWrapper(apis);
-    pub const Device = vk.DeviceWrapper(apis);
-};
-
-const InstanceProxy = vk.InstanceProxy(apis);
-const DeviceProxy = vk.DeviceProxy(apis);
-
 const DeletionQueue = struct {
     const DeinitContext = struct {
-        device: DeviceProxy,
+        device: vk.DeviceProxy,
         vma_allocator: c.VmaAllocator,
     };
 
@@ -56,6 +38,10 @@ const DeletionQueue = struct {
         descriptor_set_layout: vk.DescriptorSetLayout,
         pipeline_layout: vk.PipelineLayout,
         pipeline: vk.Pipeline,
+        command_pool: vk.CommandPool,
+        fence: vk.Fence,
+        descriptor_pool: vk.DescriptorPool,
+        imgui_impl_vulkan: void,
 
         fn deinit(self: QueueItem, context: DeinitContext) void {
             switch (self) {
@@ -66,6 +52,10 @@ const DeletionQueue = struct {
                 .descriptor_set_layout => |item| context.device.destroyDescriptorSetLayout(item, null),
                 .pipeline_layout => |item| context.device.destroyPipelineLayout(item, null),
                 .pipeline => |item| context.device.destroyPipeline(item, null),
+                .command_pool => |item| context.device.destroyCommandPool(item, null),
+                .fence => |item| context.device.destroyFence(item, null),
+                .descriptor_pool => |item| context.device.destroyDescriptorPool(item, null),
+                .imgui_impl_vulkan => c.cImGui_ImplVulkan_Shutdown(),
             }
         }
     };
@@ -101,7 +91,7 @@ const DescriptorAllocator = struct {
 
     pool: vk.DescriptorPool,
 
-    pub fn initPool(temp: Allocator, device: DeviceProxy, max_sets: u32, pool_ratios: []const PoolSizeRatio) !DescriptorAllocator {
+    pub fn initPool(temp: Allocator, device: vk.DeviceProxy, max_sets: u32, pool_ratios: []const PoolSizeRatio) !DescriptorAllocator {
         const pool_sizes = try temp.alloc(vk.DescriptorPoolSize, pool_ratios.len);
         for (pool_sizes, pool_ratios) |*size, ratio| {
             size.* = vk.DescriptorPoolSize{
@@ -121,15 +111,15 @@ const DescriptorAllocator = struct {
         };
     }
 
-    pub fn clearDescriptors(self: DescriptorAllocator, device: DeviceProxy) void {
+    pub fn clearDescriptors(self: DescriptorAllocator, device: vk.DeviceProxy) void {
         device.resetDescriptorPool(self.pool, .{});
     }
 
-    pub fn destroyPool(self: DescriptorAllocator, device: DeviceProxy) void {
+    pub fn destroyPool(self: DescriptorAllocator, device: vk.DeviceProxy) void {
         device.destroyDescriptorPool(self.pool, null);
     }
 
-    pub fn allocate(self: DescriptorAllocator, device: DeviceProxy, layout: vk.DescriptorSetLayout) !vk.DescriptorSet {
+    pub fn allocate(self: DescriptorAllocator, device: vk.DeviceProxy, layout: vk.DescriptorSetLayout) !vk.DescriptorSet {
         const alloc_info: vk.DescriptorSetAllocateInfo = .{
             .descriptor_pool = self.pool,
             .descriptor_set_count = 1,
@@ -149,7 +139,7 @@ const SwapChain = struct {
     image_views: []vk.ImageView,
     extent: vk.Extent2D,
 
-    fn deinit(self: SwapChain, alloc: Allocator, device: DeviceProxy) void {
+    fn deinit(self: SwapChain, alloc: Allocator, device: vk.DeviceProxy) void {
         device.destroySwapchainKHR(self.handle, null);
         for (self.image_views) |image_view| {
             device.destroyImageView(image_view, null);
@@ -177,10 +167,10 @@ pub const VulkanEngine = struct {
 
     window: *c.SDL_Window,
 
-    base_dispatch: Dispatch.Base,
+    base_dispatch: vk.BaseWrapper,
 
-    instance: InstanceProxy,
-    device: DeviceProxy,
+    instance: vk.InstanceProxy,
+    device: vk.DeviceProxy,
 
     debug_messenger: vk.DebugUtilsMessengerEXT, // Vulkan debug output handle
     chosen_gpu: vk.PhysicalDevice, // GPU chosen as the default device
@@ -209,6 +199,11 @@ pub const VulkanEngine = struct {
 
     gradient_pipeline: vk.Pipeline,
     gradient_pipeline_layout: vk.PipelineLayout,
+
+    // immediate submit structures
+    imm_fence: vk.Fence,
+    imm_command_buffer: vk.CommandBuffer,
+    imm_command_pool: vk.CommandPool,
 
     pub fn draw(self: *VulkanEngine) !void {
         const local = struct {
@@ -265,8 +260,14 @@ pub const VulkanEngine = struct {
             // execute a copy from the draw image into the swapchain
             vk_image.copyImageToImage(self.device, cmd, self.draw_image.image, self.swapchain.images[swapchain_image_index], self.draw_extent, self.swapchain.extent);
 
+            // set swapchain image layout to Attachment Optimal so we can draw it
+            vk_image.transitionImage(self.device, cmd, self.swapchain.images[swapchain_image_index], .transfer_dst_optimal, .color_attachment_optimal);
+
+            //draw imgui into the swapchain image
+            drawImgui(self.swapchain.extent, self.device, cmd, self.swapchain.image_views[swapchain_image_index]);
+
             // set swapchain image layout to Present so we can show it on the screen
-            vk_image.transitionImage(self.device, cmd, self.swapchain.images[swapchain_image_index], .transfer_dst_optimal, .present_src_khr);
+            vk_image.transitionImage(self.device, cmd, self.swapchain.images[swapchain_image_index], .color_attachment_optimal, .present_src_khr);
         }
         //finalize the command buffer (we can no longer add commands, but it can now be executed)
         try self.device.endCommandBuffer(cmd);
@@ -298,6 +299,25 @@ pub const VulkanEngine = struct {
         self.frame_number += 1;
     }
 
+    fn immediateModeBegin(self: *VulkanEngine) vk.CommandBuffer {
+        try self.device.resetFences(1, &self.imm_fence);
+        try vk.ResetCommandBuffer(self.imm_command_buffer, 0);
+
+        try self.device.beginCommandBuffer(self.imm_command_buffer, &.{ .flags = .{ .one_time_submit_bit = true } });
+    }
+
+    fn immediateModeEnd(self: *VulkanEngine) vk.CommandBuffer {
+        try self.device.endCommandBuffer(self.imm_command_buffer);
+
+        const cmdinfo: vk.CommandBufferSubmitInfo = vk_init.commandBufferSubmitInfo(self.imm_command_buffer);
+        const submit: vk.SubmitInfo2 = vk_init.submitInfo(&cmdinfo, null, null);
+
+        // submit command buffer to the queue and execute it.
+        //  _renderFence will now block until the graphic commands finish execution
+        try self.device.queueSubmit2(self.graphics_queue, 1, &submit, self.imm_fence);
+        try self.device.waitForFences(1, &self.imm_fence, true, 9999999999);
+    }
+
     pub inline fn currentFrame(self: *VulkanEngine) *FrameData {
         return &self.frames[self.frame_number % FrameData.FRAME_OVERLAP];
     }
@@ -317,25 +337,25 @@ pub const VulkanEngine = struct {
         defer temp_arena.deinit();
         const temp_alloc = temp_arena.allocator();
 
-        const window_width = 400;
-        const window_height = 400;
+        const window_width = 1080;
+        const window_height = 1080;
 
         const tracy_SDL_CreateWindow = tracy.zoneEx(@src(), .{ .name = "SDL_CreateWindow" });
         const window = c.SDL_CreateWindow("title", window_width, window_height, c.SDL_WINDOW_VULKAN) orelse return error.engine_init_failure;
         tracy_SDL_CreateWindow.end();
 
         const tracy_load_base_dispatch = tracy.zoneEx(@src(), .{ .name = "load base_dispatch" });
-        const base_dispatch = try Dispatch.Base.load(@as(vk.PfnGetInstanceProcAddr, @ptrCast(c.SDL_Vulkan_GetVkGetInstanceProcAddr())));
+        const base_dispatch = vk.BaseWrapper.load(@as(vk.PfnGetInstanceProcAddr, @ptrCast(c.SDL_Vulkan_GetVkGetInstanceProcAddr())));
         tracy_load_base_dispatch.end();
 
         const instance = try vk_init.createVkInstance(base_dispatch, temp_alloc);
-        const instance_dispatch = try init_alloc.create(Dispatch.Instance);
+        const instance_dispatch = try init_alloc.create(vk.InstanceWrapper);
         {
             const tracy_load_instance_dispatch = tracy.zoneEx(@src(), .{ .name = "load instance_dispatch" });
-            instance_dispatch.* = try Dispatch.Instance.load(instance, base_dispatch.dispatch.vkGetInstanceProcAddr);
+            instance_dispatch.* = vk.InstanceWrapper.load(instance, base_dispatch.dispatch.vkGetInstanceProcAddr.?);
             tracy_load_instance_dispatch.end();
         }
-        const instance_proxy = InstanceProxy.init(instance, instance_dispatch);
+        const instance_proxy = vk.InstanceProxy.init(instance, instance_dispatch);
 
         const tracy_SDL_Vulkan_CreateSurface = tracy.zoneEx(@src(), .{ .name = "SDL_Vulkan_CreateSurface" });
         var surface: vk.SurfaceKHR = undefined;
@@ -346,18 +366,63 @@ pub const VulkanEngine = struct {
         const queue_family_indices = try vk_init.findQueueFamilies(physical_device, instance_dispatch.*, surface, temp_alloc);
 
         const device = try vk_init.createLogicalDevice(physical_device, instance_dispatch.*, queue_family_indices);
-        const device_dispatch = try init_alloc.create(Dispatch.Device);
+        const device_dispatch = try init_alloc.create(vk.DeviceWrapper);
         {
             const tracy_load_device_dispatch = tracy.zoneEx(@src(), .{ .name = "load device_dispatch" });
-            device_dispatch.* = try Dispatch.Device.load(device, instance_dispatch.dispatch.vkGetDeviceProcAddr);
+            device_dispatch.* = vk.DeviceWrapper.load(device, instance_dispatch.dispatch.vkGetDeviceProcAddr.?);
             tracy_load_device_dispatch.end();
         }
-        const device_proxy = DeviceProxy.init(device, device_dispatch);
+        const device_proxy = vk.DeviceProxy.init(device, device_dispatch);
+
+        // init_commands() {
+        // init_sync_structures() {
+        const command_pool_info: vk.CommandPoolCreateInfo = .{
+            .flags = .{ .reset_command_buffer_bit = true },
+            .queue_family_index = queue_family_indices.graphics_family.?,
+        };
+
+        const fence_create_info: vk.FenceCreateInfo = .{ .flags = .{ .signaled_bit = true } };
 
         var frames: [FrameData.FRAME_OVERLAP]FrameData = undefined;
         for (&frames) |*frame| {
-            frame.* = try vk_init.initFrame(device_proxy, queue_family_indices.graphics_family.?);
+            const command_pool = try device_proxy.createCommandPool(&command_pool_info, null);
+
+            var main_command_buffer: vk.CommandBuffer = undefined;
+            const cmd_alloc_info: vk.CommandBufferAllocateInfo = .{
+                .command_pool = command_pool,
+                .command_buffer_count = 1,
+                .level = .primary,
+            };
+            try device_proxy.allocateCommandBuffers(&cmd_alloc_info, (&main_command_buffer)[0..1]);
+
+            frame.* = .{
+                .command_pool = command_pool,
+                .render_fence = try device_proxy.createFence(&fence_create_info, null),
+                .swapchain_semaphore = try device_proxy.createSemaphore(&.{}, null),
+                .render_semaphore = try device_proxy.createSemaphore(&.{}, null),
+                .main_command_buffer = main_command_buffer,
+                .deletion_queue = .init,
+            };
         }
+
+        const imm_command_pool = try device_proxy.createCommandPool(&command_pool_info, null);
+
+        const cmd_alloc_info: vk.CommandBufferAllocateInfo = .{
+            .command_pool = imm_command_pool,
+            .command_buffer_count = 1,
+            .level = .primary,
+        };
+
+        var imm_command_buffer: vk.CommandBuffer = undefined;
+        try device_proxy.allocateCommandBuffers(&cmd_alloc_info, (&imm_command_buffer)[0..1]);
+
+        var main_deletion_queue: DeletionQueue = .init;
+        try main_deletion_queue.append(allocator, .{ .command_pool = imm_command_pool });
+
+        const imm_fence = try device_proxy.createFence(&fence_create_info, null);
+
+        try main_deletion_queue.append(allocator, .{ .fence = imm_fence });
+        // }}
 
         var vma_allocator: c.VmaAllocator = undefined;
         if (c.vmaCreateAllocator(&.{
@@ -371,7 +436,6 @@ pub const VulkanEngine = struct {
             },
         }, &vma_allocator) != 0) return error.vma_allocator_init_failed;
 
-        var main_deletion_queue: DeletionQueue = .init;
         try main_deletion_queue.append(allocator, .{ .vma_allocator = vma_allocator });
 
         const draw_allocated_image = blk: {
@@ -484,6 +548,110 @@ pub const VulkanEngine = struct {
         try main_deletion_queue.append(allocator, .{ .pipeline_layout = gradient_pipeline_layout });
         try main_deletion_queue.append(allocator, .{ .pipeline = gradient_pipeline });
 
+        const graphics_queue = device_proxy.getDeviceQueue(queue_family_indices.graphics_family.?, 0);
+
+        const swapchain = try vk_init.createSwapchain(
+            init_alloc,
+            temp_alloc,
+            physical_device,
+            device_proxy,
+            surface,
+            window_width,
+            window_height,
+            instance_dispatch.*,
+        );
+
+        {
+            // TODO: fix gamma corection of imgui:
+            // https://tuket.github.io/posts/2022-11-24-imgui-gamma/
+            // https://github.com/ocornut/imgui/issues/6611
+
+            // 1: create descriptor pool for IMGUI
+            //  the size of the pool is very oversize, but it's copied from imgui demo
+            //  itself.
+            const pool_sizes = [_]vk.DescriptorPoolSize{
+                .{ .type = .sampler, .descriptor_count = 1000 },
+                .{ .type = .combined_image_sampler, .descriptor_count = 1000 },
+                .{ .type = .sampled_image, .descriptor_count = 1000 },
+                .{ .type = .storage_image, .descriptor_count = 1000 },
+                .{ .type = .uniform_texel_buffer, .descriptor_count = 1000 },
+                .{ .type = .storage_texel_buffer, .descriptor_count = 1000 },
+                .{ .type = .uniform_buffer, .descriptor_count = 1000 },
+                .{ .type = .storage_buffer, .descriptor_count = 1000 },
+                .{ .type = .uniform_buffer_dynamic, .descriptor_count = 1000 },
+                .{ .type = .storage_buffer_dynamic, .descriptor_count = 1000 },
+                .{ .type = .input_attachment, .descriptor_count = 1000 },
+            };
+
+            const pool_info: vk.DescriptorPoolCreateInfo = .{
+                .flags = .{ .free_descriptor_set_bit = true },
+                .max_sets = 1000,
+                .pool_size_count = pool_sizes.len,
+                .p_pool_sizes = &pool_sizes,
+            };
+
+            const imguiPool = try device_proxy.createDescriptorPool(&pool_info, null);
+
+            //ImGui_ImplVulkan_LoadFunctions(VK_API_VERSION_1_3, [](const char* function_name, void*) { return vkGetInstanceProcAddr(your_vk_isntance, function_name); });
+            const imgui_vk_loader = struct {
+                var loader: vk.PfnGetInstanceProcAddr = undefined;
+                var instance_: vk.Instance = undefined;
+
+                fn f(name: [*c]const u8, _: ?*anyopaque) callconv(.c) c.PFN_vkVoidFunction {
+                    return @ptrCast(loader(
+                        instance_,
+                        @ptrCast(name),
+                    ));
+                }
+            };
+            imgui_vk_loader.loader = base_dispatch.dispatch.vkGetInstanceProcAddr.?;
+            imgui_vk_loader.instance_ = instance;
+
+            _ = c.cImGui_ImplVulkan_LoadFunctions(
+                @bitCast(vk.makeApiVersion(1, 3, 0, 0)), // TODO: set with global variable
+                imgui_vk_loader.f,
+            );
+
+            // 2: initialize imgui library
+
+            // this initializes the core structures of imgui
+            _ = c.ImGui_CreateContext(null);
+            const io: *c.ImGuiIO = c.ImGui_GetIO();
+            io.ConfigFlags |= c.ImGuiConfigFlags_NavEnableKeyboard; // Enable Keyboard Controls
+            io.ConfigFlags |= c.ImGuiConfigFlags_NavEnableGamepad; // Enable Gamepad Controls
+            io.WantSaveIniSettings = false; // TODO, reenable somehow that is not annoying when developping, maybe just changing gitignore?
+
+            // this initializes imgui for SDL
+            _ = c.cImGui_ImplSDL3_InitForVulkan(window);
+
+            std.debug.print("{}\n", .{swapchain.image_format});
+
+            // this initializes imgui for Vulkan
+            var init_info: c.ImGui_ImplVulkan_InitInfo = .{
+                .Instance = @ptrFromInt(@intFromEnum(instance)),
+                .PhysicalDevice = @ptrFromInt(@intFromEnum(physical_device)),
+                .Device = @ptrFromInt(@intFromEnum(device)),
+                .Queue = @ptrFromInt(@intFromEnum(graphics_queue)),
+                .DescriptorPool = @ptrFromInt(@intFromEnum(imguiPool)),
+                .MinImageCount = 3,
+                .ImageCount = 3,
+                .UseDynamicRendering = true,
+                //dynamic rendering parameters for imgui to use
+                .PipelineRenderingCreateInfo = .{
+                    .sType = c.VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+                    .colorAttachmentCount = 1,
+                    .pColorAttachmentFormats = @ptrCast(&swapchain.image_format),
+                },
+                .MSAASamples = c.VK_SAMPLE_COUNT_1_BIT,
+            };
+
+            _ = c.cImGui_ImplVulkan_Init(&init_info);
+            _ = c.cImGui_ImplVulkan_CreateFontsTexture();
+
+            try main_deletion_queue.append(allocator, .{ .descriptor_pool = imguiPool });
+            try main_deletion_queue.append(allocator, .imgui_impl_vulkan);
+        }
+
         return .{
             .init_arena = init_arena,
 
@@ -491,21 +659,12 @@ pub const VulkanEngine = struct {
             .base_dispatch = base_dispatch,
             .instance = instance_proxy,
             .device = device_proxy,
-            .swapchain = try vk_init.createSwapchain(
-                init_alloc,
-                temp_alloc,
-                physical_device,
-                device_proxy,
-                surface,
-                window_width,
-                window_height,
-                instance_dispatch.*,
-            ),
+            .swapchain = swapchain,
             .debug_messenger = .null_handle,
             .chosen_gpu = physical_device,
             .surface = surface,
 
-            .graphics_queue = device_proxy.getDeviceQueue(queue_family_indices.graphics_family.?, 0),
+            .graphics_queue = graphics_queue,
             .graphics_queue_family = queue_family_indices.graphics_family.?,
 
             .frame_number = 0,
@@ -525,6 +684,10 @@ pub const VulkanEngine = struct {
 
             .gradient_pipeline_layout = gradient_pipeline_layout,
             .gradient_pipeline = gradient_pipeline,
+
+            .imm_command_buffer = imm_command_buffer,
+            .imm_command_pool = imm_command_pool,
+            .imm_fence = imm_fence,
         };
     }
 
@@ -563,7 +726,7 @@ pub const VulkanEngine = struct {
 
     pub fn initGradientPipeline(
         draw_image_descriptor_layout: vk.DescriptorSetLayout,
-        device: DeviceProxy,
+        device: vk.DeviceProxy,
     ) !struct { vk.PipelineLayout, vk.Pipeline } {
         const computeLayout: vk.PipelineLayoutCreateInfo = .{
             .p_set_layouts = (&draw_image_descriptor_layout)[0..1],
@@ -593,6 +756,17 @@ pub const VulkanEngine = struct {
 
         return .{ gradient_pipeline_layout, gradient_pipeline };
     }
+
+    fn drawImgui(swapchainExtent: vk.Extent2D, device: vk.DeviceProxy, cmd: vk.CommandBuffer, targetImageView: vk.ImageView) void {
+        const colorAttachment: vk.RenderingAttachmentInfo = vk_init.attachmentInfo(targetImageView, null, .attachment_optimal);
+        const renderInfo: vk.RenderingInfo = vk_init.renderingInfo(swapchainExtent, &colorAttachment, null);
+
+        device.cmdBeginRendering(cmd, &renderInfo);
+
+        c.cImGui_ImplVulkan_RenderDrawData(c.ImGui_GetDrawData(), @ptrFromInt(@intFromEnum(cmd)));
+
+        device.cmdEndRendering(cmd);
+    }
 };
 
 const vk_descriptors = struct {
@@ -612,7 +786,7 @@ const vk_descriptors = struct {
 
         pub fn createSet(
             bindings: []vk.DescriptorSetLayoutBinding,
-            device: DeviceProxy,
+            device: vk.DeviceProxy,
             shader_stages: vk.ShaderStageFlags,
             p_next: ?*anyopaque,
             flags: vk.DescriptorSetLayoutCreateFlags,
@@ -638,7 +812,7 @@ const vk_descriptors = struct {
 
 const vk_image = struct {
     fn transitionImage(
-        device: DeviceProxy,
+        device: vk.DeviceProxy,
         cmd: vk.CommandBuffer,
         image: vk.Image,
         current_layout: vk.ImageLayout,
@@ -671,7 +845,7 @@ const vk_image = struct {
     }
 
     fn copyImageToImage(
-        device: DeviceProxy,
+        device: vk.DeviceProxy,
         cmd: vk.CommandBuffer,
         source: vk.Image,
         destination: vk.Image,
@@ -717,7 +891,37 @@ const vk_image = struct {
 };
 
 const vk_init = struct {
-    pub fn loadShaderModule(comptime file: []const u8, device: DeviceProxy) !vk.ShaderModule {
+    fn renderingInfo(renderExtent: vk.Extent2D, colorAttachment: *const vk.RenderingAttachmentInfo, depthAttachment: ?*const vk.RenderingAttachmentInfo) vk.RenderingInfo {
+        const renderInfo: vk.RenderingInfo = .{
+            .render_area = vk.Rect2D{ .offset = vk.Offset2D{ .x = 0, .y = 0 }, .extent = renderExtent },
+            .layer_count = 1,
+            .color_attachment_count = 1,
+            .p_color_attachments = colorAttachment[0..1],
+            .p_depth_attachment = depthAttachment,
+            .p_stencil_attachment = null,
+
+            .view_mask = 0,
+        };
+        return renderInfo;
+    }
+
+    // VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+    fn attachmentInfo(view: vk.ImageView, clear: ?*vk.ClearValue, layout: vk.ImageLayout) vk.RenderingAttachmentInfo {
+        const colorAttachment: vk.RenderingAttachmentInfo = .{
+            .image_view = view,
+            .image_layout = layout,
+            .load_op = if (clear) |_| .clear else .load,
+            .store_op = .store,
+            .clear_value = if (clear) |item| item.* else std.mem.zeroes(vk.ClearValue),
+
+            .resolve_mode = .{},
+            .resolve_image_layout = .undefined,
+        };
+
+        return colorAttachment;
+    }
+
+    pub fn loadShaderModule(comptime file: []const u8, device: vk.DeviceProxy) !vk.ShaderModule {
         const spv align(@alignOf(u32)) = file[0..].*;
 
         return try device.createShaderModule(&.{
@@ -812,33 +1016,7 @@ const vk_init = struct {
         return subImage;
     }
 
-    fn initFrame(device: DeviceProxy, graphics_queue_family_index: u32) !FrameData {
-        const command_pool_info: vk.CommandPoolCreateInfo = .{
-            .flags = .{ .reset_command_buffer_bit = true },
-            .queue_family_index = graphics_queue_family_index,
-        };
-
-        const command_pool = try device.createCommandPool(&command_pool_info, null);
-
-        var main_command_buffer: vk.CommandBuffer = undefined;
-        const cmd_alloc_info: vk.CommandBufferAllocateInfo = .{
-            .command_pool = command_pool,
-            .command_buffer_count = 1,
-            .level = .primary,
-        };
-        try device.allocateCommandBuffers(&cmd_alloc_info, (&main_command_buffer)[0..1]);
-
-        return .{
-            .command_pool = command_pool,
-            .render_fence = try device.createFence(&.{ .flags = .{ .signaled_bit = true } }, null),
-            .swapchain_semaphore = try device.createSemaphore(&.{}, null),
-            .render_semaphore = try device.createSemaphore(&.{}, null),
-            .main_command_buffer = main_command_buffer,
-            .deletion_queue = .init,
-        };
-    }
-
-    pub fn createVkInstance(base_dispatch: Dispatch.Base, temp_alloc: Allocator) !vk.Instance {
+    pub fn createVkInstance(base_dispatch: vk.BaseWrapper, temp_alloc: Allocator) !vk.Instance {
         const zone = tracy.zone(@src());
         defer zone.end();
 
@@ -876,7 +1054,7 @@ const vk_init = struct {
         );
     }
 
-    pub fn checkValidationLayerSupport(temp_alloc: Allocator, base_dispatch: Dispatch.Base) !void {
+    pub fn checkValidationLayerSupport(temp_alloc: Allocator, base_dispatch: vk.BaseWrapper) !void {
         const zone = tracy.zone(@src());
         defer zone.end();
 
@@ -897,7 +1075,7 @@ const vk_init = struct {
         }
     }
 
-    pub fn pickPhysicalDevice(instance: InstanceProxy, surface: vk.SurfaceKHR, temp_alloc: Allocator) !vk.PhysicalDevice {
+    pub fn pickPhysicalDevice(instance: vk.InstanceProxy, surface: vk.SurfaceKHR, temp_alloc: Allocator) !vk.PhysicalDevice {
         const zone = tracy.zone(@src());
         defer zone.end();
 
@@ -917,7 +1095,7 @@ const vk_init = struct {
 
     pub fn isPhysicalDeviceSuitable(
         physical_device: vk.PhysicalDevice,
-        instance_dispatch: Dispatch.Instance,
+        instance_dispatch: vk.InstanceWrapper,
         surface: vk.SurfaceKHR,
         temp_alloc: Allocator,
     ) !bool {
@@ -934,7 +1112,7 @@ const vk_init = struct {
 
     pub fn findQueueFamilies(
         physical_device: vk.PhysicalDevice,
-        instance_dispatch: Dispatch.Instance,
+        instance_dispatch: vk.InstanceWrapper,
         surface: vk.SurfaceKHR,
         temp_alloc: Allocator,
     ) !QueueFamilyIndices {
@@ -969,7 +1147,7 @@ const vk_init = struct {
 
     pub fn checkDeviceExtensionSupport(
         physical_device: vk.PhysicalDevice,
-        instance_dispatch: Dispatch.Instance,
+        instance_dispatch: vk.InstanceWrapper,
         temp_alloc: Allocator,
     ) !bool {
         const zone = tracy.zone(@src());
@@ -994,7 +1172,7 @@ const vk_init = struct {
 
     pub fn createLogicalDevice(
         physical_device: vk.PhysicalDevice,
-        instance_dispatch: Dispatch.Instance,
+        instance_dispatch: vk.InstanceWrapper,
         queue_family_indices: QueueFamilyIndices,
     ) !vk.Device {
         const zone = tracy.zone(@src());
@@ -1046,11 +1224,11 @@ const vk_init = struct {
         alloc: std.mem.Allocator,
         temp_alloc: std.mem.Allocator,
         physical_device: vk.PhysicalDevice,
-        device: DeviceProxy,
+        device: vk.DeviceProxy,
         surface: vk.SurfaceKHR,
         window_width: u32,
         window_height: u32,
-        instance_dispatch: Dispatch.Instance,
+        instance_dispatch: vk.InstanceWrapper,
     ) !SwapChain {
         const zone = tracy.zone(@src());
         defer zone.end();
@@ -1073,7 +1251,7 @@ const vk_init = struct {
 
         // Try fallback format if preferred not found
         if (!swapchain_image_format_found) {
-            swapchain_image_format = .b8g8r8a8_srgb;
+            swapchain_image_format = .r8g8b8a8_srgb;
             for (surface_formats) |format| {
                 if (swapchain_image_format == format.format) {
                     swapchain_image_format_found = true;
