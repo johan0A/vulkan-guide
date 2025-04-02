@@ -48,6 +48,5 @@ void main(
         * abs(1.0f / (30.0f * uv.y));
     float3 horBeam = float3(beamWidth, beamWidth, beamWidth);
 
-    
     gImage[texelCoord] = float4(horBeam * horColour, 1.0f);
 }

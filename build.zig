@@ -84,6 +84,7 @@ pub fn build(b: *std.Build) !void {
 
         b.installArtifact(exe);
         const run_cmd = b.addRunArtifact(exe);
+        run_cmd.cwd = b.path("zig-out/bin/");
         run_cmd.step.dependOn(b.getInstallStep());
 
         if (b.args) |args| run_cmd.addArgs(args);
@@ -130,9 +131,10 @@ fn shadersModule(
         if (!std.mem.eql(u8, std.fs.path.extension(shader_file.name), ".slang")) continue;
 
         const stem = std.fs.path.stem(shader_file.name);
+
         generated_file.appendSlice(
             b.allocator,
-            std.fmt.allocPrint(b.allocator, "pub const {s} = @embedFile(\"{s}\");\n", .{ stem, stem }) catch @panic("OOM"),
+            b.fmt("pub const {s} = \"shaders/{s}.spv\";", .{ stem, stem }),
         ) catch @panic("OOM");
 
         const slang_path = b.dependency("zig_slang_binaries", .{}).namedLazyPath("binaries");
@@ -143,9 +145,8 @@ fn shadersModule(
         system_command.addArg("-o");
         const out_path = system_command.addOutputFileArg("comp.spv");
 
-        module.addAnonymousImport(stem, .{
-            .root_source_file = out_path,
-        });
+        const install = b.addInstallFile(out_path, b.fmt("bin/shaders/{s}.spv", .{stem}));
+        b.getInstallStep().dependOn(&install.step);
     }
 
     module.root_source_file = b.addWriteFiles().add("shaders.zig", generated_file.items);

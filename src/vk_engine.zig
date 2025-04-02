@@ -27,7 +27,7 @@ pub const QueueFamilyIndices = struct {
 const DeletionQueue = struct {
     const DeinitContext = struct {
         device: vk.DeviceProxy,
-        vma_allocator: c.VmaAllocator,
+        vma_allocator: ?c.VmaAllocator,
     };
 
     const QueueItem = union(enum) {
@@ -47,7 +47,7 @@ const DeletionQueue = struct {
             switch (self) {
                 .vma_allocator => |item| c.vmaDestroyAllocator(item),
                 .image_view => |item| context.device.destroyImageView(item, null),
-                .vma_allocated_image => |item| c.vmaDestroyImage(context.vma_allocator, @ptrFromInt(@intFromEnum(item.image)), item.allocation),
+                .vma_allocated_image => |item| c.vmaDestroyImage(context.vma_allocator.?, @ptrFromInt(@intFromEnum(item.image)), item.allocation),
                 .descriptor_allocator => |item| item.destroyPool(context.device),
                 .descriptor_set_layout => |item| context.device.destroyDescriptorSetLayout(item, null),
                 .pipeline_layout => |item| context.device.destroyPipelineLayout(item, null),
@@ -331,6 +331,7 @@ pub const VulkanEngine = struct {
         tracy_SDL_Init.end();
 
         var init_arena: std.heap.ArenaAllocator = .init(allocator);
+        errdefer init_arena.deinit();
         const init_alloc = init_arena.allocator();
 
         var temp_arena: std.heap.ArenaAllocator = .init(allocator);
@@ -420,7 +421,6 @@ pub const VulkanEngine = struct {
         try main_deletion_queue.append(allocator, .{ .command_pool = imm_command_pool });
 
         const imm_fence = try device_proxy.createFence(&fence_create_info, null);
-
         try main_deletion_queue.append(allocator, .{ .fence = imm_fence });
         // }}
 
@@ -437,6 +437,11 @@ pub const VulkanEngine = struct {
         }, &vma_allocator) != 0) return error.vma_allocator_init_failed;
 
         try main_deletion_queue.append(allocator, .{ .vma_allocator = vma_allocator });
+
+        errdefer main_deletion_queue.deinit(allocator, .{
+            .device = device_proxy,
+            .vma_allocator = vma_allocator,
+        }); // TODO: find a way to move this next to the main_deletion_queue's init
 
         const draw_allocated_image = blk: {
             const draw_image_format: vk.Format = .r16g16b16a16_sfloat;
@@ -543,7 +548,7 @@ pub const VulkanEngine = struct {
         try main_deletion_queue.append(allocator, .{ .descriptor_set_layout = draw_image_descriptor_layout });
         try main_deletion_queue.append(allocator, .{ .descriptor_allocator = global_descriptor_allocator });
 
-        const gradient_pipeline_layout, const gradient_pipeline = try initGradientPipeline(draw_image_descriptor_layout, device_proxy);
+        const gradient_pipeline_layout, const gradient_pipeline = try initGradientPipeline(temp_alloc, draw_image_descriptor_layout, device_proxy);
 
         try main_deletion_queue.append(allocator, .{ .pipeline_layout = gradient_pipeline_layout });
         try main_deletion_queue.append(allocator, .{ .pipeline = gradient_pipeline });
@@ -623,8 +628,6 @@ pub const VulkanEngine = struct {
 
             // this initializes imgui for SDL
             _ = c.cImGui_ImplSDL3_InitForVulkan(window);
-
-            std.debug.print("{}\n", .{swapchain.image_format});
 
             // this initializes imgui for Vulkan
             var init_info: c.ImGui_ImplVulkan_InitInfo = .{
@@ -725,6 +728,7 @@ pub const VulkanEngine = struct {
     }
 
     pub fn initGradientPipeline(
+        temp: Allocator,
         draw_image_descriptor_layout: vk.DescriptorSetLayout,
         device: vk.DeviceProxy,
     ) !struct { vk.PipelineLayout, vk.Pipeline } {
@@ -734,7 +738,12 @@ pub const VulkanEngine = struct {
         };
         const gradient_pipeline_layout = try device.createPipelineLayout(&computeLayout, null);
 
-        const computeDrawShader: vk.ShaderModule = try vk_init.loadShaderModule(shaders.comp, device);
+        const file = try std.fs.cwd().openFile(shaders.comp, .{});
+
+        const computeDrawShader: vk.ShaderModule = try vk_init.loadShaderModule(
+            try file.readToEndAllocOptions(temp, 1e6, null, @alignOf(u32), null),
+            device,
+        );
 
         const stageinfo: vk.PipelineShaderStageCreateInfo = .{
             .stage = .{ .compute_bit = true },
@@ -921,12 +930,11 @@ const vk_init = struct {
         return colorAttachment;
     }
 
-    pub fn loadShaderModule(comptime file: []const u8, device: vk.DeviceProxy) !vk.ShaderModule {
-        const spv align(@alignOf(u32)) = file[0..].*;
-
+    pub fn loadShaderModule(file: []align(@alignOf(u32)) const u8, device: vk.DeviceProxy) !vk.ShaderModule {
+        const data: []const u32 = @ptrCast(file);
         return try device.createShaderModule(&.{
-            .code_size = spv.len,
-            .p_code = @ptrCast(&spv),
+            .code_size = file.len,
+            .p_code = data.ptr,
         }, null);
     }
 
