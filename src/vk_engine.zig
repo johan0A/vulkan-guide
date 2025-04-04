@@ -223,7 +223,6 @@ pub const VulkanEngine = struct {
                 );
             }
         };
-
         _ = try self.device.waitForFences(1, (&self.currentFrame().render_fence)[0..1], vk.TRUE, 1e9);
         _ = try self.device.resetFences(1, (&self.currentFrame().render_fence)[0..1]);
 

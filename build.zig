@@ -143,7 +143,7 @@ fn shadersModule(
         const system_command = b.addSystemCommand(&.{slang_exe_path.getPath2(b, null)});
         system_command.addFileArg(path.join(b.allocator, shader_file.name) catch @panic("OOM"));
         system_command.addArg("-o");
-        const out_path = system_command.addOutputFileArg("comp.spv");
+        const out_path = system_command.addOutputFileArg(b.fmt("{s}.spv", .{stem}));
 
         const install = b.addInstallFile(out_path, b.fmt("bin/shaders/{s}.spv", .{stem}));
         b.getInstallStep().dependOn(&install.step);
