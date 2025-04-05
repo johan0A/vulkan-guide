@@ -11,6 +11,12 @@ const validation_layers = [_][:0]const u8{"VK_LAYER_KHRONOS_validation"};
 
 pub const required_device_extensions = [_][:0]const u8{vk.extensions.khr_swapchain.name};
 
+const ShaderData = struct {
+    /// in bytes
+    size: usize,
+    ptr: [*]const u32,
+};
+
 const AllocatedImage = struct {
     image: vk.Image,
     image_view: vk.ImageView,
@@ -628,6 +634,8 @@ pub const VulkanEngine = struct {
             // this initializes imgui for SDL
             _ = c.cImGui_ImplSDL3_InitForVulkan(window);
 
+            const frag_shader = try loadShader(shaders.imgui_frag, temp_alloc);
+
             // this initializes imgui for Vulkan
             var init_info: c.ImGui_ImplVulkan_InitInfo = .{
                 .Instance = @ptrFromInt(@intFromEnum(instance)),
@@ -645,6 +653,8 @@ pub const VulkanEngine = struct {
                     .pColorAttachmentFormats = @ptrCast(&swapchain.image_format),
                 },
                 .MSAASamples = c.VK_SAMPLE_COUNT_1_BIT,
+                .CustomFragShader = frag_shader.ptr,
+                .CustomFragShaderSize = frag_shader.size,
             };
 
             _ = c.cImGui_ImplVulkan_Init(&init_info);
@@ -737,12 +747,9 @@ pub const VulkanEngine = struct {
         };
         const gradient_pipeline_layout = try device.createPipelineLayout(&computeLayout, null);
 
-        const file = try std.fs.cwd().openFile(shaders.comp, .{});
+        const shader_data = try loadShader(shaders.comp, temp);
 
-        const computeDrawShader: vk.ShaderModule = try vk_init.loadShaderModule(
-            try file.readToEndAllocOptions(temp, 1e6, null, @alignOf(u32), null),
-            device,
-        );
+        const computeDrawShader: vk.ShaderModule = try vk_init.loadShaderModule(shader_data, device);
 
         const stageinfo: vk.PipelineShaderStageCreateInfo = .{
             .stage = .{ .compute_bit = true },
@@ -929,11 +936,10 @@ const vk_init = struct {
         return colorAttachment;
     }
 
-    pub fn loadShaderModule(file: []align(@alignOf(u32)) const u8, device: vk.DeviceProxy) !vk.ShaderModule {
-        const data: []const u32 = @ptrCast(file);
+    pub fn loadShaderModule(shader_data: ShaderData, device: vk.DeviceProxy) !vk.ShaderModule {
         return try device.createShaderModule(&.{
-            .code_size = file.len,
-            .p_code = data.ptr,
+            .code_size = shader_data.size,
+            .p_code = shader_data.ptr,
         }, null);
     }
 
@@ -1357,3 +1363,13 @@ const vk_init = struct {
         };
     }
 };
+
+fn loadShader(relative_path: []const u8, allocator: Allocator) !ShaderData {
+    const file = try std.fs.cwd().openFile(relative_path, .{});
+    const data = try file.readToEndAllocOptions(allocator, 1e6, null, @alignOf(u32), null);
+
+    return ShaderData{
+        .ptr = @ptrCast(data.ptr),
+        .size = data.len,
+    };
+}

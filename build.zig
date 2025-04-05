@@ -34,7 +34,7 @@ pub fn build(b: *std.Build) !void {
     {
         const sdl_dep = b.dependency("sdl", .{
             .target = target,
-            .optimize = .ReleaseFast, // TODO: change to `optimize` when SDL dep is fixed https://github.com/castholm/SDL/issues/9
+            .optimize = optimize,
             .preferred_link_mode = .static,
         });
         root_module.linkLibrary(sdl_dep.artifact("SDL3"));
@@ -48,13 +48,20 @@ pub fn build(b: *std.Build) !void {
         });
         root_module.linkLibrary(vma.artifact("VulkanMemoryAllocator"));
 
-        const cimgui_dep = b.dependency("cimgui_zig", .{
+        const vulkan_headers_dep = b.dependency("vulkan_headers", .{
             .target = target,
             .optimize = optimize,
-            .platform = .SDL3,
-            .renderer = .Vulkan,
         });
-        root_module.linkLibrary(cimgui_dep.artifact("cimgui"));
+
+        const cimgui_dep = b.dependency("dcimgui", .{
+            .target = target,
+            .optimize = optimize,
+            .@"include-path-list" = @as([]const std.Build.LazyPath, &.{
+                vulkan_headers_dep.artifact("vulkan-headers").getEmittedIncludeTree(),
+                sdl_dep.artifact("SDL3").getEmittedIncludeTree(),
+            }),
+        });
+        root_module.linkLibrary(cimgui_dep.artifact("cimgui_clib"));
 
         const c_translate = b.addTranslateC(.{
             .root_source_file = b.addWriteFiles().add("c.h",
@@ -62,15 +69,15 @@ pub fn build(b: *std.Build) !void {
                 \\#include <SDL3/SDL_vulkan.h>
                 \\#include <vk_mem_alloc.h>
                 \\#include <dcimgui.h>
-                \\#include <backends/dcimgui_impl_sdl3.h>
-                \\#include <backends/dcimgui_impl_vulkan.h>
+                \\#include <dcimgui_impl_sdl3.h>
+                \\#include <dcimgui_impl_vulkan.h>
             ),
             .target = target,
             .optimize = optimize,
         });
-        c_translate.addIncludePath(sdl_dep.path("include"));
+        c_translate.addIncludePath(sdl_dep.artifact("SDL3").getEmittedIncludeTree());
         c_translate.addIncludePath(vma.artifact("VulkanMemoryAllocator").getEmittedIncludeTree());
-        c_translate.addIncludePath(cimgui_dep.artifact("cimgui").getEmittedIncludeTree());
+        c_translate.addIncludePath(cimgui_dep.artifact("cimgui_clib").getEmittedIncludeTree());
         root_module.addImport("c", c_translate.createModule());
     }
 
