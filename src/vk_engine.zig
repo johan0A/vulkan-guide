@@ -203,8 +203,8 @@ pub const VulkanEngine = struct {
 
     globalDescriptorAllocator: DescriptorAllocator,
 
-    gradient_pipeline: vk.Pipeline,
-    gradient_pipeline_layout: vk.PipelineLayout,
+    background_effects: []ComputeEffect,
+    active_background_effect: u32,
 
     // immediate submit structures
     imm_fence: vk.Fence,
@@ -215,10 +215,30 @@ pub const VulkanEngine = struct {
         const local = struct {
             fn drawBackground(engine: *VulkanEngine, cmd: vk.CommandBuffer) void {
                 // bind the gradient drawing compute pipeline
-                engine.device.cmdBindPipeline(cmd, .compute, engine.gradient_pipeline);
+                engine.device.cmdBindPipeline(cmd, .compute, engine.background_effects[engine.active_background_effect].pipeline);
 
                 // bind the descriptor set containing the draw image for the compute pipeline
-                engine.device.cmdBindDescriptorSets(cmd, .compute, engine.gradient_pipeline_layout, 0, 1, (&engine.draw_image_descriptors)[0..1], 0, null);
+                engine.device.cmdBindDescriptorSets(
+                    cmd,
+                    .compute,
+                    engine.background_effects[engine.active_background_effect].layout,
+                    0,
+                    1,
+                    (&engine.draw_image_descriptors)[0..1],
+                    0,
+                    null,
+                );
+
+                std.debug.print("", .{});
+
+                engine.device.cmdPushConstants(
+                    cmd,
+                    engine.background_effects[engine.active_background_effect].layout,
+                    .{ .compute_bit = true },
+                    0,
+                    @intCast(engine.background_effects[engine.active_background_effect].data.size()),
+                    @ptrCast(engine.background_effects[engine.active_background_effect].data.payloadPtr()),
+                );
 
                 // execute the compute pipeline dispatch. We are using 16x16 workgroup size so we need to divide by it
                 engine.device.cmdDispatch(
@@ -269,7 +289,7 @@ pub const VulkanEngine = struct {
             vk_image.transitionImage(self.device, cmd, self.swapchain.images[swapchain_image_index], .transfer_dst_optimal, .color_attachment_optimal);
 
             //draw imgui into the swapchain image
-            drawImgui(self.swapchain.extent, self.device, cmd, self.swapchain.image_views[swapchain_image_index]);
+            self.drawImgui(cmd, self.swapchain.image_views[swapchain_image_index]);
 
             // set swapchain image layout to Present so we can show it on the screen
             vk_image.transitionImage(self.device, cmd, self.swapchain.images[swapchain_image_index], .color_attachment_optimal, .present_src_khr);
@@ -553,10 +573,63 @@ pub const VulkanEngine = struct {
         try main_deletion_queue.append(allocator, .{ .descriptor_set_layout = draw_image_descriptor_layout });
         try main_deletion_queue.append(allocator, .{ .descriptor_allocator = global_descriptor_allocator });
 
-        const gradient_pipeline_layout, const gradient_pipeline = try initGradientPipeline(temp_alloc, draw_image_descriptor_layout, device_proxy);
+        // backround effects init ------------
+        const effect_infos = [_]struct { path: []const u8, default_data: ComputeEffect.ComputeData, name: [:0]const u8 }{
+            .{ .path = shaders.color, .default_data = .{ .color = .{ 1, 0, 0, 1 } }, .name = "color" },
+            .{ .path = shaders.circle, .default_data = .{ .circle_effect = .{} }, .name = "circle" },
+        };
 
-        try main_deletion_queue.append(allocator, .{ .pipeline_layout = gradient_pipeline_layout });
-        try main_deletion_queue.append(allocator, .{ .pipeline = gradient_pipeline });
+        const background_effects = try init_alloc.alloc(ComputeEffect, effect_infos.len);
+
+        for (effect_infos, background_effects) |effect_info, *background_effect| {
+            const shader_data = try loadShader(effect_info.path, temp_alloc);
+
+            const pushConstant: vk.PushConstantRange = .{
+                .offset = 0,
+                .size = @intCast(effect_info.default_data.size()),
+                .stage_flags = .{ .compute_bit = true },
+            };
+
+            const computeLayout: vk.PipelineLayoutCreateInfo = .{
+                .p_set_layouts = (&draw_image_descriptor_layout)[0..1],
+                .set_layout_count = 1,
+                .p_push_constant_ranges = (&pushConstant)[0..1],
+                .push_constant_range_count = 1,
+            };
+
+            const gradient_pipeline_layout = try device_proxy.createPipelineLayout(&computeLayout, null);
+
+            const computeDrawShader: vk.ShaderModule = try vk_init.loadShaderModule(shader_data, device_proxy);
+            defer device_proxy.destroyShaderModule(computeDrawShader, null);
+
+            const stageinfo: vk.PipelineShaderStageCreateInfo = .{
+                .stage = .{ .compute_bit = true },
+                .module = computeDrawShader,
+                .p_name = "main",
+            };
+
+            const computePipelineCreateInfo: vk.ComputePipelineCreateInfo = .{
+                .layout = gradient_pipeline_layout,
+                .stage = stageinfo,
+
+                .base_pipeline_index = 0,
+            };
+
+            var gradient_pipeline: vk.Pipeline = undefined;
+            _ = try device_proxy.createComputePipelines(.null_handle, 1, (&computePipelineCreateInfo)[0..1], null, (&gradient_pipeline)[0..1]);
+
+            try main_deletion_queue.append(allocator, .{ .pipeline_layout = gradient_pipeline_layout });
+            try main_deletion_queue.append(allocator, .{ .pipeline = gradient_pipeline });
+
+            background_effect.* = ComputeEffect{
+                .name = effect_info.name,
+
+                .pipeline = gradient_pipeline,
+                .layout = gradient_pipeline_layout,
+
+                .data = effect_info.default_data,
+            };
+        }
 
         const graphics_queue = device_proxy.getDeviceQueue(queue_family_indices.graphics_family.?, 0);
 
@@ -602,7 +675,6 @@ pub const VulkanEngine = struct {
 
             const imguiPool = try device_proxy.createDescriptorPool(&pool_info, null);
 
-            //ImGui_ImplVulkan_LoadFunctions(VK_API_VERSION_1_3, [](const char* function_name, void*) { return vkGetInstanceProcAddr(your_vk_isntance, function_name); });
             const imgui_vk_loader = struct {
                 var loader: vk.PfnGetInstanceProcAddr = undefined;
                 var instance_: vk.Instance = undefined;
@@ -629,7 +701,6 @@ pub const VulkanEngine = struct {
             const io: *c.ImGuiIO = c.ImGui_GetIO();
             io.ConfigFlags |= c.ImGuiConfigFlags_NavEnableKeyboard; // Enable Keyboard Controls
             io.ConfigFlags |= c.ImGuiConfigFlags_NavEnableGamepad; // Enable Gamepad Controls
-            io.WantSaveIniSettings = false; // TODO, reenable somehow that is not annoying when developping, maybe just changing gitignore?
 
             // this initializes imgui for SDL
             _ = c.cImGui_ImplSDL3_InitForVulkan(window);
@@ -694,8 +765,8 @@ pub const VulkanEngine = struct {
             .draw_image_descriptors = draw_image_descriptors,
             .draw_image_descriptor_set_layout = draw_image_descriptor_layout,
 
-            .gradient_pipeline_layout = gradient_pipeline_layout,
-            .gradient_pipeline = gradient_pipeline,
+            .background_effects = background_effects,
+            .active_background_effect = 0,
 
             .imm_command_buffer = imm_command_buffer,
             .imm_command_pool = imm_command_pool,
@@ -736,51 +807,35 @@ pub const VulkanEngine = struct {
         self.init_arena.deinit();
     }
 
-    pub fn initGradientPipeline(
-        temp: Allocator,
-        draw_image_descriptor_layout: vk.DescriptorSetLayout,
-        device: vk.DeviceProxy,
-    ) !struct { vk.PipelineLayout, vk.Pipeline } {
-        const computeLayout: vk.PipelineLayoutCreateInfo = .{
-            .p_set_layouts = (&draw_image_descriptor_layout)[0..1],
-            .set_layout_count = 1,
-        };
-        const gradient_pipeline_layout = try device.createPipelineLayout(&computeLayout, null);
+    fn drawImgui(self: *VulkanEngine, cmd: vk.CommandBuffer, targetImageView: vk.ImageView) void {
+        const colorAttachment = vk_init.attachmentInfo(targetImageView, null, .attachment_optimal);
+        const renderInfo = vk_init.renderingInfo(self.swapchain.extent, &colorAttachment, null);
 
-        const shader_data = try loadShader(shaders.comp, temp);
+        self.device.cmdBeginRendering(cmd, &renderInfo);
 
-        const computeDrawShader: vk.ShaderModule = try vk_init.loadShaderModule(shader_data, device);
+        c.cImGui_ImplVulkan_NewFrame();
+        c.cImGui_ImplSDL3_NewFrame();
+        c.ImGui_NewFrame();
 
-        const stageinfo: vk.PipelineShaderStageCreateInfo = .{
-            .stage = .{ .compute_bit = true },
-            .module = computeDrawShader,
-            .p_name = "main",
-        };
+        c.ImGui_SetNextWindowSize(.{ .x = 300, .y = 200 }, c.ImGuiCond_Once);
+        if (c.ImGui_Begin("out", null, 0)) {
+            if (self.background_effects.len > 1) {
+                if (c.ImGui_BeginCombo("Select an option", self.background_effects[self.active_background_effect].name, 0)) {
+                    for (self.background_effects, 0..) |effect, i| {
+                        if (c.ImGui_Selectable(effect.name)) self.active_background_effect = @intCast(i);
+                        if (self.active_background_effect == i) c.ImGui_SetItemDefaultFocus();
+                    }
+                    c.ImGui_EndCombo();
+                }
+            }
+            self.background_effects[self.active_background_effect].data.imGuiMenu();
+        }
+        c.ImGui_End();
 
-        const computePipelineCreateInfo: vk.ComputePipelineCreateInfo = .{
-            .layout = gradient_pipeline_layout,
-            .stage = stageinfo,
-
-            .base_pipeline_index = 0,
-        };
-
-        var gradient_pipeline: vk.Pipeline = undefined;
-        _ = try device.createComputePipelines(.null_handle, 1, (&computePipelineCreateInfo)[0..1], null, (&gradient_pipeline)[0..1]);
-
-        device.destroyShaderModule(computeDrawShader, null);
-
-        return .{ gradient_pipeline_layout, gradient_pipeline };
-    }
-
-    fn drawImgui(swapchainExtent: vk.Extent2D, device: vk.DeviceProxy, cmd: vk.CommandBuffer, targetImageView: vk.ImageView) void {
-        const colorAttachment: vk.RenderingAttachmentInfo = vk_init.attachmentInfo(targetImageView, null, .attachment_optimal);
-        const renderInfo: vk.RenderingInfo = vk_init.renderingInfo(swapchainExtent, &colorAttachment, null);
-
-        device.cmdBeginRendering(cmd, &renderInfo);
-
+        c.ImGui_Render();
         c.cImGui_ImplVulkan_RenderDrawData(c.ImGui_GetDrawData(), @ptrFromInt(@intFromEnum(cmd)));
 
-        device.cmdEndRendering(cmd);
+        self.device.cmdEndRendering(cmd);
     }
 };
 
@@ -1233,6 +1288,7 @@ const vk_init = struct {
         return try instance_dispatch.createDevice(physical_device, &create_info, null);
     }
 
+    // TODO: review this function, not convinced that this is done correctly
     fn createSwapchain(
         alloc: std.mem.Allocator,
         temp_alloc: std.mem.Allocator,
@@ -1373,3 +1429,44 @@ fn loadShader(relative_path: []const u8, allocator: Allocator) !ShaderData {
         .size = data.len,
     };
 }
+
+const ComputeEffect = struct {
+    name: [:0]const u8,
+
+    pipeline: vk.Pipeline,
+    layout: vk.PipelineLayout,
+
+    data: ComputeData,
+
+    const ComputeData = union(enum) {
+        color: @Vector(4, f32),
+        circle_effect: extern struct {
+            background_color: @Vector(4, f32) = .{ 0, 0, 0, 1 },
+            time: f32 = 2,
+        },
+
+        fn size(self: ComputeData) usize {
+            return switch (self) {
+                inline else => |data| @sizeOf(@TypeOf(data)),
+            };
+        }
+
+        fn payloadPtr(self: *ComputeData) *anyopaque {
+            return switch (self.*) {
+                inline else => |_, tag| return &@field(self.*, @tagName(tag)),
+            };
+        }
+
+        fn imGuiMenu(self: *ComputeData) void {
+            switch (self.*) {
+                .color => |*color| {
+                    _ = c.ImGui_ColorPicker4("color", @ptrCast(color), 0, @as([*]const f32, &.{ 1, 0, 0, 1 }));
+                },
+                .circle_effect => |*circle_effect| {
+                    _ = c.ImGui_ColorPicker4("background_color", @ptrCast(&circle_effect.background_color), 0, @as([*]const f32, &.{ 0, 0, 0, 1 }));
+                    _ = c.ImGui_DragFloatEx("time", &circle_effect.time, 0.01, 2, std.math.floatMax(f32), null, 0);
+                },
+            }
+        }
+    };
+};

@@ -1,12 +1,10 @@
-[[vk::binding(0, 0)]]
-RWTexture2D<float4> gImage;
-
-static const float time = 0.0f;
-
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void main(
-    uint3 globalID : SV_DispatchThreadID
+    uniform float4 background_color,
+    uniform float time,
+    RWTexture2D<float4> gImage,
+    uint3 globalID: SV_DispatchThreadID
 ) {
     int2 texelCoord = int2(globalID.xy);
 
@@ -48,5 +46,14 @@ void main(
         * abs(1.0f / (30.0f * uv.y));
     float3 horBeam = float3(beamWidth, beamWidth, beamWidth);
 
-    gImage[texelCoord] = float4(horBeam * horColour, 1.0f);
+    float4 circle_color = float4(linear_from_srgb(horBeam * horColour), 1.0f);
+
+    gImage[texelCoord] = 1 - (1 - background_color) * (1 - circle_color) ;
+}
+
+float3 linear_from_srgb(float3 srgb) {
+    bool3 cutoff = srgb <= 0.04045f;
+    float3 lower = srgb / 12.92f;
+    float3 higher = pow((srgb + 0.055f) / 1.055f, 2.4f);
+    return lerp(higher, lower, (float3)cutoff);
 }

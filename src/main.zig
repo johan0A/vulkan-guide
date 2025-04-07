@@ -32,17 +32,6 @@ pub fn main() !void {
             continue;
         }
 
-        // imgui new frame
-        c.cImGui_ImplVulkan_NewFrame();
-        c.cImGui_ImplSDL3_NewFrame();
-        c.ImGui_NewFrame();
-
-        //some imgui UI to test
-        c.ImGui_ShowDemoWindow(null);
-
-        //make imgui calculate internal draw structures
-        c.ImGui_Render();
-
         try engine.draw();
     }
 }
