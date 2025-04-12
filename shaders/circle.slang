@@ -1,3 +1,7 @@
+// Shader ported from https://www.shadertoy.com/view/XdlSDs.
+// Author: dynamite
+// License: CC BY-NC-SA 3.0 https://creativecommons.org/licenses/by-nc-sa/3.0/deed.en
+
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void main(
