@@ -5,6 +5,10 @@ const vk = @import("vulkan");
 const c = @import("c");
 const tracy = @import("tracy");
 const shaders = @import("shaders");
+const zla = @import("zla");
+const vec = zla.vec;
+const Mat = zla.Mat;
+const Mat4 = zla.Mat(f32, 4, 4);
 
 // TODO: make those not globals?
 const enable_validation_layers = true;
@@ -15,6 +19,59 @@ const ShaderData = struct {
     /// in bytes
     size: usize,
     ptr: [*]const u32,
+};
+
+const AllocatedBuffer = struct {
+    buffer: vk.Buffer,
+    allocation: c.VmaAllocation,
+    info: c.VmaAllocationInfo,
+
+    pub fn create(allocator: c.VmaAllocator, size: usize, usage: vk.BufferUsageFlags, memory_usage: c.VmaMemoryUsage) !AllocatedBuffer {
+        const bufferInfo: vk.BufferCreateInfo = .{
+            .usage = usage,
+            .size = size,
+
+            .sharing_mode = .exclusive,
+        };
+
+        const vmaallocInfo: c.VmaAllocationCreateInfo = .{
+            .usage = memory_usage,
+            .flags = c.VMA_ALLOCATION_CREATE_MAPPED_BIT,
+        };
+
+        var newBuffer: AllocatedBuffer = undefined;
+        const result: vk.Result = @enumFromInt(c.vmaCreateBuffer(allocator, @ptrCast(&bufferInfo), &vmaallocInfo, @ptrCast(&newBuffer.buffer), &newBuffer.allocation, &newBuffer.info));
+        if (result != .success) {
+            std.log.err("vma allocation: error {s}\n", .{@tagName(result)});
+            return error.vma_allocation_failed;
+        }
+        return newBuffer;
+    }
+
+    pub fn destroy(buffer: AllocatedBuffer, allocator: c.VmaAllocator) void {
+        c.vmaDestroyBuffer(allocator, @ptrFromInt(@intFromEnum(buffer.buffer)), buffer.allocation);
+    }
+};
+
+pub const Vertex = extern struct {
+    position: [3]f32,
+    uv_x: f32,
+    normal: [3]f32,
+    uv_y: f32,
+    color: [4]f32,
+};
+
+// holds the resources needed for a mesh
+pub const GPUMeshBuffers = struct {
+    indexBuffer: AllocatedBuffer,
+    vertexBuffer: AllocatedBuffer,
+    vertexBufferAddress: vk.DeviceAddress,
+};
+
+// push constants for our mesh object draws
+pub const GPUDrawPushConstants = struct {
+    worldMatrix: Mat4,
+    vertexBuffer: vk.DeviceAddress,
 };
 
 const AllocatedImage = struct {
@@ -41,10 +98,6 @@ pub const PipelineBuilder = struct {
     depth_stencil: vk.PipelineDepthStencilStateCreateInfo = std.mem.zeroInit(vk.PipelineDepthStencilStateCreateInfo, .{}),
     render_info: vk.PipelineRenderingCreateInfo = std.mem.zeroInit(vk.PipelineRenderingCreateInfo, .{}),
     color_attachmentformat: vk.Format = .undefined,
-
-    // PipelineBuilder(){ clear(); }
-
-    // void clear();
 
     pub fn buildPipeline(self: PipelineBuilder, device: vk.DeviceProxy) !vk.Pipeline {
         // make viewport state from our stored viewport and scissor.
@@ -199,6 +252,7 @@ const DeletionQueue = struct {
         fence: vk.Fence,
         descriptor_pool: vk.DescriptorPool,
         imgui_impl_vulkan: void,
+        allocated_buffer: AllocatedBuffer,
 
         fn deinit(self: QueueItem, context: DeinitContext) void {
             switch (self) {
@@ -213,6 +267,7 @@ const DeletionQueue = struct {
                 .fence => |item| context.device.destroyFence(item, null),
                 .descriptor_pool => |item| context.device.destroyDescriptorPool(item, null),
                 .imgui_impl_vulkan => c.cImGui_ImplVulkan_Shutdown(),
+                .allocated_buffer => |item| item.destroy(context.vma_allocator.?),
             }
         }
     };
@@ -365,6 +420,11 @@ pub const VulkanEngine = struct {
     triangle_pipeline_layout: vk.PipelineLayout,
     triangle_pipeline: vk.Pipeline,
 
+    mesh_pipeline_layout: vk.PipelineLayout,
+    mesh_pipeline: vk.Pipeline,
+
+    rectangle: GPUMeshBuffers,
+
     pub fn draw(self: *VulkanEngine) !void {
         const local = struct {
             fn drawBackground(engine: *VulkanEngine, cmd: vk.CommandBuffer) void {
@@ -483,23 +543,23 @@ pub const VulkanEngine = struct {
         self.frame_number += 1;
     }
 
-    fn immediateModeBegin(self: *VulkanEngine) vk.CommandBuffer {
-        try self.device.resetFences(1, &self.imm_fence);
-        try vk.ResetCommandBuffer(self.imm_command_buffer, 0);
+    fn immediateModeBegin(device: vk.DeviceProxy, imm_fence: vk.Fence, imm_command_buffer: vk.CommandBuffer) !void {
+        try device.resetFences(1, (&imm_fence)[0..1]);
+        try device.resetCommandBuffer(imm_command_buffer, .{});
 
-        try self.device.beginCommandBuffer(self.imm_command_buffer, &.{ .flags = .{ .one_time_submit_bit = true } });
+        try device.beginCommandBuffer(imm_command_buffer, &.{ .flags = .{ .one_time_submit_bit = true } });
     }
 
-    fn immediateModeEnd(self: *VulkanEngine) vk.CommandBuffer {
-        try self.device.endCommandBuffer(self.imm_command_buffer);
+    fn immediateModeEnd(device: vk.DeviceProxy, imm_fence: vk.Fence, imm_command_buffer: vk.CommandBuffer, graphics_queue: vk.Queue) !void {
+        try device.endCommandBuffer(imm_command_buffer);
 
-        const cmdinfo: vk.CommandBufferSubmitInfo = vk_init.commandBufferSubmitInfo(self.imm_command_buffer);
+        const cmdinfo: vk.CommandBufferSubmitInfo = vk_init.commandBufferSubmitInfo(imm_command_buffer);
         const submit: vk.SubmitInfo2 = vk_init.submitInfo(&cmdinfo, null, null);
 
         // submit command buffer to the queue and execute it.
         //  _renderFence will now block until the graphic commands finish execution
-        try self.device.queueSubmit2(self.graphics_queue, 1, &submit, self.imm_fence);
-        try self.device.waitForFences(1, &self.imm_fence, true, 9999999999);
+        try device.queueSubmit2(graphics_queue, 1, (&submit)[0..1], imm_fence);
+        _ = try device.waitForFences(1, (&imm_fence)[0..1], vk.TRUE, 9999999999);
     }
 
     pub inline fn currentFrame(self: *VulkanEngine) *FrameData {
@@ -804,10 +864,6 @@ pub const VulkanEngine = struct {
         );
 
         {
-            // TODO: fix gamma corection of imgui:
-            // https://tuket.github.io/posts/2022-11-24-imgui-gamma/
-            // https://github.com/ocornut/imgui/issues/6611
-
             // 1: create descriptor pool for IMGUI
             //  the size of the pool is very oversize, but it's copied from imgui demo
             //  itself.
@@ -894,6 +950,7 @@ pub const VulkanEngine = struct {
             try main_deletion_queue.append(allocator, .imgui_impl_vulkan);
         }
 
+        // init_triangle_pipeline {
         const triangleFragShader = try vk_init.loadShaderModule(try loadShader(shaders.colored_triangle_frag, temp_alloc), device_proxy);
         defer device_proxy.destroyShaderModule(triangleFragShader, null);
         const triangleVertexShader = try vk_init.loadShaderModule(try loadShader(shaders.colored_triangle_vert, temp_alloc), device_proxy);
@@ -903,34 +960,100 @@ pub const VulkanEngine = struct {
         //we are not using descriptor sets or other systems yet, so no need to use anything other than empty default
         const triangle_pipeline_layout = try device_proxy.createPipelineLayout(&vk_init.pipelineLayoutCreateInfo(), null);
 
-        var pipelineBuilder: PipelineBuilder = .{};
+        const triangle_pipeline = blk: {
+            var pipelineBuilder: PipelineBuilder = .{};
 
-        //use the triangle layout we created
-        pipelineBuilder.pipeline_layout = triangle_pipeline_layout;
-        //connecting the vertex and pixel shaders to the pipeline
-        try pipelineBuilder.setShaders(triangleVertexShader, triangleFragShader, temp_alloc);
-        //it will draw triangles
-        pipelineBuilder.setInputTopology(.triangle_list);
-        //filled triangles
-        pipelineBuilder.setPolygonMode(.fill);
-        //no backface culling
-        pipelineBuilder.setCullMode(.{}, .clockwise);
-        //no multisampling
-        pipelineBuilder.setMultisamplingNone();
-        //no blending
-        pipelineBuilder.disableBlending();
-        //no depth testing
-        pipelineBuilder.disableDepthtest();
+            //use the triangle layout we created
+            pipelineBuilder.pipeline_layout = triangle_pipeline_layout;
+            //connecting the vertex and pixel shaders to the pipeline
+            try pipelineBuilder.setShaders(triangleVertexShader, triangleFragShader, temp_alloc);
+            //it will draw triangles
+            pipelineBuilder.setInputTopology(.triangle_list);
+            //filled triangles
+            pipelineBuilder.setPolygonMode(.fill);
+            //no backface culling
+            pipelineBuilder.setCullMode(.{}, .clockwise);
+            //no multisampling
+            pipelineBuilder.setMultisamplingNone();
+            //no blending
+            pipelineBuilder.disableBlending();
+            //no depth testing
+            pipelineBuilder.disableDepthtest();
 
-        //connect the image format we will draw into, from draw image
-        pipelineBuilder.setColorAttachmentFormat(draw_allocated_image.image_format);
-        pipelineBuilder.setDepthFormat(.undefined);
-
-        //finally build the pipeline
-        const triangle_pipeline = try pipelineBuilder.buildPipeline(device_proxy);
+            //connect the image format we will draw into, from draw image
+            pipelineBuilder.setColorAttachmentFormat(draw_allocated_image.image_format);
+            pipelineBuilder.setDepthFormat(.undefined);
+            break :blk try pipelineBuilder.buildPipeline(device_proxy);
+        };
 
         try main_deletion_queue.append(allocator, .{ .pipeline_layout = triangle_pipeline_layout });
         try main_deletion_queue.append(allocator, .{ .pipeline = triangle_pipeline });
+        // }
+
+        // init_mesh_pipeline {
+        const meshFragShader = try vk_init.loadShaderModule(try loadShader(shaders.colored_triangle_frag, temp_alloc), device_proxy);
+        defer device_proxy.destroyShaderModule(meshFragShader, null);
+        const meshVertexShader = try vk_init.loadShaderModule(try loadShader(shaders.colored_triangle_mesh_vert, temp_alloc), device_proxy);
+        defer device_proxy.destroyShaderModule(meshVertexShader, null);
+
+        const bufferRange: vk.PushConstantRange = .{
+            .offset = 0,
+            .size = @sizeOf(GPUDrawPushConstants),
+            .stage_flags = .{ .vertex_bit = true },
+        };
+
+        var mesh_pipeline_layout_info: vk.PipelineLayoutCreateInfo = vk_init.pipelineLayoutCreateInfo();
+        mesh_pipeline_layout_info.p_push_constant_ranges = (&bufferRange)[0..1];
+        mesh_pipeline_layout_info.push_constant_range_count = 1;
+
+        //build the pipeline layout that controls the inputs/outputs of the shader
+        //we are not using descriptor sets or other systems yet, so no need to use anything other than empty default
+        const mesh_pipeline_layout = try device_proxy.createPipelineLayout(&mesh_pipeline_layout_info, null);
+
+        //finally build the pipeline
+        const mesh_pipeline = blk: {
+            var pipelineBuilder: PipelineBuilder = .{};
+
+            //use the triangle layout we created
+            pipelineBuilder.pipeline_layout = mesh_pipeline_layout;
+            //connecting the vertex and pixel shaders to the pipeline
+            try pipelineBuilder.setShaders(meshVertexShader, meshFragShader, temp_alloc);
+            //it will draw triangles
+            pipelineBuilder.setInputTopology(.triangle_list);
+            //filled triangles
+            pipelineBuilder.setPolygonMode(.fill);
+            //no backface culling
+            pipelineBuilder.setCullMode(.{}, .clockwise);
+            //no multisampling
+            pipelineBuilder.setMultisamplingNone();
+            //no blending
+            pipelineBuilder.disableBlending();
+            //no depth testing
+            pipelineBuilder.disableDepthtest();
+
+            //connect the image format we will draw into, from draw image
+            pipelineBuilder.setColorAttachmentFormat(draw_allocated_image.image_format);
+            pipelineBuilder.setDepthFormat(.undefined);
+            break :blk try pipelineBuilder.buildPipeline(device_proxy);
+        };
+        try main_deletion_queue.append(allocator, .{ .pipeline_layout = mesh_pipeline_layout });
+        try main_deletion_queue.append(allocator, .{ .pipeline = mesh_pipeline });
+        // }
+
+        // init_default_data {
+        const rect_vertices: [4]Vertex = .{
+            .{ .position = .{ 0.5, -0.5, 0 }, .color = .{ 0, 0, 0, 1 }, .uv_x = 0, .uv_y = 0, .normal = @splat(0) },
+            .{ .position = .{ 0.5, 0.5, 0 }, .color = .{ 0.5, 0.5, 0.5, 1 }, .uv_x = 0, .uv_y = 0, .normal = @splat(0) },
+            .{ .position = .{ -0.5, -0.5, 0 }, .color = .{ 1, 0, 0, 1 }, .uv_x = 0, .uv_y = 0, .normal = @splat(0) },
+            .{ .position = .{ -0.5, 0.5, 0 }, .color = .{ 0, 1, 0, 1 }, .uv_x = 0, .uv_y = 0, .normal = @splat(0) },
+        };
+
+        const rect_indices: [6]u32 = .{ 0, 1, 2, 2, 1, 3 };
+
+        const rectangle = try uploadMesh(device_proxy, vma_allocator, imm_fence, imm_command_buffer, graphics_queue, &rect_indices, &rect_vertices);
+
+        try main_deletion_queue.append(allocator, .{ .allocated_buffer = rectangle.indexBuffer });
+        try main_deletion_queue.append(allocator, .{ .allocated_buffer = rectangle.vertexBuffer });
 
         return .{
             .init_arena = init_arena,
@@ -971,6 +1094,11 @@ pub const VulkanEngine = struct {
 
             .triangle_pipeline_layout = triangle_pipeline_layout,
             .triangle_pipeline = triangle_pipeline,
+
+            .mesh_pipeline_layout = mesh_pipeline_layout,
+            .mesh_pipeline = mesh_pipeline,
+
+            .rectangle = rectangle,
         };
     }
 
@@ -1073,7 +1201,101 @@ pub const VulkanEngine = struct {
 
         //launch a draw command to draw 3 vertices
         self.device.cmdDraw(cmd, 3, 1, 0, 0);
+
+        {
+            self.device.cmdBindPipeline(cmd, .graphics, self.mesh_pipeline);
+
+            const push_constants: GPUDrawPushConstants = .{
+                .worldMatrix = .identity,
+                .vertexBuffer = self.rectangle.vertexBufferAddress,
+            };
+
+            self.device.cmdPushConstants(cmd, self.mesh_pipeline_layout, .{ .vertex_bit = true }, 0, @sizeOf(GPUDrawPushConstants), &push_constants);
+            self.device.cmdBindIndexBuffer(cmd, self.rectangle.indexBuffer.buffer, 0, .uint32);
+
+            self.device.cmdDrawIndexed(cmd, 6, 1, 0, 0, 0);
+        }
+
         self.device.cmdEndRendering(cmd);
+    }
+
+    pub fn uploadMesh(
+        device: vk.DeviceProxy,
+        vma_allocator: c.VmaAllocator,
+        imm_fence: vk.Fence,
+        imm_command_buffer: vk.CommandBuffer,
+        graphics_queue: vk.Queue,
+        indices: []const u32,
+        vertices: []const Vertex,
+    ) !GPUMeshBuffers {
+        const vertexBufferSize: usize = vertices.len * @sizeOf(Vertex);
+        const indexBufferSize: usize = indices.len * @sizeOf(u32);
+
+        //create vertex buffer
+        const vertexBuffer: AllocatedBuffer = try .create(
+            vma_allocator,
+            vertexBufferSize,
+            .{ .storage_buffer_bit = true, .transfer_dst_bit = true, .shader_device_address_bit = true },
+            c.VMA_MEMORY_USAGE_GPU_ONLY,
+        );
+
+        //find the adress of the vertex buffer
+        const deviceAdressInfo: vk.BufferDeviceAddressInfo = .{ .buffer = vertexBuffer.buffer };
+        const vertexBufferAddress = device.getBufferDeviceAddress(&deviceAdressInfo);
+
+        //create index buffer
+        const indexBuffer: AllocatedBuffer = try .create(
+            vma_allocator,
+            indexBufferSize,
+            .{ .storage_buffer_bit = true, .transfer_dst_bit = true, .index_buffer_bit = true },
+            c.VMA_MEMORY_USAGE_GPU_ONLY,
+        );
+        const newSurface: GPUMeshBuffers = .{
+            .vertexBuffer = vertexBuffer,
+            .indexBuffer = indexBuffer,
+            .vertexBufferAddress = vertexBufferAddress,
+        };
+
+        const staging: AllocatedBuffer = try .create(
+            vma_allocator,
+            vertexBufferSize + indexBufferSize,
+            .{ .transfer_src_bit = true },
+            c.VMA_MEMORY_USAGE_CPU_ONLY,
+        );
+        defer staging.destroy(vma_allocator);
+
+        var data: [*]u8 = undefined;
+        _ = c.vmaMapMemory(vma_allocator, staging.allocation, @ptrCast(&data)); // TODO: handle error?
+        defer c.vmaUnmapMemory(vma_allocator, staging.allocation);
+
+        // copy vertex buffer
+        @memcpy(@as([*]Vertex, @alignCast(@ptrCast(data))), vertices);
+        // copy index buffer
+        @memcpy(@as([*]u32, @alignCast(@ptrCast(data[vertexBufferSize..]))), indices);
+
+        {
+            try immediateModeBegin(device, imm_fence, imm_command_buffer);
+
+            const vertexCopy: vk.BufferCopy = .{
+                .dst_offset = 0,
+                .src_offset = 0,
+                .size = vertexBufferSize,
+            };
+
+            device.cmdCopyBuffer(imm_command_buffer, staging.buffer, newSurface.vertexBuffer.buffer, 1, (&vertexCopy)[0..1]);
+
+            const indexCopy: vk.BufferCopy = .{
+                .dst_offset = 0,
+                .src_offset = vertexBufferSize,
+                .size = indexBufferSize,
+            };
+
+            device.cmdCopyBuffer(imm_command_buffer, staging.buffer, newSurface.indexBuffer.buffer, 1, (&indexCopy)[0..1]);
+
+            try immediateModeEnd(device, imm_fence, imm_command_buffer, graphics_queue);
+        }
+
+        return newSurface;
     }
 };
 

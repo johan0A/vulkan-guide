@@ -29,6 +29,12 @@ pub fn build(b: *std.Build) !void {
             .default_callstack_depth = b.option(u32, "default_callstack_depth", "sets TRACY_CALLSTACK to the depth provided") orelse 0,
         });
         root_module.addImport("tracy", tracy.module("tracy"));
+
+        const zla = b.dependency("zla", .{
+            .target = target,
+            .optimize = optimize, // todo: change to ReleaseFast?
+        });
+        root_module.addImport("zla", zla.module("zla"));
     }
 
     {

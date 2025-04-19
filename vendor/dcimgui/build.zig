@@ -1,4 +1,6 @@
-// TODO: add worning for this:
+// TODO: finnish this and make it its own package
+
+// TODO: add warning for this:
 // NOTE: unfortunately switching to the 'prefix-less' functions in
 // zimgui.h isn't that easy because some Dear ImGui functions collide
 // with Win32 function (Set/GetCursorPos and Set/GetWindowPos).
@@ -9,8 +11,8 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const backend = b.option([]Backends, "backend", "") orelse &.{};
-    _ = backend; // autofix
+    const backends = b.option([]Backend, "backends", "") orelse &.{};
+    _ = backends; // autofix
 
     const lib_cimgui = b.addLibrary(.{
         .linkage = b.option(std.builtin.LinkMode, "linkage", "default to static") orelse .static,
@@ -109,7 +111,7 @@ pub fn build(b: *std.Build) !void {
             regenerate.dependOn(&run.step);
         }
 
-        inline for (@typeInfo(Backends).@"enum".fields) |field| {
+        inline for (@typeInfo(Backend).@"enum".fields) |field| {
             const run = b.addSystemCommand(&.{python});
             run.addFileArg(generator_path);
             run.addArg("--backend");
@@ -178,7 +180,7 @@ const DeleteJson = struct {
     }
 };
 
-const Backends = enum {
+const Backend = enum {
     imgui_impl_allegro5,
     imgui_impl_android,
     imgui_impl_dx10,

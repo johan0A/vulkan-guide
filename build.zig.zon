@@ -30,6 +30,10 @@
             .url = "git+https://github.com/hexops/vulkan-headers#68ab446d1fa0707bb7082c95c51d33a731cafac2",
             .hash = "N-V-__8AAAIGzwCa4tCHc1jhxfgWaL73kQkckQuQ2WA2XWI5",
         },
+        .zla = .{
+            .url = "git+https://github.com/johan0A/zig-linear-algebra#7ecd00896389e5f9cc51e6b92063b6bdd7ff363c",
+            .hash = "zla-0.0.2-zqm18LRpAAAy2Gb8nhJz0_vPXs8M_wHC4KEGZCmrrlDJ",
+        },
     },
     .paths = .{
         "build.zig",
