@@ -32,7 +32,7 @@ pub fn build(b: *std.Build) !void {
 
         const zla = b.dependency("zla", .{
             .target = target,
-            .optimize = optimize, // todo: change to ReleaseFast?
+            .optimize = optimize, // todo: change to ReleaseFast/ReleaseSafe?
         });
         root_module.addImport("zla", zla.module("zla"));
 

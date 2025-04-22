@@ -242,6 +242,33 @@ pub const PipelineBuilder = struct {
         self.depth_stencil.max_depth_bounds = 1;
     }
 
+    pub fn enableBlendingAdditive(self: *PipelineBuilder) void {
+        // TODO: maybe use the same pattern of init all at once for other builder methods?
+        self.color_blend_attachment = .{
+            .color_write_mask = .{ .r_bit = true, .g_bit = true, .b_bit = true, .a_bit = true },
+            .blend_enable = vk.TRUE,
+            .src_color_blend_factor = .src_alpha,
+            .dst_color_blend_factor = .one,
+            .color_blend_op = .add,
+            .src_alpha_blend_factor = .one,
+            .dst_alpha_blend_factor = .zero,
+            .alpha_blend_op = .add,
+        };
+    }
+
+    pub fn enableBlendingAlphablend(self: *PipelineBuilder) void {
+        self.color_blend_attachment = .{
+            .color_write_mask = .{ .r_bit = true, .g_bit = true, .b_bit = true, .a_bit = true },
+            .blend_enable = vk.TRUE,
+            .src_color_blend_factor = .src_alpha,
+            .dst_color_blend_factor = .one_minus_src_alpha,
+            .color_blend_op = .add,
+            .src_alpha_blend_factor = .one,
+            .dst_alpha_blend_factor = .zero,
+            .alpha_blend_op = .add,
+        };
+    }
+
     fn deinit(self: *PipelineBuilder, alloc: Allocator) void {
         self.shader_stages.deinit(alloc);
     }
