@@ -35,6 +35,12 @@ pub fn build(b: *std.Build) !void {
             .optimize = optimize, // todo: change to ReleaseFast?
         });
         root_module.addImport("zla", zla.module("zla"));
+
+        const gltf = b.dependency("zgltf", .{
+            .target = target,
+            .optimize = optimize,
+        });
+        root_module.addImport("gltf", gltf.module("zgltf"));
     }
 
     {

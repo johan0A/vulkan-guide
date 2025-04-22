@@ -25,8 +25,7 @@ VSOutput main(
     Vertex v = PushConstants.vertices[vertexID];
 
     VSOutput output;
-    // output.position = mul(PushConstants.render_matrix, float4(v.position, 1.0f));
-    output.position = float4(v.position, 1.0f);
+    output.position = mul(PushConstants.render_matrix, float4(v.position, 1.0f));
     output.color = v.color.xyz;
     output.uv = float2(v.uv_x, v.uv_y);
 

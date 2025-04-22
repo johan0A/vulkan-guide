@@ -1,6 +1,6 @@
 const std = @import("std");
 const tracy = @import("tracy");
-const VulkanEngine = @import("vk_engine.zig").VulkanEngine;
+const VulkanEngine = @import("vk_engine.zig").VkEngine;
 const c = @import("c");
 
 pub fn main() !void {

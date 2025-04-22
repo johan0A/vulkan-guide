@@ -6,6 +6,7 @@ const c = @import("c");
 const tracy = @import("tracy");
 const shaders = @import("shaders");
 const zla = @import("zla");
+const loader = @import("./loader.zig");
 const vec = zla.vec;
 const Mat = zla.Mat;
 const Mat4 = zla.Mat(f32, 4, 4);
@@ -152,8 +153,8 @@ pub const PipelineBuilder = struct {
         };
 
         // TODO: handle error ???
-        // its easy to error out on create graphics pipeline, so we handle it a bit
-        // better than the common VK_CHECK case
+        // // its easy to error out on create graphics pipeline, so we handle it a bit
+        // // better than the common VK_CHECK case
         var new_pipeline: vk.Pipeline = undefined;
         _ = try device.createGraphicsPipelines(.null_handle, 1, (&pipeline_info)[0..1], null, (&new_pipeline)[0..1]);
         return new_pipeline;
@@ -225,6 +226,18 @@ pub const PipelineBuilder = struct {
         self.depth_stencil.stencil_test_enable = vk.FALSE;
         // self.depthStencil.front = .{};
         // self.depthStencil.back = .{};
+        self.depth_stencil.min_depth_bounds = 0;
+        self.depth_stencil.max_depth_bounds = 1;
+    }
+
+    pub fn enableDepthtest(self: *PipelineBuilder, depthWriteEnable: bool, op: vk.CompareOp) void {
+        self.depth_stencil.depth_test_enable = vk.TRUE;
+        self.depth_stencil.depth_write_enable = if (depthWriteEnable) vk.TRUE else vk.FALSE;
+        self.depth_stencil.depth_compare_op = op;
+        self.depth_stencil.depth_bounds_test_enable = vk.FALSE;
+        self.depth_stencil.stencil_test_enable = vk.FALSE;
+        // self.depth_stencil.front = {};
+        // self.depth_stencil.back = {};
         self.depth_stencil.min_depth_bounds = 0;
         self.depth_stencil.max_depth_bounds = 1;
     }
@@ -351,6 +364,8 @@ const SwapChain = struct {
     image_views: []vk.ImageView,
     extent: vk.Extent2D,
 
+    // TODO: move sapchain creation here
+
     fn deinit(self: SwapChain, alloc: Allocator, device: vk.DeviceProxy) void {
         device.destroySwapchainKHR(self.handle, null);
         for (self.image_views) |image_view| {
@@ -374,34 +389,47 @@ const FrameData = struct {
     deletion_queue: DeletionQueue,
 };
 
-pub const VulkanEngine = struct {
+pub const VkEngine = struct {
+    pub const VkContext = struct {
+        base_dispatch: vk.BaseWrapper,
+        instance: vk.InstanceProxy,
+
+        chosen_gpu: vk.PhysicalDevice, // GPU chosen as the default device
+        surface: vk.SurfaceKHR, // Vulkan window surface
+        debug_messenger: vk.DebugUtilsMessengerEXT, // Vulkan debug output handle
+    };
+
+    pub const DeviceContext = struct {
+        device: vk.DeviceProxy,
+        graphics_queue: vk.Queue,
+        graphics_queue_family: u32,
+        vma_allocator: c.VmaAllocator,
+    };
+
+    // immediate submit structures
+    pub const ImmSubmit = struct {
+        fence: vk.Fence,
+        command_buffer: vk.CommandBuffer,
+        command_pool: vk.CommandPool,
+    };
+
     init_arena: std.heap.ArenaAllocator,
 
     window: *c.SDL_Window,
 
-    base_dispatch: vk.BaseWrapper,
-
-    instance: vk.InstanceProxy,
-    device: vk.DeviceProxy,
-
-    debug_messenger: vk.DebugUtilsMessengerEXT, // Vulkan debug output handle
-    chosen_gpu: vk.PhysicalDevice, // GPU chosen as the default device
-    surface: vk.SurfaceKHR, // Vulkan window surface
+    vk_ctx: VkContext,
+    device_ctx: DeviceContext,
 
     swapchain: SwapChain,
-
-    graphics_queue: vk.Queue,
-    graphics_queue_family: u32,
 
     frame_number: u64,
     frames: [FrameData.FRAME_OVERLAP]FrameData,
 
     main_deletion_queue: DeletionQueue,
 
-    vma_allocator: c.VmaAllocator,
-
     //draw resources
     draw_image: AllocatedImage,
+    depth_image: AllocatedImage,
     draw_extent: vk.Extent2D,
 
     draw_image_descriptors: vk.DescriptorSet,
@@ -412,10 +440,7 @@ pub const VulkanEngine = struct {
     background_effects: []ComputeEffect,
     active_background_effect: u32,
 
-    // immediate submit structures
-    imm_fence: vk.Fence,
-    imm_command_buffer: vk.CommandBuffer,
-    imm_command_pool: vk.CommandPool,
+    imm: ImmSubmit,
 
     triangle_pipeline_layout: vk.PipelineLayout,
     triangle_pipeline: vk.Pipeline,
@@ -425,14 +450,17 @@ pub const VulkanEngine = struct {
 
     rectangle: GPUMeshBuffers,
 
-    pub fn draw(self: *VulkanEngine) !void {
+    test_meshes: std.ArrayListUnmanaged(loader.MeshAsset),
+
+    pub fn draw(self: *VkEngine) !void {
         const local = struct {
-            fn drawBackground(engine: *VulkanEngine, cmd: vk.CommandBuffer) void {
+            fn drawBackground(engine: *VkEngine, cmd: vk.CommandBuffer) void {
                 // bind the gradient drawing compute pipeline
-                engine.device.cmdBindPipeline(cmd, .compute, engine.background_effects[engine.active_background_effect].pipeline);
+                const device = engine.device_ctx.device;
+                device.cmdBindPipeline(cmd, .compute, engine.background_effects[engine.active_background_effect].pipeline);
 
                 // bind the descriptor set containing the draw image for the compute pipeline
-                engine.device.cmdBindDescriptorSets(
+                device.cmdBindDescriptorSets(
                     cmd,
                     .compute,
                     engine.background_effects[engine.active_background_effect].layout,
@@ -445,7 +473,7 @@ pub const VulkanEngine = struct {
 
                 std.debug.print("", .{});
 
-                engine.device.cmdPushConstants(
+                device.cmdPushConstants(
                     cmd,
                     engine.background_effects[engine.active_background_effect].layout,
                     .{ .compute_bit = true },
@@ -455,7 +483,7 @@ pub const VulkanEngine = struct {
                 );
 
                 // execute the compute pipeline dispatch. We are using 16x16 workgroup size so we need to divide by it
-                engine.device.cmdDispatch(
+                device.cmdDispatch(
                     cmd,
                     std.math.divCeil(u32, engine.draw_extent.width, 16) catch unreachable,
                     std.math.divCeil(u32, engine.draw_extent.height, 16) catch unreachable,
@@ -463,10 +491,13 @@ pub const VulkanEngine = struct {
                 );
             }
         };
-        _ = try self.device.waitForFences(1, (&self.currentFrame().render_fence)[0..1], vk.TRUE, 1e9);
-        _ = try self.device.resetFences(1, (&self.currentFrame().render_fence)[0..1]);
 
-        const swapchain_image_index: u32 = (try self.device.acquireNextImageKHR(
+        const device = self.device_ctx.device;
+
+        _ = try device.waitForFences(1, (&self.currentFrame().render_fence)[0..1], vk.TRUE, 1e9);
+        _ = try device.resetFences(1, (&self.currentFrame().render_fence)[0..1]);
+
+        const swapchain_image_index: u32 = (try device.acquireNextImageKHR(
             self.swapchain.handle,
             1e9,
             self.currentFrame().swapchain_semaphore,
@@ -481,40 +512,40 @@ pub const VulkanEngine = struct {
 
         // now that we are sure that the commands finished executing, we can safely
         // reset the command buffer to begin recording again.
-        try self.device.resetCommandBuffer(cmd, .{});
+        try device.resetCommandBuffer(cmd, .{});
 
         // begin the command buffer recording. We will use this command buffer exactly once, so we want to let vulkan know that
-        try self.device.beginCommandBuffer(cmd, &.{ .flags = .{ .one_time_submit_bit = true } });
+        try device.beginCommandBuffer(cmd, &.{ .flags = .{ .one_time_submit_bit = true } });
         {
             // transition our main draw image into general layout so we can write into it
             // we will overwrite it all so we dont care about what was the older layout
-            vk_image.transitionImage(self.device, cmd, self.draw_image.image, .undefined, .general);
+            vk_image.transitionImage(device, cmd, self.draw_image.image, .undefined, .general);
 
             local.drawBackground(self, cmd);
 
-            vk_image.transitionImage(self.device, cmd, self.draw_image.image, .general, .color_attachment_optimal);
-
+            vk_image.transitionImage(device, cmd, self.draw_image.image, .general, .color_attachment_optimal);
+            vk_image.transitionImage(device, cmd, self.depth_image.image, .undefined, .depth_attachment_optimal);
             self.draw_geometry(cmd);
 
             //transtion the draw image and the swapchain image into their correct transfer layouts
-            vk_image.transitionImage(self.device, cmd, self.draw_image.image, .color_attachment_optimal, .transfer_src_optimal);
+            vk_image.transitionImage(device, cmd, self.draw_image.image, .color_attachment_optimal, .transfer_src_optimal);
 
-            vk_image.transitionImage(self.device, cmd, self.swapchain.images[swapchain_image_index], .undefined, .transfer_dst_optimal);
+            vk_image.transitionImage(device, cmd, self.swapchain.images[swapchain_image_index], .undefined, .transfer_dst_optimal);
 
             // execute a copy from the draw image into the swapchain
-            vk_image.copyImageToImage(self.device, cmd, self.draw_image.image, self.swapchain.images[swapchain_image_index], self.draw_extent, self.swapchain.extent);
+            vk_image.copyImageToImage(device, cmd, self.draw_image.image, self.swapchain.images[swapchain_image_index], self.draw_extent, self.swapchain.extent);
 
             // set swapchain image layout to Attachment Optimal so we can draw it
-            vk_image.transitionImage(self.device, cmd, self.swapchain.images[swapchain_image_index], .transfer_dst_optimal, .color_attachment_optimal);
+            vk_image.transitionImage(device, cmd, self.swapchain.images[swapchain_image_index], .transfer_dst_optimal, .color_attachment_optimal);
 
             //draw imgui into the swapchain image
             self.drawImgui(cmd, self.swapchain.image_views[swapchain_image_index]);
 
             // set swapchain image layout to Present so we can show it on the screen
-            vk_image.transitionImage(self.device, cmd, self.swapchain.images[swapchain_image_index], .color_attachment_optimal, .present_src_khr);
+            vk_image.transitionImage(device, cmd, self.swapchain.images[swapchain_image_index], .color_attachment_optimal, .present_src_khr);
         }
         //finalize the command buffer (we can no longer add commands, but it can now be executed)
-        try self.device.endCommandBuffer(cmd);
+        try device.endCommandBuffer(cmd);
 
         //prepare the submission to the queue.
         //we want to wait on the _presentSemaphore, as that semaphore is signaled when the swapchain is ready
@@ -528,7 +559,7 @@ pub const VulkanEngine = struct {
 
             //submit command buffer to the queue and execute it.
             // _render_fence will now block until the graphic commands finish execution
-            try self.device.queueSubmit2(self.graphics_queue, 1, (&submit_info)[0..1], self.currentFrame().render_fence);
+            try device.queueSubmit2(self.device_ctx.graphics_queue, 1, (&submit_info)[0..1], self.currentFrame().render_fence);
         }
 
         const present_info: vk.PresentInfoKHR = .{
@@ -538,7 +569,7 @@ pub const VulkanEngine = struct {
             .wait_semaphore_count = 1,
             .p_image_indices = (&swapchain_image_index)[0..1],
         };
-        _ = try self.device.queuePresentKHR(self.graphics_queue, &present_info);
+        _ = try device.queuePresentKHR(self.device_ctx.graphics_queue, &present_info);
 
         self.frame_number += 1;
     }
@@ -562,11 +593,11 @@ pub const VulkanEngine = struct {
         _ = try device.waitForFences(1, (&imm_fence)[0..1], vk.TRUE, 9999999999);
     }
 
-    pub inline fn currentFrame(self: *VulkanEngine) *FrameData {
+    pub inline fn currentFrame(self: *VkEngine) *FrameData {
         return &self.frames[self.frame_number % FrameData.FRAME_OVERLAP];
     }
 
-    pub fn init(allocator: Allocator) !VulkanEngine {
+    pub fn init(allocator: Allocator) !VkEngine {
         const tracy_init_engine = tracy.zoneEx(@src(), .{ .name = "init engine" });
         defer tracy_init_engine.end();
 
@@ -687,74 +718,99 @@ pub const VulkanEngine = struct {
             .vma_allocator = vma_allocator,
         }); // TODO: find a way to move this next to the main_deletion_queue's init
 
-        const draw_allocated_image = blk: {
-            const draw_image_format: vk.Format = .r16g16b16a16_sfloat;
+        //allocate images {
+        const draw_image_format: vk.Format = .r16g16b16a16_sfloat;
 
-            const draw_image_usages: vk.ImageUsageFlags = .{
-                .transfer_src_bit = true,
-                .transfer_dst_bit = true,
-                .storage_bit = true,
-                .color_attachment_bit = true,
-            };
+        const draw_image_usages: vk.ImageUsageFlags = .{
+            .transfer_src_bit = true,
+            .transfer_dst_bit = true,
+            .storage_bit = true,
+            .color_attachment_bit = true,
+        };
 
-            const draw_image_extent: vk.Extent3D = .{
+        const draw_image_extent: vk.Extent3D = .{
+            .width = window_width,
+            .height = window_height,
+            .depth = 1,
+        };
+
+        const rimg_info: vk.ImageCreateInfo = vk_init.imageCreateInfo(draw_image_format, draw_image_usages, draw_image_extent);
+
+        //for the draw image, we want to allocate it from gpu local memory
+        const rimg_allocinfo: c.VmaAllocationCreateInfo = .{
+            .usage = c.VMA_MEMORY_USAGE_GPU_ONLY,
+            .requiredFlags = @bitCast(vk.MemoryPropertyFlags{ .device_local_bit = true }),
+        };
+
+        var draw_image: vk.Image = undefined;
+        var draw_image_allocation: c.VmaAllocation = undefined;
+
+        //allocate and create the image
+        const result: vk.Result = @enumFromInt(c.vmaCreateImage(
+            vma_allocator,
+            @ptrCast(&rimg_info),
+            @ptrCast(&rimg_allocinfo),
+            @ptrCast(&draw_image),
+            &draw_image_allocation,
+            null,
+        ));
+        _ = result; // TODO: handle failure
+
+        //build a image-view for the draw image to use for rendering
+        const rview_info: vk.ImageViewCreateInfo = vk_init.imageViewCreateInfo(
+            draw_image_format,
+            draw_image,
+            .{ .color_bit = true },
+        );
+
+        const draw_allocated_image: AllocatedImage = .{
+            //hardcoding the draw format to 32 bit float
+            .image_format = draw_image_format,
+            //draw image size will match the window
+            .image_extent = .{
                 .width = window_width,
                 .height = window_height,
                 .depth = 1,
-            };
-
-            const rimg_info: vk.ImageCreateInfo = vk_init.imageCreateInfo(draw_image_format, draw_image_usages, draw_image_extent);
-
-            //for the draw image, we want to allocate it from gpu local memory
-            const rimg_allocinfo: c.VmaAllocationCreateInfo = .{
-                .usage = c.VMA_MEMORY_USAGE_GPU_ONLY,
-                .requiredFlags = @bitCast(vk.MemoryPropertyFlags{ .device_local_bit = true }),
-            };
-
-            var draw_image: vk.Image = undefined;
-            var draw_image_allocation: c.VmaAllocation = undefined;
-
-            //allocate and create the image
-            const result: vk.Result = @enumFromInt(c.vmaCreateImage(
-                vma_allocator,
-                @ptrCast(&rimg_info),
-                @ptrCast(&rimg_allocinfo),
-                @ptrCast(&draw_image),
-                &draw_image_allocation,
-                null,
-            ));
-            _ = result; // TODO: handle failure
-
-            //build a image-view for the draw image to use for rendering
-            const rview_info: vk.ImageViewCreateInfo = vk_init.imageViewCreateInfo(
-                draw_image_format,
-                draw_image,
-                .{ .color_bit = true },
-            );
-
-            const draw_allocated_image: AllocatedImage = .{
-                //hardcoding the draw format to 32 bit float
-                .image_format = .r16g16b16a16_sfloat,
-                //draw image size will match the window
-                .image_extent = .{
-                    .width = window_width,
-                    .height = window_height,
-                    .depth = 1,
-                },
-                .image = draw_image,
-                .image_view = try device_proxy.createImageView(&rview_info, null),
-                .allocation = draw_image_allocation,
-            };
-
-            //add to deletion queues
-            try main_deletion_queue.append(allocator, .{ .image_view = draw_allocated_image.image_view });
-            try main_deletion_queue.append(allocator, .{ .vma_allocated_image = .{
-                .image = draw_allocated_image.image,
-                .allocation = draw_allocated_image.allocation,
-            } });
-
-            break :blk draw_allocated_image;
+            },
+            .image = draw_image,
+            .image_view = try device_proxy.createImageView(&rview_info, null),
+            .allocation = draw_image_allocation,
         };
+
+        //add to deletion queues
+        try main_deletion_queue.append(allocator, .{ .image_view = draw_allocated_image.image_view });
+        try main_deletion_queue.append(allocator, .{ .vma_allocated_image = .{
+            .image = draw_allocated_image.image,
+            .allocation = draw_allocated_image.allocation,
+        } });
+
+        const depthImageUsages: vk.ImageUsageFlags = .{ .depth_stencil_attachment_bit = true };
+
+        const depth_image_format: vk.Format = .d32_sfloat;
+        const dimg_info: vk.ImageCreateInfo = vk_init.imageCreateInfo(depth_image_format, depthImageUsages, draw_image_extent);
+
+        var depth_image_allocation: c.VmaAllocation = undefined;
+        //allocate and create the image
+        var depth_image: vk.Image = undefined;
+        _ = c.vmaCreateImage(vma_allocator, @ptrCast(&dimg_info), &rimg_allocinfo, @ptrCast(&depth_image), &depth_image_allocation, null); // TODO: handle error?
+
+        //build a image-view for the draw image to use for rendering
+        const dview_info: vk.ImageViewCreateInfo = vk_init.imageViewCreateInfo(depth_image_format, depth_image, .{ .depth_bit = true });
+
+        const depth_allocated_image: AllocatedImage = .{
+            .image_format = depth_image_format,
+            .image_extent = draw_image_extent,
+            .image_view = try device_proxy.createImageView(&dview_info, null),
+            .image = depth_image,
+            .allocation = depth_image_allocation,
+        };
+
+        try main_deletion_queue.append(allocator, .{ .image_view = depth_allocated_image.image_view });
+        try main_deletion_queue.append(allocator, .{ .vma_allocated_image = .{
+            .image = depth_allocated_image.image,
+            .allocation = depth_allocated_image.allocation,
+        } });
+        //}
 
         //create a descriptor pool that will hold 10 sets with 1 image each
         const sizes: []const DescriptorAllocator.PoolSizeRatio = &.{.{ .type = .storage_image, .ratio = 1 }};
@@ -891,17 +947,17 @@ pub const VulkanEngine = struct {
             const imgui_pool = try device_proxy.createDescriptorPool(&pool_info, null);
 
             const ImguiVkLoader = struct {
-                var loader: vk.PfnGetInstanceProcAddr = undefined;
+                var instance_proc_addr: vk.PfnGetInstanceProcAddr = undefined;
                 var instance_: vk.Instance = undefined;
 
                 fn f(name: [*c]const u8, _: ?*anyopaque) callconv(.c) c.PFN_vkVoidFunction {
-                    return @ptrCast(loader(
+                    return @ptrCast(instance_proc_addr(
                         instance_,
                         @ptrCast(name),
                     ));
                 }
             };
-            ImguiVkLoader.loader = base_dispatch.dispatch.vkGetInstanceProcAddr.?;
+            ImguiVkLoader.instance_proc_addr = base_dispatch.dispatch.vkGetInstanceProcAddr.?;
             ImguiVkLoader.instance_ = instance;
 
             _ = c.cImGui_ImplVulkan_LoadFunctions(
@@ -978,11 +1034,12 @@ pub const VulkanEngine = struct {
             //no blending
             pipelineBuilder.disableBlending();
             //no depth testing
-            pipelineBuilder.disableDepthtest();
+            // pipelineBuilder.disableDepthtest();
+            pipelineBuilder.enableDepthtest(true, .greater_or_equal);
 
             //connect the image format we will draw into, from draw image
             pipelineBuilder.setColorAttachmentFormat(draw_allocated_image.image_format);
-            pipelineBuilder.setDepthFormat(.undefined);
+            pipelineBuilder.setDepthFormat(depth_allocated_image.image_format);
             break :blk try pipelineBuilder.buildPipeline(device_proxy);
         };
 
@@ -1029,11 +1086,12 @@ pub const VulkanEngine = struct {
             //no blending
             pipelineBuilder.disableBlending();
             //no depth testing
-            pipelineBuilder.disableDepthtest();
+            // pipelineBuilder.disableDepthtest();
+            pipelineBuilder.enableDepthtest(true, .greater_or_equal);
 
             //connect the image format we will draw into, from draw image
             pipelineBuilder.setColorAttachmentFormat(draw_allocated_image.image_format);
-            pipelineBuilder.setDepthFormat(.undefined);
+            pipelineBuilder.setDepthFormat(depth_allocated_image.image_format);
             break :blk try pipelineBuilder.buildPipeline(device_proxy);
         };
         try main_deletion_queue.append(allocator, .{ .pipeline_layout = mesh_pipeline_layout });
@@ -1050,34 +1108,51 @@ pub const VulkanEngine = struct {
 
         const rect_indices: [6]u32 = .{ 0, 1, 2, 2, 1, 3 };
 
-        const rectangle = try uploadMesh(device_proxy, vma_allocator, imm_fence, imm_command_buffer, graphics_queue, &rect_indices, &rect_vertices);
+        const device_ctx: DeviceContext = .{
+            .device = device_proxy,
+            .graphics_queue = graphics_queue,
+            .graphics_queue_family = queue_family_indices.graphics_family.?,
+            .vma_allocator = vma_allocator,
+        };
+        const imm: ImmSubmit = .{
+            .command_buffer = imm_command_buffer,
+            .command_pool = imm_command_pool,
+            .fence = imm_fence,
+        };
+
+        const rectangle = try uploadMesh(device_ctx, imm, &rect_indices, &rect_vertices);
 
         try main_deletion_queue.append(allocator, .{ .allocated_buffer = rectangle.indexBuffer });
         try main_deletion_queue.append(allocator, .{ .allocated_buffer = rectangle.vertexBuffer });
 
+        const testMeshes = try loader.loadGltfMeshes(init_alloc, temp_alloc, device_ctx, imm, "assets/basicmesh.glb");
+
+        // }
+
         return .{
+            .vk_ctx = .{
+                .base_dispatch = base_dispatch,
+                .instance = instance_proxy,
+                .surface = surface,
+                .chosen_gpu = physical_device,
+                .debug_messenger = .null_handle,
+            },
+
+            .device_ctx = device_ctx,
+
             .init_arena = init_arena,
 
             .window = window,
-            .base_dispatch = base_dispatch,
-            .instance = instance_proxy,
-            .device = device_proxy,
-            .swapchain = swapchain,
-            .debug_messenger = .null_handle,
-            .chosen_gpu = physical_device,
-            .surface = surface,
 
-            .graphics_queue = graphics_queue,
-            .graphics_queue_family = queue_family_indices.graphics_family.?,
+            .swapchain = swapchain,
 
             .frame_number = 0,
             .frames = frames,
 
             .main_deletion_queue = main_deletion_queue,
 
-            .vma_allocator = vma_allocator,
-
             .draw_image = draw_allocated_image,
+            .depth_image = depth_allocated_image,
             .draw_extent = .{ .width = 0, .height = 0 },
 
             .global_descriptor_allocator = global_descriptor_allocator,
@@ -1088,9 +1163,7 @@ pub const VulkanEngine = struct {
             .background_effects = background_effects,
             .active_background_effect = 0,
 
-            .imm_command_buffer = imm_command_buffer,
-            .imm_command_pool = imm_command_pool,
-            .imm_fence = imm_fence,
+            .imm = imm,
 
             .triangle_pipeline_layout = triangle_pipeline_layout,
             .triangle_pipeline = triangle_pipeline,
@@ -1099,35 +1172,45 @@ pub const VulkanEngine = struct {
             .mesh_pipeline = mesh_pipeline,
 
             .rectangle = rectangle,
+
+            .test_meshes = testMeshes,
         };
     }
 
-    pub fn deinit(self: *VulkanEngine, allocator: Allocator) void {
-        self.device.deviceWaitIdle() catch @panic(""); // TODO
+    pub fn deinit(self: *VkEngine, allocator: Allocator) void {
+        const device = self.device_ctx.device;
+        device.deviceWaitIdle() catch @panic(""); // TODO
 
         for (0..self.frames.len) |i| {
-            self.device.destroyCommandPool(self.frames[i].command_pool, null);
+            device.destroyCommandPool(self.frames[i].command_pool, null);
 
-            self.device.destroyFence(self.frames[i].render_fence, null);
-            self.device.destroySemaphore(self.frames[i].swapchain_semaphore, null);
-            self.device.destroySemaphore(self.frames[i].render_semaphore, null);
+            device.destroyFence(self.frames[i].render_fence, null);
+            device.destroySemaphore(self.frames[i].swapchain_semaphore, null);
+            device.destroySemaphore(self.frames[i].render_semaphore, null);
 
             self.frames[i].deletion_queue.deinit(allocator, .{
-                .device = self.device,
-                .vma_allocator = self.vma_allocator,
+                .device = device,
+                .vma_allocator = self.device_ctx.vma_allocator,
             });
         }
 
+        for (self.test_meshes.items) |mesh| {
+            mesh.mesh_buffers.indexBuffer.destroy(self.device_ctx.vma_allocator);
+            mesh.mesh_buffers.vertexBuffer.destroy(self.device_ctx.vma_allocator);
+        }
+
+        // _mainDeletionQueue.flush();
+
         self.main_deletion_queue.deinit(allocator, .{
-            .device = self.device,
-            .vma_allocator = self.vma_allocator,
+            .device = device,
+            .vma_allocator = self.device_ctx.vma_allocator,
         });
 
-        self.swapchain.deinit(self.init_arena.allocator(), self.device);
+        self.swapchain.deinit(self.init_arena.allocator(), device);
 
-        self.device.destroyDevice(null);
-        self.instance.destroySurfaceKHR(self.surface, null);
-        self.instance.destroyInstance(null);
+        device.destroyDevice(null);
+        self.vk_ctx.instance.destroySurfaceKHR(self.vk_ctx.surface, null);
+        self.vk_ctx.instance.destroyInstance(null);
 
         c.SDL_DestroyWindow(self.window);
         c.SDL_Quit();
@@ -1135,11 +1218,12 @@ pub const VulkanEngine = struct {
         self.init_arena.deinit();
     }
 
-    fn drawImgui(self: *VulkanEngine, cmd: vk.CommandBuffer, target_image_view: vk.ImageView) void {
+    fn drawImgui(self: *VkEngine, cmd: vk.CommandBuffer, target_image_view: vk.ImageView) void {
+        const device = self.device_ctx.device;
         const color_attachment = vk_init.attachmentInfo(target_image_view, null, .attachment_optimal);
         const render_info = vk_init.renderingInfo(self.swapchain.extent, &color_attachment, null);
 
-        self.device.cmdBeginRendering(cmd, &render_info);
+        device.cmdBeginRendering(cmd, &render_info);
 
         c.cImGui_ImplVulkan_NewFrame();
         c.cImGui_ImplSDL3_NewFrame();
@@ -1163,17 +1247,20 @@ pub const VulkanEngine = struct {
         c.ImGui_Render();
         c.cImGui_ImplVulkan_RenderDrawData(c.ImGui_GetDrawData(), @ptrFromInt(@intFromEnum(cmd)));
 
-        self.device.cmdEndRendering(cmd);
+        device.cmdEndRendering(cmd);
     }
 
-    pub fn draw_geometry(self: VulkanEngine, cmd: vk.CommandBuffer) void {
+    pub fn draw_geometry(self: VkEngine, cmd: vk.CommandBuffer) void {
         //begin a render pass  connected to our draw image
         const color_attachment: vk.RenderingAttachmentInfo = vk_init.attachmentInfo(self.draw_image.image_view, null, .attachment_optimal);
+        const depthAttachment: vk.RenderingAttachmentInfo = vk_init.depthAttachmentInfo(self.depth_image.image_view, .depth_attachment_optimal);
 
-        const render_info = vk_init.renderingInfo(self.draw_extent, &color_attachment, null);
-        self.device.cmdBeginRendering(cmd, &render_info);
+        const render_info = vk_init.renderingInfo(self.draw_extent, &color_attachment, &depthAttachment);
+        const device = self.device_ctx.device;
 
-        self.device.cmdBindPipeline(cmd, .graphics, self.triangle_pipeline);
+        device.cmdBeginRendering(cmd, &render_info);
+
+        device.cmdBindPipeline(cmd, .graphics, self.triangle_pipeline);
 
         //set dynamic viewport and scissor
         const viewport: vk.Viewport = .{
@@ -1185,7 +1272,7 @@ pub const VulkanEngine = struct {
             .max_depth = 1,
         };
 
-        self.device.cmdSetViewport(cmd, 0, 1, (&viewport)[0..1]);
+        device.cmdSetViewport(cmd, 0, 1, (&viewport)[0..1]);
 
         const scissor: vk.Rect2D = .{
             .offset = .{
@@ -1197,37 +1284,51 @@ pub const VulkanEngine = struct {
                 .height = self.draw_extent.height,
             },
         };
-        self.device.cmdSetScissor(cmd, 0, 1, (&scissor)[0..1]);
+        device.cmdSetScissor(cmd, 0, 1, (&scissor)[0..1]);
 
         //launch a draw command to draw 3 vertices
-        self.device.cmdDraw(cmd, 3, 1, 0, 0);
+        device.cmdDraw(cmd, 3, 1, 0, 0);
 
         {
-            self.device.cmdBindPipeline(cmd, .graphics, self.mesh_pipeline);
+            device.cmdBindPipeline(cmd, .graphics, self.mesh_pipeline);
 
-            const push_constants: GPUDrawPushConstants = .{
+            var push_constants: GPUDrawPushConstants = .{
                 .worldMatrix = .identity,
                 .vertexBuffer = self.rectangle.vertexBufferAddress,
             };
 
-            self.device.cmdPushConstants(cmd, self.mesh_pipeline_layout, .{ .vertex_bit = true }, 0, @sizeOf(GPUDrawPushConstants), &push_constants);
-            self.device.cmdBindIndexBuffer(cmd, self.rectangle.indexBuffer.buffer, 0, .uint32);
+            device.cmdPushConstants(cmd, self.mesh_pipeline_layout, .{ .vertex_bit = true }, 0, @sizeOf(GPUDrawPushConstants), &push_constants);
+            device.cmdBindIndexBuffer(cmd, self.rectangle.indexBuffer.buffer, 0, .uint32);
 
-            self.device.cmdDrawIndexed(cmd, 6, 1, 0, 0, 0);
+            device.cmdDrawIndexed(cmd, 6, 1, 0, 0, 0);
+
+            // draw monkey
+            const view = Mat4.identity.translate(.{ 0, 0, -5 });
+            var projection: Mat4 = .perspective(70, @as(f32, @floatFromInt(self.draw_extent.width)) / @as(f32, @floatFromInt(self.draw_extent.height)), 10000, 0.1);
+            // invert the Y direction on projection matrix so that we are more similar
+            // to opengl and gltf axis
+            projection.items[1][1] *= -1;
+            push_constants.worldMatrix = projection.mul(view);
+            push_constants.vertexBuffer = self.test_meshes.items[2].mesh_buffers.vertexBufferAddress;
+
+            device.cmdPushConstants(cmd, self.mesh_pipeline_layout, .{ .vertex_bit = true }, 0, @sizeOf(GPUDrawPushConstants), &push_constants);
+            device.cmdBindIndexBuffer(cmd, self.test_meshes.items[2].mesh_buffers.indexBuffer.buffer, 0, .uint32);
+
+            device.cmdDrawIndexed(cmd, self.test_meshes.items[2].surfaces.items[0].count, 1, self.test_meshes.items[2].surfaces.items[0].start_index, 0, 0);
         }
 
-        self.device.cmdEndRendering(cmd);
+        device.cmdEndRendering(cmd);
     }
 
     pub fn uploadMesh(
-        device: vk.DeviceProxy,
-        vma_allocator: c.VmaAllocator,
-        imm_fence: vk.Fence,
-        imm_command_buffer: vk.CommandBuffer,
-        graphics_queue: vk.Queue,
+        device_ctx: VkEngine.DeviceContext,
+        imm: VkEngine.ImmSubmit,
         indices: []const u32,
         vertices: []const Vertex,
     ) !GPUMeshBuffers {
+        const device = device_ctx.device;
+        const vma_allocator = device_ctx.vma_allocator;
+
         const vertexBufferSize: usize = vertices.len * @sizeOf(Vertex);
         const indexBufferSize: usize = indices.len * @sizeOf(u32);
 
@@ -1274,7 +1375,7 @@ pub const VulkanEngine = struct {
         @memcpy(@as([*]u32, @alignCast(@ptrCast(data[vertexBufferSize..]))), indices);
 
         {
-            try immediateModeBegin(device, imm_fence, imm_command_buffer);
+            try immediateModeBegin(device, imm.fence, imm.command_buffer);
 
             const vertexCopy: vk.BufferCopy = .{
                 .dst_offset = 0,
@@ -1282,7 +1383,7 @@ pub const VulkanEngine = struct {
                 .size = vertexBufferSize,
             };
 
-            device.cmdCopyBuffer(imm_command_buffer, staging.buffer, newSurface.vertexBuffer.buffer, 1, (&vertexCopy)[0..1]);
+            device.cmdCopyBuffer(imm.command_buffer, staging.buffer, newSurface.vertexBuffer.buffer, 1, (&vertexCopy)[0..1]);
 
             const indexCopy: vk.BufferCopy = .{
                 .dst_offset = 0,
@@ -1290,9 +1391,9 @@ pub const VulkanEngine = struct {
                 .size = indexBufferSize,
             };
 
-            device.cmdCopyBuffer(imm_command_buffer, staging.buffer, newSurface.indexBuffer.buffer, 1, (&indexCopy)[0..1]);
+            device.cmdCopyBuffer(imm.command_buffer, staging.buffer, newSurface.indexBuffer.buffer, 1, (&indexCopy)[0..1]);
 
-            try immediateModeEnd(device, imm_fence, imm_command_buffer, graphics_queue);
+            try immediateModeEnd(device, imm.fence, imm.command_buffer, device_ctx.graphics_queue);
         }
 
         return newSurface;
@@ -1461,6 +1562,28 @@ const vk_init = struct {
         };
 
         return colorAttachment;
+    }
+
+    pub fn depthAttachmentInfo(
+        view: vk.ImageView,
+        layout: vk.ImageLayout, //= VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+    ) vk.RenderingAttachmentInfo {
+        const depthAttachment: vk.RenderingAttachmentInfo = .{
+            .image_view = view,
+            .image_layout = layout,
+            .load_op = .clear,
+            .store_op = .store,
+            .clear_value = .{
+                .depth_stencil = .{
+                    .depth = 0,
+
+                    .stencil = 0,
+                },
+            },
+            .resolve_mode = .{},
+            .resolve_image_layout = .undefined,
+        };
+        return depthAttachment;
     }
 
     pub fn loadShaderModule(shader_data: ShaderData, device: vk.DeviceProxy) !vk.ShaderModule {
@@ -1760,7 +1883,7 @@ const vk_init = struct {
         return try instance_dispatch.createDevice(physical_device, &create_info, null);
     }
 
-    // TODO: review this function, not convinced that this is done correctly
+    // TODO: review this function, not convinced that this is done best
     fn createSwapchain(
         alloc: std.mem.Allocator,
         temp_alloc: std.mem.Allocator,

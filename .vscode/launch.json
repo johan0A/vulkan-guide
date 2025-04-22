@@ -7,7 +7,7 @@
             "request": "launch",
             "program": "${workspaceFolder}/zig-out/bin/debug",
             "args": [],
-            "cwd": "${workspaceFolder}",
+            "cwd": "${workspaceFolder}/zig-out/bin",
             "terminal": "integrated",
             "preLaunchTask": "build-debug",
             "stopOnEntry": false,

@@ -31,8 +31,12 @@
             .hash = "N-V-__8AAAIGzwCa4tCHc1jhxfgWaL73kQkckQuQ2WA2XWI5",
         },
         .zla = .{
-            .url = "git+https://github.com/johan0A/zig-linear-algebra#7ecd00896389e5f9cc51e6b92063b6bdd7ff363c",
-            .hash = "zla-0.0.2-zqm18LRpAAAy2Gb8nhJz0_vPXs8M_wHC4KEGZCmrrlDJ",
+            .url = "git+https://github.com/johan0A/zig-linear-algebra#0ce6cf8e4436475aea5bf706ecb3fa56e2726d96",
+            .hash = "zla-0.0.2-zqm18LxzAACwdcC6PYTPtM2GUvJdfcdL3oKMkxYz-nxc",
+        },
+        .zgltf = .{
+            .url = "git+https://github.com/kooparse/zgltf#b6579c3887c7ab0eef5f1eda09abbbc1f04d76ce",
+            .hash = "zgltf-0.1.0-sX6QAqIKAgAfb7yQlVrdsLwCNc6Fx8wFOLIQRaEGJnVC",
         },
     },
     .paths = .{
