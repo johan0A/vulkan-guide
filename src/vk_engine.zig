@@ -448,6 +448,7 @@ pub const VkEngine = struct {
     device_ctx: DeviceContext,
 
     swapchain: SwapChain,
+    resize_requested: bool,
 
     frame_number: u64,
     frames: [FrameData.FRAME_OVERLAP]FrameData,
@@ -524,12 +525,19 @@ pub const VkEngine = struct {
         _ = try device.waitForFences(1, (&self.currentFrame().render_fence)[0..1], vk.TRUE, 1e9);
         _ = try device.resetFences(1, (&self.currentFrame().render_fence)[0..1]);
 
-        const swapchain_image_index: u32 = (try device.acquireNextImageKHR(
+        const acquire_next_image_result = device.acquireNextImageKHR(
             self.swapchain.handle,
             1e9,
             self.currentFrame().swapchain_semaphore,
             .null_handle,
-        )).image_index;
+        ) catch |err| switch (err) {
+            error.OutOfDateKHR => {
+                self.resize_requested = true;
+                return;
+            },
+            else => |e| return e,
+        };
+        const swapchain_image_index: u32 = acquire_next_image_result.image_index;
 
         //naming it cmd for shorter writing
         const cmd: vk.CommandBuffer = self.currentFrame().main_command_buffer;
@@ -596,7 +604,12 @@ pub const VkEngine = struct {
             .wait_semaphore_count = 1,
             .p_image_indices = (&swapchain_image_index)[0..1],
         };
-        _ = try device.queuePresentKHR(self.device_ctx.graphics_queue, &present_info);
+        _ = device.queuePresentKHR(self.device_ctx.graphics_queue, &present_info) catch |err| switch (err) {
+            error.OutOfDateKHR => {
+                self.resize_requested = true;
+            },
+            else => |e| return e,
+        };
 
         self.frame_number += 1;
     }
@@ -644,7 +657,7 @@ pub const VkEngine = struct {
         const window_height = 1080;
 
         const tracy_SDL_CreateWindow = tracy.zoneEx(@src(), .{ .name = "SDL_CreateWindow" });
-        const window = c.SDL_CreateWindow("title", window_width, window_height, c.SDL_WINDOW_VULKAN) orelse return error.engine_init_failure;
+        const window = c.SDL_CreateWindow("title", window_width, window_height, c.SDL_WINDOW_VULKAN | c.SDL_WINDOW_RESIZABLE) orelse return error.engine_init_failure;
         tracy_SDL_CreateWindow.end();
 
         const tracy_load_base_dispatch = tracy.zoneEx(@src(), .{ .name = "load base_dispatch" });
@@ -936,7 +949,7 @@ pub const VkEngine = struct {
         const graphics_queue = device_proxy.getDeviceQueue(queue_family_indices.graphics_family.?, 0);
 
         const swapchain = try vk_init.createSwapchain(
-            init_alloc,
+            allocator,
             temp_alloc,
             physical_device,
             device_proxy,
@@ -1153,7 +1166,6 @@ pub const VkEngine = struct {
         try main_deletion_queue.append(allocator, .{ .allocated_buffer = rectangle.vertexBuffer });
 
         const testMeshes = try loader.loadGltfMeshes(init_alloc, temp_alloc, device_ctx, imm, "assets/basicmesh.glb");
-
         // }
 
         return .{
@@ -1172,6 +1184,7 @@ pub const VkEngine = struct {
             .window = window,
 
             .swapchain = swapchain,
+            .resize_requested = false,
 
             .frame_number = 0,
             .frames = frames,
@@ -1204,6 +1217,35 @@ pub const VkEngine = struct {
         };
     }
 
+    pub fn resizeSwapchain(self: *VkEngine, alloc: Allocator) !void {
+        const device = self.device_ctx.device;
+        try device.deviceWaitIdle();
+
+        self.swapchain.deinit(alloc, device);
+
+        var w: i32 = undefined;
+        var h: i32 = undefined;
+        _ = c.SDL_GetWindowSize(self.window, &w, &h);
+        self.swapchain.extent.width = @intCast(w);
+        self.swapchain.extent.height = @intCast(h);
+
+        var temp_arena = std.heap.ArenaAllocator.init(alloc);
+        defer temp_arena.deinit();
+
+        self.swapchain = try vk_init.createSwapchain(
+            alloc,
+            temp_arena.allocator(),
+            self.vk_ctx.chosen_gpu,
+            device,
+            self.vk_ctx.surface,
+            self.swapchain.extent.width,
+            self.swapchain.extent.height,
+            self.vk_ctx.instance.wrapper.*,
+        );
+
+        self.resize_requested = false;
+    }
+
     pub fn deinit(self: *VkEngine, allocator: Allocator) void {
         const device = self.device_ctx.device;
         device.deviceWaitIdle() catch @panic(""); // TODO
@@ -1233,7 +1275,7 @@ pub const VkEngine = struct {
             .vma_allocator = self.device_ctx.vma_allocator,
         });
 
-        self.swapchain.deinit(self.init_arena.allocator(), device);
+        self.swapchain.deinit(allocator, device);
 
         device.destroyDevice(null);
         self.vk_ctx.instance.destroySurfaceKHR(self.vk_ctx.surface, null);
@@ -1324,10 +1366,10 @@ pub const VkEngine = struct {
                 .vertexBuffer = self.rectangle.vertexBufferAddress,
             };
 
-            device.cmdPushConstants(cmd, self.mesh_pipeline_layout, .{ .vertex_bit = true }, 0, @sizeOf(GPUDrawPushConstants), &push_constants);
-            device.cmdBindIndexBuffer(cmd, self.rectangle.indexBuffer.buffer, 0, .uint32);
+            // device.cmdPushConstants(cmd, self.mesh_pipeline_layout, .{ .vertex_bit = true }, 0, @sizeOf(GPUDrawPushConstants), &push_constants);
+            // device.cmdBindIndexBuffer(cmd, self.rectangle.indexBuffer.buffer, 0, .uint32);
 
-            device.cmdDrawIndexed(cmd, 6, 1, 0, 0, 0);
+            // device.cmdDrawIndexed(cmd, 6, 1, 0, 0, 0);
 
             // draw monkey
             const view = Mat4.identity.translate(.{ 0, 0, -5 });

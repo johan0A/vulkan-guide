@@ -33,5 +33,9 @@ pub fn main() !void {
         }
 
         try engine.draw();
+
+        if (engine.resize_requested) {
+            try engine.resizeSwapchain(allocator);
+        }
     }
 }
