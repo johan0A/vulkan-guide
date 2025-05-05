@@ -5,14 +5,14 @@ const vk = @import("vulkan");
 const c = @import("c");
 const tracy = @import("tracy");
 const shaders = @import("shaders");
+const loader = @import("loader.zig");
 const zla = @import("zla");
-const loader = @import("./loader.zig");
 const vec = zla.vec;
 const Mat = zla.Mat;
 const Mat4 = zla.Mat(f32, 4, 4);
+const options = @import("options");
 
 // TODO: make those not globals?
-const enable_validation_layers = true;
 const validation_layers = [_][:0]const u8{"VK_LAYER_KHRONOS_validation"};
 const required_device_extensions = [_][:0]const u8{vk.extensions.khr_swapchain.name};
 
@@ -664,7 +664,7 @@ pub const VkEngine = struct {
         const base_dispatch = vk.BaseWrapper.load(@as(vk.PfnGetInstanceProcAddr, @ptrCast(c.SDL_Vulkan_GetVkGetInstanceProcAddr())));
         tracy_load_base_dispatch.end();
 
-        const instance = try vk_init.createVkInstance(base_dispatch, temp_alloc);
+        const instance = try vk_init.createVkInstance(base_dispatch, temp_alloc, options.enable_validation_layers);
         const instance_dispatch = try init_alloc.create(vk.InstanceWrapper);
         {
             const tracy_load_instance_dispatch = tracy.zoneEx(@src(), .{ .name = "load instance_dispatch" });
@@ -1165,7 +1165,7 @@ pub const VkEngine = struct {
         try main_deletion_queue.append(allocator, .{ .allocated_buffer = rectangle.indexBuffer });
         try main_deletion_queue.append(allocator, .{ .allocated_buffer = rectangle.vertexBuffer });
 
-        const testMeshes = try loader.loadGltfMeshes(init_alloc, temp_alloc, device_ctx, imm, "assets/basicmesh.glb");
+        const testMeshes = try loader.loadGltfMeshes(init_alloc, temp_alloc, device_ctx, imm, options.assets_path ++ "/basicmesh.glb");
         // }
 
         return .{
@@ -1748,7 +1748,7 @@ const vk_init = struct {
         return subImage;
     }
 
-    pub fn createVkInstance(base_dispatch: vk.BaseWrapper, temp_alloc: Allocator) !vk.Instance {
+    pub fn createVkInstance(base_dispatch: vk.BaseWrapper, temp_alloc: Allocator, enable_validation_layers: bool) !vk.Instance {
         const zone = tracy.zone(@src());
         defer zone.end();
 

@@ -84,7 +84,9 @@ pub fn build(b: *std.Build) !void {
         _ = generator.addCopyDirectory(b.dependency("ply", .{}).path("src"), "", .{});
 
         const generator_path = try generator.getDirectory().join(b.allocator, "dear_bindings.py");
-        const python = try b.findProgram(&.{ "py", "python3", "python" }, &.{});
+
+        // const python = b.findProgram(&.{ "py", "python3", "python" }, &.{}) catch "python"; // prints a bunch of errors to console when program is not found
+        const python = "python";
 
         const regenerate = b.step("gen", "");
 
