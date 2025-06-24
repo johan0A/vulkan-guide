@@ -1470,8 +1470,119 @@ pub const VkEngine = struct {
 };
 
 const vk_descriptors = struct {
+    const DescriptorAllocatorGrowable = struct {
+        const PoolSizeRatio = struct {
+            type: vk.DescriptorType,
+            ratio: f32,
+        };
+
+        ratios: std.ArrayListUnmanaged(PoolSizeRatio),
+        fullPools: std.ArrayListUnmanaged(vk.DescriptorPool),
+        readyPools: std.ArrayListUnmanaged(vk.DescriptorPool),
+        setsPerPool: u32,
+
+        pub fn init(
+            self: *DescriptorAllocatorGrowable,
+            device: vk.Device,
+            max_sets: u32,
+            pool_ratios: []const PoolSizeRatio,
+        ) void {
+            self.ratios.clearRetainingCapacity();
+
+            for (pool_ratios) |ratio| {
+                self.ratios.append(ratio);
+            }
+
+            self.setsPerPool = max_sets * 1.5; //grow it next allocation
+
+            const new_pool = self.createPool(device, max_sets, pool_ratios);
+            self.readyPools.append(new_pool);
+        }
+
+        pub fn clear_pools(self: *DescriptorAllocatorGrowable, device: vk.DeviceProxy) void {
+            for (self.readyPools.items) |pool| {
+                device.resetDescriptorPool(pool, .{});
+            }
+
+            for (self.fullPools.items) |pool| {
+                device.destroyDescriptorPool(pool, null);
+                self.readyPools.append(pool);
+            }
+            self.fullPools.clearRetainingCapacity();
+        }
+
+        pub fn destroyPools(self: *DescriptorAllocatorGrowable, device: vk.DeviceProxy) void {
+            for (self.readyPools.items) |pool| {
+                device.destroyDescriptorPool(pool, null);
+            }
+            self.readyPools.clearRetainingCapacity();
+
+            for (self.fullPools.items) |pool| {
+                device.destroyDescriptorPool(pool, null);
+            }
+            self.fullPools.clearRetainingCapacity();
+        }
+
+        pub fn allocate(self: *DescriptorAllocatorGrowable, device: vk.DeviceProxy, layout_: vk.DescriptorSetLayout, pNext: *anyopaque) vk.DescriptorSet {
+            //get or create a pool to allocate from
+            var poolToUse = self.getPool(device);
+
+            const allocInfo: vk.DescriptorSetAllocateInfo = .{
+                .p_next = pNext,
+                .descriptor_pool = poolToUse,
+                .descriptor_set_count = 1,
+                .p_set_layouts = &layout_,
+            };
+
+            var result: vk.DescriptorSet = undefined;
+            device.allocateDescriptorSets(&allocInfo, &result) catch |err| switch (err) {
+                .OutOfPoolMemory, .FragmentedPool => { //allocation failed. Try again
+                    try self.fullPools.append(poolToUse);
+
+                    poolToUse = self.getPool(device);
+                    allocInfo.descriptorPool = poolToUse;
+
+                    try device.allocateDescriptorSets(&allocInfo, &result);
+                },
+                .OutOfHostMemory, .OutOfDeviceMemory, .Unknown => |e| return e,
+            };
+
+            self.readyPools.append(poolToUse);
+            return result;
+        }
+
+        pub fn getPool(self: *DescriptorAllocatorGrowable, device: vk.DeviceProxy) vk.DescriptorPool {
+            if (self.readyPools.items.len != 0) {
+                return self.readyPools.pop().?;
+            } else {
+                self.setsPerPool = self.setsPerPool * 1.5;
+                if (self.setsPerPool > 4092) {
+                    self.setsPerPool = 4092;
+                }
+
+                return createPool(device, self.setsPerPool, self.ratios);
+            }
+        }
+
+        pub fn createPool(device: vk.DeviceProxy, setCount: u32, poolRatios: []const PoolSizeRatio) vk.DescriptorPool {
+            var poolSizes: std.ArrayListUnmanaged(vk.DescriptorPoolSize) = .empty;
+            for (poolRatios) |ratio| {
+                poolSizes.append(.{ .type = ratio.type, .descriptorCount = ratio.ratio * setCount });
+            }
+
+            const pool_info: vk.DescriptorPoolCreateInfo = .{
+                .flags = 0,
+                .max_sets = setCount,
+                .pool_size_count = @intCast(poolSizes.items.len),
+                .p_pool_sizes = poolSizes.items.ptr,
+            };
+
+            return try device.createDescriptorPool(&pool_info, null);
+        }
+    };
+
     const layout = struct {
-        fn createSetBinding(
+        pub fn createSetBinding(
             binding: u32,
             descriptor_type: vk.DescriptorType,
         ) vk.DescriptorSetLayoutBinding {
