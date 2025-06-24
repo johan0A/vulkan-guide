@@ -1,19 +1,24 @@
 .{
     .name = .vulkan_tutorial,
     .version = "0.0.0",
-    .fingerprint = 0xe6a82ece1521df,
+    .fingerprint = 0xe6a82ece1521df, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.14.1",
     .dependencies = .{
+        .vulkan_headers = .{
+            .url = "git+https://github.com/hexops/vulkan-headers#68ab446d1fa0707bb7082c95c51d33a731cafac2",
+            .hash = "N-V-__8AAAIGzwCa4tCHc1jhxfgWaL73kQkckQuQ2WA2XWI5",
+        },
         .vulkan = .{
             .url = "git+https://github.com/Snektron/vulkan-zig#40ad90a912eafb81581a121e585688fbbd7d8ddf",
             .hash = "vulkan-0.0.0-r7Ytx1JTAwC3R0cfA3SxaWPGJa6p3EUw3OTXTgSPr_hF",
         },
-        .sdl = .{
-            .url = "git+https://github.com/castholm/SDL?ref=v0.2.1+3.2.10#f6bbe8ac5e7b901db69ba62f017596090c362d84",
-            .hash = "sdl-0.2.1+3.2.10-7uIn9PLkfQHKJO7TvSXbVa0VnySCHbLz28PDZIlKWF4Y",
-        },
         .VulkanMemoryAllocator = .{
             .url = "git+https://github.com/johan0A/VulkanMemoryAllocator#be6c5d6ef9b4db59f5690bf586c91c78f5b42085",
             .hash = "VulkanMemoryAllocator-3.2.1-eK3SgawSAABzHzL3WtsUG1RrWiU1wTS4Jc9s8GWj80WP",
+        },
+        .sdl = .{
+            .url = "git+https://github.com/castholm/SDL?ref=v0.2.1+3.2.10#f6bbe8ac5e7b901db69ba62f017596090c362d84",
+            .hash = "sdl-0.2.1+3.2.10-7uIn9PLkfQHKJO7TvSXbVa0VnySCHbLz28PDZIlKWF4Y",
         },
         .tracy = .{
             .url = "git+https://github.com/johan0A/zig-tracy#06f7e1bf96c3213bbe3e34414651b2ef76e023c3",
@@ -25,10 +30,6 @@
         },
         .dcimgui = .{
             .path = "vendor/dcimgui",
-        },
-        .vulkan_headers = .{
-            .url = "git+https://github.com/hexops/vulkan-headers#68ab446d1fa0707bb7082c95c51d33a731cafac2",
-            .hash = "N-V-__8AAAIGzwCa4tCHc1jhxfgWaL73kQkckQuQ2WA2XWI5",
         },
         .zla = .{
             .url = "git+https://github.com/johan0A/zig-linear-algebra#0ce6cf8e4436475aea5bf706ecb3fa56e2726d96",
@@ -43,6 +44,9 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "assets",
+        "shaders",
+        "vendor",
         "LICENSE",
         "README.md",
     },
