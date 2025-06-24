@@ -864,26 +864,34 @@ pub const VkEngine = struct {
 
         const draw_image_descriptors = try global_descriptor_allocator.allocate(device_proxy, draw_image_descriptor_layout);
 
-        const img_info: vk.DescriptorImageInfo = .{
-            .image_layout = .general,
-            .image_view = draw_allocated_image.image_view,
+        // {
+        // const img_info: vk.DescriptorImageInfo = .{
+        //     .image_layout = .general,
+        //     .image_view = draw_allocated_image.image_view,
 
-            .sampler = .null_handle,
-        };
+        //     .sampler = .null_handle,
+        // };
 
-        const draw_image_write: vk.WriteDescriptorSet = .{
-            .dst_binding = 0,
-            .dst_set = draw_image_descriptors,
-            .descriptor_count = 1,
-            .descriptor_type = .storage_image,
-            .p_image_info = (&img_info)[0..1],
-            .dst_array_element = 0,
-            // image descriptor, not a buffer or texel buffer: (TODO: is undefined correct here?)
-            .p_buffer_info = undefined,
-            .p_texel_buffer_view = undefined,
-        };
+        // const draw_image_write: vk.WriteDescriptorSet = .{
+        //     .dst_binding = 0,
+        //     .dst_set = draw_image_descriptors,
+        //     .descriptor_count = 1,
+        //     .descriptor_type = .storage_image,
+        //     .p_image_info = (&img_info)[0..1],
+        //     .dst_array_element = 0,
+        //     // image descriptor, not a buffer or texel buffer: (TODO: is undefined correct here?)
+        //     .p_buffer_info = undefined,
+        //     .p_texel_buffer_view = undefined,
+        // };
 
-        device_proxy.updateDescriptorSets(1, (&draw_image_write)[0..1], 0, null);
+        // device_proxy.updateDescriptorSets(1, (&draw_image_write)[0..1], 0, null);
+        // TODO: above replaced with below, is abstraction good here?
+        var writer: vk_descriptors.DescriptorWriter = .{};
+        defer writer.deinit(allocator);
+        try writer.writeImage(allocator, 0, draw_allocated_image.image_view, .null_handle, .general, .storage_image);
+
+        writer.updateSet(device_proxy, draw_image_descriptors);
+        // }
 
         try main_deletion_queue.append(allocator, .{ .descriptor_set_layout = draw_image_descriptor_layout });
         try main_deletion_queue.append(allocator, .{ .descriptor_allocator = global_descriptor_allocator });
@@ -1614,6 +1622,59 @@ const vk_descriptors = struct {
                 .flags = flags,
             };
             return try device.createDescriptorSetLayout(&info, null);
+        }
+    };
+
+    const DescriptorWriter = struct {
+        imageInfos: std.SegmentedList(vk.DescriptorImageInfo, 128) = .{},
+        bufferInfos: std.SegmentedList(vk.DescriptorBufferInfo, 128) = .{},
+        writes: std.ArrayListUnmanaged(vk.WriteDescriptorSet) = .empty,
+
+        pub fn writeImage(self: *DescriptorWriter, allocator: Allocator, binding: u32, image: vk.ImageView, sampler: vk.Sampler, layout_: vk.ImageLayout, @"type": vk.DescriptorType) !void {
+            const info: *vk.DescriptorImageInfo = try self.imageInfos.addOne(allocator);
+            info.* = .{ .sampler = sampler, .image_view = image, .image_layout = layout_ };
+
+            try self.writes.append(allocator, .{
+                .dst_binding = binding,
+                .dst_set = .null_handle, //left empty for now until we need to write it
+                .descriptor_count = 1,
+                .descriptor_type = @"type",
+                .p_image_info = info[0..1],
+
+                .dst_array_element = undefined, // TODO undefined correct here?
+                .p_buffer_info = undefined,
+                .p_texel_buffer_view = undefined,
+            });
+        }
+
+        pub fn writeBuffer(self: *DescriptorWriter, allocator: Allocator, binding: u32, buffer: vk.Buffer, size: usize, offset: usize, @"type": vk.DescriptorType) !void {
+            const info: *vk.DescriptorBufferInfo = self.bufferInfos.addOne();
+            info.* = .{ .buffer = buffer, .offset = offset, .range = size };
+
+            try self.writes.append(allocator, .{
+                .dst_binding = binding,
+                .dst_set = .null_handle, //left empty for now until we need to write it
+                .descriptor_count = 1,
+                .descriptor_type = @"type",
+                .p_buffer_info = info,
+            });
+        }
+
+        pub fn clear(self: *DescriptorWriter) void {
+            self.imageInfos.clearRetainingCapacity();
+            self.writes.clearRetainingCapacity();
+            self.bufferInfos.clearRetainingCapacity();
+        }
+
+        pub fn deinit(self: *DescriptorWriter, allocator: Allocator) void {
+            self.imageInfos.deinit(allocator);
+            self.writes.deinit(allocator);
+            self.bufferInfos.deinit(allocator);
+        }
+
+        pub fn updateSet(self: *DescriptorWriter, device: vk.DeviceProxy, set: vk.DescriptorSet) void {
+            for (self.writes.items) |*write| write.dst_set = set;
+            device.updateDescriptorSets(@intCast(self.writes.items.len), self.writes.items.ptr, 0, null);
         }
     };
 };
