@@ -8,7 +8,6 @@ const shaders = @import("shaders");
 const loader = @import("loader.zig");
 const zla = @import("zla");
 const vec = zla.vec;
-const Mat = zla.Mat;
 const Mat4 = zla.Mat(f32, 4, 4);
 const options = @import("options");
 
@@ -60,6 +59,15 @@ pub const Vertex = extern struct {
     normal: [3]f32,
     uv_y: f32,
     color: [4]f32,
+};
+
+pub const GPUSceneData = extern struct {
+    view: Mat4,
+    proj: Mat4,
+    viewproj: Mat4,
+    ambientColor: [4]f32,
+    sunlightDirection: [4]f32, // w for sun power
+    sunlightColor: [4]f32,
 };
 
 // holds the resources needed for a mesh
@@ -406,14 +414,15 @@ const SwapChain = struct {
 const FrameData = struct {
     const FRAME_OVERLAP = 2;
 
-    command_pool: vk.CommandPool,
-    main_command_buffer: vk.CommandBuffer,
-
     swapchain_semaphore: vk.Semaphore,
     render_semaphore: vk.Semaphore,
     render_fence: vk.Fence,
 
+    command_pool: vk.CommandPool,
+    main_command_buffer: vk.CommandBuffer,
+
     deletion_queue: DeletionQueue,
+    frame_descriptors: descriptors.DescriptorAllocatorGrowable,
 };
 
 pub const VkEngine = struct {
@@ -463,6 +472,9 @@ pub const VkEngine = struct {
     draw_image_descriptors: vk.DescriptorSet,
     draw_image_descriptor_set_layout: vk.DescriptorSetLayout,
 
+    scene_data: GPUSceneData,
+    gpu_scene_data_descriptor_layout: vk.DescriptorSetLayout,
+
     global_descriptor_allocator: DescriptorAllocator,
 
     background_effects: []ComputeEffect,
@@ -480,7 +492,7 @@ pub const VkEngine = struct {
 
     test_meshes: std.ArrayListUnmanaged(loader.MeshAsset),
 
-    pub fn draw(self: *VkEngine) !void {
+    pub fn draw(self: *VkEngine, allocator: Allocator) !void {
         const local = struct {
             fn drawBackground(engine: *VkEngine, cmd: vk.CommandBuffer) void {
                 // bind the gradient drawing compute pipeline
@@ -520,9 +532,21 @@ pub const VkEngine = struct {
             }
         };
 
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const temp_alloc = arena.allocator();
+
         const device = self.device_ctx.device;
 
         _ = try device.waitForFences(1, (&self.currentFrame().render_fence)[0..1], vk.TRUE, 1e9);
+
+        self.currentFrame().deletion_queue.flush(.{
+            .device = device,
+            .vma_allocator = self.device_ctx.vma_allocator,
+        });
+
+        try self.currentFrame().frame_descriptors.clearPools(allocator, device);
+
         _ = try device.resetFences(1, (&self.currentFrame().render_fence)[0..1]);
 
         const acquire_next_image_result = device.acquireNextImageKHR(
@@ -560,7 +584,7 @@ pub const VkEngine = struct {
 
             vk_image.transitionImage(device, cmd, self.draw_image.image, .general, .color_attachment_optimal);
             vk_image.transitionImage(device, cmd, self.depth_image.image, .undefined, .depth_attachment_optimal);
-            self.draw_geometry(cmd);
+            try self.drawGeometry(allocator, temp_alloc, cmd);
 
             //transtion the draw image and the swapchain image into their correct transfer layouts
             vk_image.transitionImage(device, cmd, self.draw_image.image, .color_attachment_optimal, .transfer_src_optimal);
@@ -718,6 +742,8 @@ pub const VkEngine = struct {
                 .render_semaphore = try device_proxy.createSemaphore(&.{}, null),
                 .main_command_buffer = main_command_buffer,
                 .deletion_queue = .init,
+
+                .frame_descriptors = undefined,
             };
         }
 
@@ -857,10 +883,10 @@ pub const VkEngine = struct {
         const global_descriptor_allocator: DescriptorAllocator = try .initPool(temp_alloc, device_proxy, 10, sizes);
 
         //make the descriptor set layout for our compute draw
-        var bindings = [_]vk.DescriptorSetLayoutBinding{
-            vk_descriptors.layout.createSetBinding(0, .storage_image),
+        var image_bindings = [_]vk.DescriptorSetLayoutBinding{
+            descriptors.layout.createSetBinding(0, .storage_image),
         };
-        const draw_image_descriptor_layout = try vk_descriptors.layout.createSet(&bindings, device_proxy, .{ .compute_bit = true }, null, .{});
+        const draw_image_descriptor_layout = try descriptors.layout.createSet(&image_bindings, device_proxy, .{ .compute_bit = true }, null, .{});
 
         const draw_image_descriptors = try global_descriptor_allocator.allocate(device_proxy, draw_image_descriptor_layout);
 
@@ -886,15 +912,41 @@ pub const VkEngine = struct {
 
         // device_proxy.updateDescriptorSets(1, (&draw_image_write)[0..1], 0, null);
         // TODO: above replaced with below, is abstraction good here?
-        var writer: vk_descriptors.DescriptorWriter = .{};
+        var writer: descriptors.DescriptorWriter = .{};
         defer writer.deinit(allocator);
         try writer.writeImage(allocator, 0, draw_allocated_image.image_view, .null_handle, .general, .storage_image);
 
         writer.updateSet(device_proxy, draw_image_descriptors);
-        // }
+
+        for (&frames) |*frame| {
+            const frame_sizes: []const descriptors.DescriptorAllocatorGrowable.PoolSizeRatio = &.{
+                .{ .type = .storage_image, .ratio = 3 },
+                .{ .type = .storage_buffer, .ratio = 3 },
+                .{ .type = .uniform_buffer, .ratio = 3 },
+                .{ .type = .combined_image_sampler, .ratio = 4 },
+            };
+
+            frame.frame_descriptors = .empty;
+            try frame.frame_descriptors.init(allocator, temp_alloc, device_proxy, 1000, frame_sizes);
+
+            // _mainDeletionQueue.push_function([&, i]() {
+            //     _frames[i]._frameDescriptors.destroy_pools(_device);
+            // });
+
+            // TODO: add to deletion queue
+            // main_deletion_queue.append(allocator, .{ .descriptor_pool =  });
+        }
+
+        var scene_data_bindings = [_]vk.DescriptorSetLayoutBinding{
+            descriptors.layout.createSetBinding(0, .uniform_buffer),
+        };
+        const gpu_scene_data_descriptor_layout = try descriptors.layout.createSet(&scene_data_bindings, device_proxy, .{ .vertex_bit = true, .fragment_bit = true }, null, .{});
+
+        try main_deletion_queue.append(allocator, .{ .descriptor_set_layout = gpu_scene_data_descriptor_layout });
 
         try main_deletion_queue.append(allocator, .{ .descriptor_set_layout = draw_image_descriptor_layout });
         try main_deletion_queue.append(allocator, .{ .descriptor_allocator = global_descriptor_allocator });
+        // }
 
         // backround effects init ------------
         const effect_infos = [_]struct { path: []const u8, default_data: ComputeEffect.ComputeData, name: [:0]const u8 }{
@@ -1203,10 +1255,20 @@ pub const VkEngine = struct {
             .depth_image = depth_allocated_image,
             .draw_extent = .{ .width = 0, .height = 0 },
 
-            .global_descriptor_allocator = global_descriptor_allocator,
-
             .draw_image_descriptors = draw_image_descriptors,
             .draw_image_descriptor_set_layout = draw_image_descriptor_layout,
+
+            .scene_data = .{
+                .view = .identity,
+                .proj = .identity,
+                .viewproj = .identity,
+                .ambientColor = @splat(0),
+                .sunlightDirection = @splat(0), // w for sun power
+                .sunlightColor = @splat(0),
+            },
+            .gpu_scene_data_descriptor_layout = gpu_scene_data_descriptor_layout,
+
+            .global_descriptor_allocator = global_descriptor_allocator,
 
             .background_effects = background_effects,
             .active_background_effect = 0,
@@ -1269,6 +1331,8 @@ pub const VkEngine = struct {
                 .device = device,
                 .vma_allocator = self.device_ctx.vma_allocator,
             });
+
+            self.frames[i].frame_descriptors.deinit(allocator, device);
         }
 
         for (self.test_meshes.items) |mesh| {
@@ -1327,7 +1391,7 @@ pub const VkEngine = struct {
         device.cmdEndRendering(cmd);
     }
 
-    pub fn draw_geometry(self: VkEngine, cmd: vk.CommandBuffer) void {
+    pub fn drawGeometry(self: *VkEngine, allocator: Allocator, temp_alloc: Allocator, cmd: vk.CommandBuffer) !void {
         //begin a render pass  connected to our draw image
         const color_attachment: vk.RenderingAttachmentInfo = vk_init.attachmentInfo(self.draw_image.image_view, null, .attachment_optimal);
         const depthAttachment: vk.RenderingAttachmentInfo = vk_init.depthAttachmentInfo(self.depth_image.image_view, .depth_attachment_optimal);
@@ -1392,6 +1456,36 @@ pub const VkEngine = struct {
             device.cmdBindIndexBuffer(cmd, self.test_meshes.items[2].mesh_buffers.indexBuffer.buffer, 0, .uint32);
 
             device.cmdDrawIndexed(cmd, self.test_meshes.items[2].surfaces.items[0].count, 1, self.test_meshes.items[2].surfaces.items[0].start_index, 0, 0);
+        }
+
+        {
+
+            //allocate a new uniform buffer for the scene data
+            const gpuSceneDataBuffer: AllocatedBuffer = try .create(self.device_ctx.vma_allocator, @sizeOf(GPUSceneData), .{ .uniform_buffer_bit = true }, c.VMA_MEMORY_USAGE_CPU_TO_GPU);
+
+            // //add it to the deletion queue of this frame so it gets deleted once its been used
+            // get_current_frame()._deletionQueue.push_function([=, this]() {
+            //     destroy_buffer(gpuSceneDataBuffer);
+            // });
+            try self.currentFrame().deletion_queue.append(allocator, .{ .allocated_buffer = gpuSceneDataBuffer });
+
+            // //write the buffer
+            // GPUSceneData* sceneUniformData = (GPUSceneData*)gpuSceneDataBuffer.allocation->GetMappedData();
+            // *sceneUniformData = sceneData;
+
+            var data: *GPUSceneData = undefined;
+            _ = c.vmaMapMemory(self.device_ctx.vma_allocator, gpuSceneDataBuffer.allocation, @ptrCast(&data)); // TODO: handle error?
+            defer c.vmaUnmapMemory(self.device_ctx.vma_allocator, gpuSceneDataBuffer.allocation);
+            data.* = self.scene_data;
+
+            // //create a descriptor set that binds that buffer and update it
+            // VkDescriptorSet globalDescriptor = get_current_frame()._frameDescriptors.allocate(_device, _gpuSceneDataDescriptorLayout);
+
+            const globalDescriptor: vk.DescriptorSet = try self.currentFrame().frame_descriptors.allocate(allocator, temp_alloc, device, self.gpu_scene_data_descriptor_layout, null);
+
+            var writer: descriptors.DescriptorWriter = .{};
+            try writer.writeBuffer(temp_alloc, 0, gpuSceneDataBuffer.buffer, @sizeOf(GPUSceneData), 0, .uniform_buffer);
+            writer.updateSet(device, globalDescriptor);
         }
 
         device.cmdEndRendering(cmd);
@@ -1477,8 +1571,10 @@ pub const VkEngine = struct {
     }
 };
 
-const vk_descriptors = struct {
+const descriptors = struct {
     const DescriptorAllocatorGrowable = struct {
+        // TODO: the design of this is pretty bad
+
         const PoolSizeRatio = struct {
             type: vk.DescriptorType,
             ratio: f32,
@@ -1489,32 +1585,52 @@ const vk_descriptors = struct {
         readyPools: std.ArrayListUnmanaged(vk.DescriptorPool),
         setsPerPool: u32,
 
+        pub const empty: DescriptorAllocatorGrowable = .{
+            .ratios = .empty,
+            .fullPools = .empty,
+            .readyPools = .empty,
+            .setsPerPool = 0,
+        };
+
         pub fn init(
             self: *DescriptorAllocatorGrowable,
-            device: vk.Device,
+            allocator: Allocator,
+            temp_alloc: Allocator,
+            device: vk.DeviceProxy,
             max_sets: u32,
             pool_ratios: []const PoolSizeRatio,
-        ) void {
+        ) !void {
             self.ratios.clearRetainingCapacity();
 
             for (pool_ratios) |ratio| {
-                self.ratios.append(ratio);
+                try self.ratios.append(allocator, ratio);
             }
 
-            self.setsPerPool = max_sets * 1.5; //grow it next allocation
+            self.setsPerPool = @intFromFloat(@as(f64, @floatFromInt(max_sets)) * 1.5); //grow it next allocation
 
-            const new_pool = self.createPool(device, max_sets, pool_ratios);
-            self.readyPools.append(new_pool);
+            const new_pool = try createPool(temp_alloc, device, max_sets, pool_ratios);
+            try self.readyPools.append(allocator, new_pool);
         }
 
-        pub fn clear_pools(self: *DescriptorAllocatorGrowable, device: vk.DeviceProxy) void {
+        fn deinit(
+            self: *DescriptorAllocatorGrowable,
+            allocator: Allocator,
+            device: vk.DeviceProxy,
+        ) void {
+            self.destroyPools(device);
+            self.ratios.deinit(allocator);
+            self.fullPools.deinit(allocator);
+            self.readyPools.deinit(allocator);
+        }
+
+        pub fn clearPools(self: *DescriptorAllocatorGrowable, allocator: Allocator, device: vk.DeviceProxy) !void {
             for (self.readyPools.items) |pool| {
-                device.resetDescriptorPool(pool, .{});
+                try device.resetDescriptorPool(pool, .{});
             }
 
             for (self.fullPools.items) |pool| {
                 device.destroyDescriptorPool(pool, null);
-                self.readyPools.append(pool);
+                try self.readyPools.append(allocator, pool);
             }
             self.fullPools.clearRetainingCapacity();
         }
@@ -1531,55 +1647,55 @@ const vk_descriptors = struct {
             self.fullPools.clearRetainingCapacity();
         }
 
-        pub fn allocate(self: *DescriptorAllocatorGrowable, device: vk.DeviceProxy, layout_: vk.DescriptorSetLayout, pNext: *anyopaque) vk.DescriptorSet {
+        pub fn allocate(self: *DescriptorAllocatorGrowable, allocator: Allocator, temp_alloc: Allocator, device: vk.DeviceProxy, layout_: vk.DescriptorSetLayout, pNext: ?*anyopaque) !vk.DescriptorSet {
             //get or create a pool to allocate from
-            var poolToUse = self.getPool(device);
+            var poolToUse = try self.getPool(temp_alloc, device);
 
-            const allocInfo: vk.DescriptorSetAllocateInfo = .{
+            var allocInfo: vk.DescriptorSetAllocateInfo = .{
                 .p_next = pNext,
                 .descriptor_pool = poolToUse,
                 .descriptor_set_count = 1,
-                .p_set_layouts = &layout_,
+                .p_set_layouts = (&layout_)[0..1],
             };
 
             var result: vk.DescriptorSet = undefined;
-            device.allocateDescriptorSets(&allocInfo, &result) catch |err| switch (err) {
-                .OutOfPoolMemory, .FragmentedPool => { //allocation failed. Try again
-                    try self.fullPools.append(poolToUse);
+            device.allocateDescriptorSets(&allocInfo, (&result)[0..1]) catch |err| switch (err) {
+                error.OutOfPoolMemory, error.FragmentedPool => { //allocation failed. Try again
+                    try self.fullPools.append(allocator, poolToUse);
 
-                    poolToUse = self.getPool(device);
-                    allocInfo.descriptorPool = poolToUse;
+                    poolToUse = try self.getPool(temp_alloc, device);
+                    allocInfo.descriptor_pool = poolToUse;
 
-                    try device.allocateDescriptorSets(&allocInfo, &result);
+                    try device.allocateDescriptorSets(&allocInfo, (&result)[0..1]);
                 },
-                .OutOfHostMemory, .OutOfDeviceMemory, .Unknown => |e| return e,
+                error.OutOfHostMemory, error.OutOfDeviceMemory, error.Unknown => |e| return e,
             };
 
-            self.readyPools.append(poolToUse);
+            try self.readyPools.append(allocator, poolToUse);
             return result;
         }
 
-        pub fn getPool(self: *DescriptorAllocatorGrowable, device: vk.DeviceProxy) vk.DescriptorPool {
+        pub fn getPool(self: *DescriptorAllocatorGrowable, temp_alloc: Allocator, device: vk.DeviceProxy) !vk.DescriptorPool {
             if (self.readyPools.items.len != 0) {
                 return self.readyPools.pop().?;
             } else {
-                self.setsPerPool = self.setsPerPool * 1.5;
+                self.setsPerPool = @intFromFloat(@as(f64, @floatFromInt(self.setsPerPool)) * 1.5);
                 if (self.setsPerPool > 4092) {
                     self.setsPerPool = 4092;
                 }
 
-                return createPool(device, self.setsPerPool, self.ratios);
+                return try createPool(temp_alloc, device, self.setsPerPool, self.ratios.items);
             }
         }
 
-        pub fn createPool(device: vk.DeviceProxy, setCount: u32, poolRatios: []const PoolSizeRatio) vk.DescriptorPool {
+        pub fn createPool(temp_alloc: Allocator, device: vk.DeviceProxy, setCount: u32, poolRatios: []const PoolSizeRatio) !vk.DescriptorPool {
             var poolSizes: std.ArrayListUnmanaged(vk.DescriptorPoolSize) = .empty;
             for (poolRatios) |ratio| {
-                poolSizes.append(.{ .type = ratio.type, .descriptorCount = ratio.ratio * setCount });
+                try poolSizes.append(temp_alloc, .{ .type = ratio.type, .descriptor_count = @as(u32, @intFromFloat(ratio.ratio)) * setCount });
             }
 
             const pool_info: vk.DescriptorPoolCreateInfo = .{
-                .flags = 0,
+                .flags = .{},
                 .max_sets = setCount,
                 .pool_size_count = @intCast(poolSizes.items.len),
                 .p_pool_sizes = poolSizes.items.ptr,
@@ -1648,7 +1764,7 @@ const vk_descriptors = struct {
         }
 
         pub fn writeBuffer(self: *DescriptorWriter, allocator: Allocator, binding: u32, buffer: vk.Buffer, size: usize, offset: usize, @"type": vk.DescriptorType) !void {
-            const info: *vk.DescriptorBufferInfo = self.bufferInfos.addOne();
+            const info: *vk.DescriptorBufferInfo = try self.bufferInfos.addOne(allocator);
             info.* = .{ .buffer = buffer, .offset = offset, .range = size };
 
             try self.writes.append(allocator, .{
@@ -1656,7 +1772,11 @@ const vk_descriptors = struct {
                 .dst_set = .null_handle, //left empty for now until we need to write it
                 .descriptor_count = 1,
                 .descriptor_type = @"type",
-                .p_buffer_info = info,
+                .p_buffer_info = info[0..1],
+
+                .dst_array_element = 0,
+                .p_image_info = &.{},
+                .p_texel_buffer_view = &.{},
             });
         }
 

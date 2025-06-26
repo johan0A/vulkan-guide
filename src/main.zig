@@ -13,18 +13,18 @@ pub fn main() !void {
     defer engine.deinit(allocator);
 
     var stop_rendering: bool = false;
-    var e: c.SDL_Event = undefined;
-    var bQuit: bool = false;
+    var event: c.SDL_Event = undefined;
+    var quit: bool = false;
 
-    while (!bQuit) {
-        while (c.SDL_PollEvent(&e) != false) {
-            switch (e.type) {
-                c.SDL_EVENT_QUIT => bQuit = true,
+    while (!quit) {
+        while (c.SDL_PollEvent(&event) != false) {
+            switch (event.type) {
+                c.SDL_EVENT_QUIT => quit = true,
                 c.SDL_EVENT_WINDOW_MINIMIZED => stop_rendering = true,
                 c.SDL_EVENT_WINDOW_RESTORED => stop_rendering = false,
                 else => {},
             }
-            _ = c.cImGui_ImplSDL3_ProcessEvent(&e);
+            _ = c.cImGui_ImplSDL3_ProcessEvent(&event);
         }
 
         if (stop_rendering) {
@@ -32,7 +32,7 @@ pub fn main() !void {
             continue;
         }
 
-        try engine.draw();
+        try engine.draw(allocator);
 
         if (engine.resize_requested) {
             try engine.resizeSwapchain(allocator);
