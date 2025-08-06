@@ -13,8 +13,8 @@
             .hash = "vulkan-0.0.0-r7Ytx1JTAwC3R0cfA3SxaWPGJa6p3EUw3OTXTgSPr_hF",
         },
         .VulkanMemoryAllocator = .{
-            .url = "git+https://github.com/johan0A/VulkanMemoryAllocator#be6c5d6ef9b4db59f5690bf586c91c78f5b42085",
-            .hash = "VulkanMemoryAllocator-3.2.1-eK3SgawSAABzHzL3WtsUG1RrWiU1wTS4Jc9s8GWj80WP",
+            .url = "git+https://github.com/johan0A/VulkanMemoryAllocator?ref=0.1.1+3.3.0#a5c048c08bb23604cb9bd369fd38021502d3adc0",
+            .hash = "VulkanMemoryAllocator-0.1.0+3.3.0-eK3SgbISAAAKSZDr14HRKQQ9-y3zWhiu7BT3cmk-yL_7",
         },
         .sdl = .{
             .url = "git+https://github.com/castholm/SDL?ref=v0.2.1+3.2.10#f6bbe8ac5e7b901db69ba62f017596090c362d84",

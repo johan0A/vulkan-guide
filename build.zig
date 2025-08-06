@@ -15,7 +15,7 @@ pub fn build(b: *std.Build) !void {
     const options = .{
         .assets_path = b.option([]const u8, "assets-path", "") orelse "./assets",
         .shaders_path = b.option([]const u8, "shaders-path", "") orelse "./zig-out/shaders",
-        .enable_validation_layers = b.option(bool, "vk-validation-layers", "") orelse true,
+        .enable_validation_layers = if (b.option(bool, "no-validation-layers", "")) |result| !result else true,
     };
 
     {
