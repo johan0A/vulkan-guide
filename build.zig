@@ -70,16 +70,13 @@ pub fn build(b: *std.Build) !void {
         });
         root_module.linkLibrary(vma_dep.artifact("VulkanMemoryAllocator"));
 
-        const vulkan_headers_dep = b.dependency("vulkan_headers", .{
-            .target = target,
-            .optimize = optimize,
-        });
+        const vulkan_headers_dep = b.dependency("vulkan_headers", .{});
 
         const cimgui_dep = b.dependency("dcimgui", .{
             .target = target,
             .optimize = optimize,
             .@"include-path-list" = @as([]const std.Build.LazyPath, &.{
-                vulkan_headers_dep.artifact("vulkan-headers").getEmittedIncludeTree(),
+                vulkan_headers_dep.namedLazyPath("vulkan-headers"),
                 sdl_dep.artifact("SDL3").getEmittedIncludeTree(),
             }),
         });

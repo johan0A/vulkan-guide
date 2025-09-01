@@ -28,7 +28,7 @@ pub fn main() !void {
         }
 
         if (stop_rendering) {
-            std.time.sleep(std.time.ns_per_ms * 100);
+            std.Thread.sleep(std.time.ns_per_ms * 100);
             continue;
         }
 

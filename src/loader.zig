@@ -1,6 +1,6 @@
 const std = @import("std");
-const Gltf = @import("gltf");
-const vk_engine = @import("./vk_engine.zig");
+const Gltf = @import("gltf").Gltf;
+const vk_engine = @import("vk_engine.zig");
 const assert = std.debug.assert;
 
 pub const GeoSurface = struct {
@@ -29,29 +29,29 @@ pub fn loadGltfMeshes(
     var gltf: Gltf = .init(temp);
     defer gltf.deinit();
 
-    try gltf.parse(try file.readToEndAllocOptions(temp, 1e9, null, 4, null));
+    try gltf.parse(try file.readToEndAllocOptions(temp, 1e9, null, .@"4", null));
 
     var meshes: std.ArrayListUnmanaged(MeshAsset) = .empty;
 
     var indices: std.ArrayListUnmanaged(u32) = .empty;
     var vertices: std.ArrayListUnmanaged(vk_engine.Vertex) = .empty;
 
-    for (gltf.data.meshes.items) |mesh| {
+    for (gltf.data.meshes) |mesh| {
         defer indices.clearRetainingCapacity();
         defer vertices.clearRetainingCapacity();
 
         var new_mesh: MeshAsset = .{
-            .name = try arena.dupe(u8, mesh.name),
+            .name = try arena.dupe(u8, mesh.name.?),
             .surfaces = .empty,
             .mesh_buffers = undefined,
         };
 
-        for (mesh.primitives.items) |primitive_| {
+        for (mesh.primitives) |primitive_| {
             const primitive: Gltf.Primitive = @as(Gltf.Primitive, primitive_); // FIXME: this is to fix bug with zls, should report it probably
 
             const new_surface: GeoSurface = .{
                 .start_index = @intCast(indices.items.len),
-                .count = @intCast(gltf.data.accessors.items[primitive.indices.?].count),
+                .count = @intCast(gltf.data.accessors[primitive.indices.?].count),
             };
             try new_mesh.surfaces.append(arena, new_surface);
 
@@ -59,7 +59,7 @@ pub fn loadGltfMeshes(
 
             // load indexes
             {
-                var it = gltf.data.accessors.items[primitive.indices.?].iterator(u16, &gltf, gltf.glb_binary.?);
+                var it = gltf.data.accessors[primitive.indices.?].iterator(u16, &gltf, gltf.glb_binary.?);
                 while (it.next()) |idx| {
                     assert(idx.len == 1);
                     try indices.append(arena, initial_vertex + idx[0]);
@@ -67,10 +67,10 @@ pub fn loadGltfMeshes(
             }
 
             // load attributes
-            for (primitive.attributes.items) |attribute| {
+            for (primitive.attributes) |attribute| {
                 switch (attribute) {
                     .position => |idx| { // TODO: this must be the first to be loaded, should I check for that, should I enforce it by iterating the attributes and finding it? not in example here: https://github.com/kooparse/zgltf
-                        const accessor = gltf.data.accessors.items[idx];
+                        const accessor = gltf.data.accessors[idx];
                         var it = accessor.iterator(f32, &gltf, gltf.glb_binary.?);
                         while (it.next()) |v| {
                             assert(v.len == 3);
@@ -84,7 +84,7 @@ pub fn loadGltfMeshes(
                         }
                     },
                     .normal => |idx| {
-                        const accessor = gltf.data.accessors.items[idx];
+                        const accessor = gltf.data.accessors[idx];
                         var it = accessor.iterator(f32, &gltf, gltf.glb_binary.?);
                         var i: u32 = 0;
                         while (it.next()) |n| : (i += 1) {
@@ -93,7 +93,7 @@ pub fn loadGltfMeshes(
                         }
                     },
                     .texcoord => |idx| {
-                        const accessor = gltf.data.accessors.items[idx];
+                        const accessor = gltf.data.accessors[idx];
                         var it = accessor.iterator(f32, &gltf, gltf.glb_binary.?);
                         var i: u32 = 0;
                         while (it.next()) |tc| : (i += 1) {
@@ -103,7 +103,7 @@ pub fn loadGltfMeshes(
                         }
                     },
                     .color => |idx| {
-                        const accessor = gltf.data.accessors.items[idx];
+                        const accessor = gltf.data.accessors[idx];
                         var it = accessor.iterator(f32, &gltf, gltf.glb_binary.?);
                         var i: u32 = 0;
                         while (it.next()) |c| : (i += 1) {

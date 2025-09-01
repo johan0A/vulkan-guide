@@ -119,7 +119,7 @@ pub const PipelineBuilder = struct {
         // setup dummy color blending. We arent using transparent objects yet
         // the blending is just "no blend", but we do write to the color attachment
         const color_blending: vk.PipelineColorBlendStateCreateInfo = .{
-            .logic_op_enable = vk.FALSE,
+            .logic_op_enable = .false,
             .logic_op = .copy,
             .attachment_count = 1,
             .p_attachments = (&self.color_blend_attachment)[0..1],
@@ -184,7 +184,7 @@ pub const PipelineBuilder = struct {
         self.input_assembly.topology = topology;
         // we are not going to use primitive restart on the entire tutorial so leave
         // it on false
-        self.input_assembly.primitive_restart_enable = vk.FALSE;
+        self.input_assembly.primitive_restart_enable = .false;
     }
 
     pub fn setPolygonMode(self: *PipelineBuilder, mode: vk.PolygonMode) void {
@@ -198,21 +198,21 @@ pub const PipelineBuilder = struct {
     }
 
     pub fn setMultisamplingNone(self: *PipelineBuilder) void {
-        self.multisampling.sample_shading_enable = vk.FALSE;
+        self.multisampling.sample_shading_enable = .false;
         // multisampling defaulted to no multisampling (1 sample per pixel)
         self.multisampling.rasterization_samples = .{ .@"1_bit" = true };
         self.multisampling.min_sample_shading = 1;
         self.multisampling.p_sample_mask = null;
         // no alpha to coverage either
-        self.multisampling.alpha_to_coverage_enable = vk.FALSE;
-        self.multisampling.alpha_to_one_enable = vk.FALSE;
+        self.multisampling.alpha_to_coverage_enable = .false;
+        self.multisampling.alpha_to_one_enable = .false;
     }
 
     pub fn disableBlending(self: *PipelineBuilder) void {
         // default write mask
         self.color_blend_attachment.color_write_mask = .{ .r_bit = true, .g_bit = true, .b_bit = true, .a_bit = true };
         // no blending
-        self.color_blend_attachment.blend_enable = vk.FALSE;
+        self.color_blend_attachment.blend_enable = .false;
     }
 
     pub fn setColorAttachmentFormat(self: *PipelineBuilder, format: vk.Format) void {
@@ -227,11 +227,11 @@ pub const PipelineBuilder = struct {
     }
 
     pub fn disableDepthtest(self: *PipelineBuilder) void {
-        self.depth_stencil.depth_test_enable = vk.FALSE;
-        self.depth_stencil.depth_write_enable = vk.FALSE;
+        self.depth_stencil.depth_test_enable = .false;
+        self.depth_stencil.depth_write_enable = .false;
         self.depth_stencil.depth_compare_op = .never;
-        self.depth_stencil.depth_bounds_test_enable = vk.FALSE;
-        self.depth_stencil.stencil_test_enable = vk.FALSE;
+        self.depth_stencil.depth_bounds_test_enable = .false;
+        self.depth_stencil.stencil_test_enable = .false;
         // self.depthStencil.front = .{};
         // self.depthStencil.back = .{};
         self.depth_stencil.min_depth_bounds = 0;
@@ -239,11 +239,11 @@ pub const PipelineBuilder = struct {
     }
 
     pub fn enableDepthtest(self: *PipelineBuilder, depthWriteEnable: bool, op: vk.CompareOp) void {
-        self.depth_stencil.depth_test_enable = vk.TRUE;
-        self.depth_stencil.depth_write_enable = if (depthWriteEnable) vk.TRUE else vk.FALSE;
+        self.depth_stencil.depth_test_enable = .true;
+        self.depth_stencil.depth_write_enable = if (depthWriteEnable) .true else .false;
         self.depth_stencil.depth_compare_op = op;
-        self.depth_stencil.depth_bounds_test_enable = vk.FALSE;
-        self.depth_stencil.stencil_test_enable = vk.FALSE;
+        self.depth_stencil.depth_bounds_test_enable = .false;
+        self.depth_stencil.stencil_test_enable = .false;
         // self.depth_stencil.front = {};
         // self.depth_stencil.back = {};
         self.depth_stencil.min_depth_bounds = 0;
@@ -254,7 +254,7 @@ pub const PipelineBuilder = struct {
         // TODO: maybe use the same pattern of init all at once for other builder methods?
         self.color_blend_attachment = .{
             .color_write_mask = .{ .r_bit = true, .g_bit = true, .b_bit = true, .a_bit = true },
-            .blend_enable = vk.TRUE,
+            .blend_enable = .true,
             .src_color_blend_factor = .src_alpha,
             .dst_color_blend_factor = .one,
             .color_blend_op = .add,
@@ -267,7 +267,7 @@ pub const PipelineBuilder = struct {
     pub fn enableBlendingAlphablend(self: *PipelineBuilder) void {
         self.color_blend_attachment = .{
             .color_write_mask = .{ .r_bit = true, .g_bit = true, .b_bit = true, .a_bit = true },
-            .blend_enable = vk.TRUE,
+            .blend_enable = .true,
             .src_color_blend_factor = .src_alpha,
             .dst_color_blend_factor = .one_minus_src_alpha,
             .color_blend_op = .add,
@@ -536,7 +536,7 @@ pub const Engine = struct {
 
         const device = self.device_ctx.device;
 
-        _ = try device.waitForFences(1, (&self.currentFrame().render_fence)[0..1], vk.TRUE, 1e9);
+        _ = try device.waitForFences(1, (&self.currentFrame().render_fence)[0..1], .true, 1e9);
 
         self.currentFrame().deletion_queue.flush(.{
             .device = device,
@@ -652,7 +652,7 @@ pub const Engine = struct {
         // submit command buffer to the queue and execute it.
         //  _renderFence will now block until the graphic commands finish execution
         try device.queueSubmit2(graphics_queue, 1, (&submit)[0..1], imm_fence);
-        _ = try device.waitForFences(1, (&imm_fence)[0..1], vk.TRUE, 9999999999);
+        _ = try device.waitForFences(1, (&imm_fence)[0..1], .true, 9999999999);
     }
 
     pub inline fn currentFrame(self: *Engine) *FrameData {
@@ -1480,8 +1480,8 @@ pub const Engine = struct {
         _ = c.vmaMapMemory(vma_allocator, staging.allocation, @ptrCast(&data)); // TODO: handle error?
         defer c.vmaUnmapMemory(vma_allocator, staging.allocation);
 
-        @memcpy(@as([*]Vertex, @alignCast(@ptrCast(data))), vertices); // copy vertex buffer
-        @memcpy(@as([*]u32, @alignCast(@ptrCast(data[vertexBufferSize..]))), indices); // copy index buffer
+        @memcpy(@as([*]Vertex, @ptrCast(@alignCast(data))), vertices); // copy vertex buffer
+        @memcpy(@as([*]u32, @ptrCast(@alignCast(data[vertexBufferSize..]))), indices); // copy index buffer
 
         {
             try immediateModeBegin(device, imm.fence, imm.command_buffer);
@@ -2039,7 +2039,7 @@ const vk_init = struct {
         }
 
         for (queue_families, 0..) |_, i| {
-            if ((try instance_dispatch.getPhysicalDeviceSurfaceSupportKHR(physical_device, @intCast(i), surface) != 0)) {
+            if ((try instance_dispatch.getPhysicalDeviceSurfaceSupportKHR(physical_device, @intCast(i), surface) == .true)) {
                 indices.present_family = @intCast(i);
                 break;
             }
@@ -2095,12 +2095,12 @@ const vk_init = struct {
             });
         }
 
-        var device_features_vk13: vk.PhysicalDeviceVulkan13Features = .{ .dynamic_rendering = vk.TRUE, .synchronization_2 = vk.TRUE };
+        var device_features_vk13: vk.PhysicalDeviceVulkan13Features = .{ .dynamic_rendering = .true, .synchronization_2 = .true };
         return try instance_dispatch.createDevice(physical_device, &.{
             .p_next = (&vk.PhysicalDeviceVulkan12Features{
                 .p_next = (&device_features_vk13)[0..1],
-                .buffer_device_address = vk.TRUE,
-                .descriptor_indexing = vk.TRUE,
+                .buffer_device_address = .true,
+                .descriptor_indexing = .true,
             })[0..1],
             .p_queue_create_infos = queue_create_infos.items.ptr,
             .queue_create_info_count = @intCast(queue_create_infos.items.len),
@@ -2148,7 +2148,7 @@ const vk_init = struct {
             .pre_transform = .{ .identity_bit_khr = true },
             .composite_alpha = .{ .opaque_bit_khr = true },
             .present_mode = .fifo_khr,
-            .clipped = vk.FALSE,
+            .clipped = .false,
             .old_swapchain = .null_handle,
         };
 
@@ -2192,7 +2192,7 @@ const vk_init = struct {
 };
 
 fn loadShader(relative_path: []const u8, allocator: Allocator) !ShaderData {
-    const data = try std.fs.cwd().readFileAllocOptions(allocator, relative_path, 1e6, null, @alignOf(u32), null);
+    const data = try std.fs.cwd().readFileAllocOptions(allocator, relative_path, 1e6, null, .of(u32), null);
     return .{ .ptr = @ptrCast(data.ptr), .size = data.len };
 }
 
