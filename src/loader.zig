@@ -18,8 +18,8 @@ pub const MeshAsset = struct {
 pub fn loadGltfMeshes(
     arena: std.mem.Allocator,
     temp: std.mem.Allocator,
-    device_ctx: vk_engine.VkEngine.DeviceContext,
-    imm: vk_engine.VkEngine.ImmSubmit,
+    device_ctx: vk_engine.Engine.DeviceContext,
+    imm: vk_engine.Engine.ImmSubmit,
     filePath: []const u8,
 ) !std.ArrayListUnmanaged(MeshAsset) {
     std.log.info("Loading GLTF {s}", .{filePath});
@@ -126,7 +126,7 @@ pub fn loadGltfMeshes(
             }
         }
 
-        new_mesh.mesh_buffers = try vk_engine.VkEngine.uploadMesh(device_ctx, imm, indices.items, vertices.items);
+        new_mesh.mesh_buffers = try vk_engine.Engine.uploadMesh(device_ctx, imm, indices.items, vertices.items);
 
         try meshes.append(arena, new_mesh);
     }

@@ -425,7 +425,7 @@ const FrameData = struct {
     frame_descriptors: descriptors.DescriptorAllocatorGrowable,
 };
 
-pub const VkEngine = struct {
+pub const Engine = struct {
     pub const VkContext = struct {
         base_dispatch: vk.BaseWrapper,
         instance: vk.InstanceProxy,
@@ -492,9 +492,9 @@ pub const VkEngine = struct {
 
     test_meshes: std.ArrayListUnmanaged(loader.MeshAsset),
 
-    pub fn draw(self: *VkEngine, allocator: Allocator) !void {
+    pub fn draw(self: *Engine, allocator: Allocator) !void {
         const local = struct {
-            fn drawBackground(engine: *VkEngine, cmd: vk.CommandBuffer) void {
+            fn drawBackground(engine: *Engine, cmd: vk.CommandBuffer) void {
                 // bind the gradient drawing compute pipeline
                 const device = engine.device_ctx.device;
                 device.cmdBindPipeline(cmd, .compute, engine.background_effects[engine.active_background_effect].pipeline);
@@ -510,8 +510,6 @@ pub const VkEngine = struct {
                     0,
                     null,
                 );
-
-                std.debug.print("", .{});
 
                 device.cmdPushConstants(
                     cmd,
@@ -657,11 +655,11 @@ pub const VkEngine = struct {
         _ = try device.waitForFences(1, (&imm_fence)[0..1], vk.TRUE, 9999999999);
     }
 
-    pub inline fn currentFrame(self: *VkEngine) *FrameData {
+    pub inline fn currentFrame(self: *Engine) *FrameData {
         return &self.frames[self.frame_number % FrameData.FRAME_OVERLAP];
     }
 
-    pub fn init(allocator: Allocator) !VkEngine {
+    pub fn init(allocator: Allocator) !Engine {
         const tracy_init_engine = tracy.zoneEx(@src(), .{ .name = "init engine" });
         defer tracy_init_engine.end();
 
@@ -690,28 +688,18 @@ pub const VkEngine = struct {
 
         const instance = try vk_init.createVkInstance(base_dispatch, temp_alloc, options.enable_validation_layers);
         const instance_dispatch = try init_alloc.create(vk.InstanceWrapper);
-        {
-            const tracy_load_instance_dispatch = tracy.zoneEx(@src(), .{ .name = "load instance_dispatch" });
-            instance_dispatch.* = vk.InstanceWrapper.load(instance, base_dispatch.dispatch.vkGetInstanceProcAddr.?);
-            tracy_load_instance_dispatch.end();
-        }
+        instance_dispatch.* = vk.InstanceWrapper.load(instance, base_dispatch.dispatch.vkGetInstanceProcAddr.?);
         const instance_proxy: vk.InstanceProxy = .init(instance, instance_dispatch);
 
-        const tracy_SDL_Vulkan_CreateSurface = tracy.zoneEx(@src(), .{ .name = "SDL_Vulkan_CreateSurface" });
-        var surface: vk.SurfaceKHR = undefined;
-        if (!c.SDL_Vulkan_CreateSurface(window, @ptrFromInt(@intFromEnum(instance)), null, @ptrCast(&surface))) return error.engine_init_failure;
-        tracy_SDL_Vulkan_CreateSurface.end();
+        var sdl_window_surface: vk.SurfaceKHR = undefined;
+        if (!c.SDL_Vulkan_CreateSurface(window, @ptrFromInt(@intFromEnum(instance)), null, @ptrCast(&sdl_window_surface))) return error.engine_init_failure;
 
-        const physical_device = try vk_init.pickPhysicalDevice(instance_proxy, surface, temp_alloc);
-        const queue_family_indices = try vk_init.findQueueFamilies(physical_device, instance_dispatch.*, surface, temp_alloc);
+        const physical_device = try vk_init.pickPhysicalDevice(instance_proxy, sdl_window_surface, temp_alloc);
+        const queue_family_indices = try vk_init.findQueueFamilies(physical_device, instance_dispatch.*, sdl_window_surface, temp_alloc);
 
         const device = try vk_init.createLogicalDevice(physical_device, instance_dispatch.*, queue_family_indices);
         const device_dispatch = try init_alloc.create(vk.DeviceWrapper);
-        {
-            const tracy_load_device_dispatch = tracy.zoneEx(@src(), .{ .name = "load device_dispatch" });
-            device_dispatch.* = vk.DeviceWrapper.load(device, instance_dispatch.dispatch.vkGetDeviceProcAddr.?);
-            tracy_load_device_dispatch.end();
-        }
+        device_dispatch.* = vk.DeviceWrapper.load(device, instance_dispatch.dispatch.vkGetDeviceProcAddr.?);
         const device_proxy: vk.DeviceProxy = .init(device, device_dispatch);
 
         // init_commands() {
@@ -845,10 +833,7 @@ pub const VkEngine = struct {
 
         //add to deletion queues
         try main_deletion_queue.append(allocator, .{ .image_view = draw_allocated_image.image_view });
-        try main_deletion_queue.append(allocator, .{ .vma_allocated_image = .{
-            .image = draw_allocated_image.image,
-            .allocation = draw_allocated_image.allocation,
-        } });
+        try main_deletion_queue.append(allocator, .{ .vma_allocated_image = .{ .image = draw_allocated_image.image, .allocation = draw_allocated_image.allocation } });
 
         const depthImageUsages: vk.ImageUsageFlags = .{ .depth_stencil_attachment_bit = true };
 
@@ -872,10 +857,7 @@ pub const VkEngine = struct {
         };
 
         try main_deletion_queue.append(allocator, .{ .image_view = depth_allocated_image.image_view });
-        try main_deletion_queue.append(allocator, .{ .vma_allocated_image = .{
-            .image = depth_allocated_image.image,
-            .allocation = depth_allocated_image.allocation,
-        } });
+        try main_deletion_queue.append(allocator, .{ .vma_allocated_image = .{ .image = depth_allocated_image.image, .allocation = depth_allocated_image.allocation } });
         //}
 
         //create a descriptor pool that will hold 10 sets with 1 image each
@@ -1007,7 +989,7 @@ pub const VkEngine = struct {
         }
 
         const graphics_queue = device_proxy.getDeviceQueue(queue_family_indices.graphics_family.?, 0);
-        const swapchain = try vk_init.createSwapchain(allocator, temp_alloc, physical_device, device_proxy, surface, window_width, window_height, instance_dispatch.*);
+        const swapchain = try vk_init.createSwapchain(allocator, temp_alloc, physical_device, device_proxy, sdl_window_surface, window_width, window_height, instance_dispatch.*);
 
         {
             // 1: create descriptor pool for IMGUI
@@ -1203,7 +1185,7 @@ pub const VkEngine = struct {
             .vk_ctx = .{
                 .base_dispatch = base_dispatch,
                 .instance = instance_proxy,
-                .surface = surface,
+                .surface = sdl_window_surface,
                 .chosen_gpu = physical_device,
                 .debug_messenger = .null_handle,
             },
@@ -1258,7 +1240,7 @@ pub const VkEngine = struct {
         };
     }
 
-    pub fn resizeSwapchain(self: *VkEngine, alloc: Allocator) !void {
+    pub fn resizeSwapchain(self: *Engine, alloc: Allocator) !void {
         const device = self.device_ctx.device;
         try device.deviceWaitIdle();
 
@@ -1287,7 +1269,7 @@ pub const VkEngine = struct {
         self.resize_requested = false;
     }
 
-    pub fn deinit(self: *VkEngine, allocator: Allocator) void {
+    pub fn deinit(self: *Engine, allocator: Allocator) void {
         const device = self.device_ctx.device;
         device.deviceWaitIdle() catch @panic(""); // TODO
 
@@ -1328,7 +1310,7 @@ pub const VkEngine = struct {
         self.init_arena.deinit();
     }
 
-    fn drawImgui(self: *VkEngine, cmd: vk.CommandBuffer, target_image_view: vk.ImageView) void {
+    fn drawImgui(self: *Engine, cmd: vk.CommandBuffer, target_image_view: vk.ImageView) void {
         const device = self.device_ctx.device;
         const color_attachment = vk_init.attachmentInfo(target_image_view, null, .attachment_optimal);
         const render_info = vk_init.renderingInfo(self.swapchain.extent, &color_attachment, null);
@@ -1360,7 +1342,7 @@ pub const VkEngine = struct {
         device.cmdEndRendering(cmd);
     }
 
-    pub fn drawGeometry(self: *VkEngine, allocator: Allocator, temp_alloc: Allocator, cmd: vk.CommandBuffer) !void {
+    pub fn drawGeometry(self: *Engine, allocator: Allocator, temp_alloc: Allocator, cmd: vk.CommandBuffer) !void {
         //begin a render pass  connected to our draw image
         const color_attachment: vk.RenderingAttachmentInfo = vk_init.attachmentInfo(self.draw_image.image_view, null, .attachment_optimal);
         const depthAttachment: vk.RenderingAttachmentInfo = vk_init.depthAttachmentInfo(self.depth_image.image_view, .depth_attachment_optimal);
@@ -1450,8 +1432,8 @@ pub const VkEngine = struct {
     }
 
     pub fn uploadMesh(
-        device_ctx: VkEngine.DeviceContext,
-        imm: VkEngine.ImmSubmit,
+        device_ctx: Engine.DeviceContext,
+        imm: Engine.ImmSubmit,
         indices: []const u32,
         vertices: []const Vertex,
     ) !GPUMeshBuffers {
@@ -1579,7 +1561,7 @@ const descriptors = struct {
             }
 
             for (self.fullPools.items) |pool| {
-                device.destroyDescriptorPool(pool, null);
+                try device.resetDescriptorPool(pool, .{});
                 try self.readyPools.append(allocator, pool);
             }
             self.fullPools.clearRetainingCapacity();
@@ -1699,7 +1681,7 @@ const descriptors = struct {
 
             try self.writes.append(allocator, .{
                 .dst_binding = binding,
-                .dst_set = .null_handle, //left empty for now until we need to write it
+                .dst_set = .null_handle, // left empty for now until we need to write it
                 .descriptor_count = 1,
                 .descriptor_type = @"type",
                 .p_image_info = info[0..1],
@@ -1716,14 +1698,14 @@ const descriptors = struct {
 
             try self.writes.append(allocator, .{
                 .dst_binding = binding,
-                .dst_set = .null_handle, //left empty for now until we need to write it
+                .dst_set = .null_handle, // left empty for now until we need to write it
                 .descriptor_count = 1,
                 .descriptor_type = @"type",
                 .p_buffer_info = info[0..1],
 
-                .dst_array_element = 0,
-                .p_image_info = &.{},
-                .p_texel_buffer_view = &.{},
+                .dst_array_element = undefined, // TODO undefined correct here?
+                .p_image_info = undefined,
+                .p_texel_buffer_view = undefined,
             });
         }
 
@@ -1768,7 +1750,6 @@ const vk_image = struct {
             .src_queue_family_index = 0,
             .dst_queue_family_index = 0,
         };
-
         device.cmdPipelineBarrier2(cmd, &.{
             .image_memory_barrier_count = 1,
             .p_image_memory_barriers = (&image_barrier)[0..1],
@@ -2076,17 +2057,16 @@ const vk_init = struct {
         defer zone.end();
         const available_extensions = try instance_dispatch.enumerateDeviceExtensionPropertiesAlloc(physical_device, null, temp_alloc);
 
-        outer: for (required_device_extensions) |required_device_extension| {
+        for (required_device_extensions) |required_device_extension| {
             for (available_extensions) |available_extension| {
                 if (std.mem.eql(
                     u8,
                     std.mem.span(@as([*:0]const u8, @ptrCast(&available_extension.extension_name))),
                     required_device_extension,
-                )) {
-                    continue :outer;
-                }
+                )) break;
+            } else {
+                return false;
             }
-            return false;
         }
 
         return true;
@@ -2115,24 +2095,18 @@ const vk_init = struct {
             });
         }
 
-        var device_features_vk13: vk.PhysicalDeviceVulkan13Features = .{
-            .dynamic_rendering = vk.TRUE,
-            .synchronization_2 = vk.TRUE,
-        };
-
-        const create_info = vk.DeviceCreateInfo{
-            .p_next = &[1]vk.PhysicalDeviceVulkan12Features{.{
+        var device_features_vk13: vk.PhysicalDeviceVulkan13Features = .{ .dynamic_rendering = vk.TRUE, .synchronization_2 = vk.TRUE };
+        return try instance_dispatch.createDevice(physical_device, &.{
+            .p_next = (&vk.PhysicalDeviceVulkan12Features{
                 .p_next = (&device_features_vk13)[0..1],
                 .buffer_device_address = vk.TRUE,
                 .descriptor_indexing = vk.TRUE,
-            }},
+            })[0..1],
             .p_queue_create_infos = queue_create_infos.items.ptr,
             .queue_create_info_count = @intCast(queue_create_infos.items.len),
             .pp_enabled_extension_names = @ptrCast(&required_device_extensions),
             .enabled_extension_count = required_device_extensions.len,
-        };
-
-        return try instance_dispatch.createDevice(physical_device, &create_info, null);
+        }, null);
     }
 
     // TODO: review this function, not convinced that this is done best
@@ -2141,65 +2115,33 @@ const vk_init = struct {
         temp_alloc: std.mem.Allocator,
         physical_device: vk.PhysicalDevice,
         device: vk.DeviceProxy,
-        surface: vk.SurfaceKHR,
+        window_surface: vk.SurfaceKHR,
         window_width: u32,
         window_height: u32,
         instance_dispatch: vk.InstanceWrapper,
     ) !SwapChain {
-        const surface_formats = try instance_dispatch.getPhysicalDeviceSurfaceFormatsAllocKHR(physical_device, surface, temp_alloc);
+        const surface_formats = try instance_dispatch.getPhysicalDeviceSurfaceFormatsAllocKHR(physical_device, window_surface, temp_alloc);
 
-        // Try to find preferred format
-        var swapchain_image_format = vk.Format.r8g8b8a8_srgb;
-        var swapchain_image_color_space: vk.ColorSpaceKHR = undefined;
-        var swapchain_image_format_found = false;
-
-        for (surface_formats) |format| {
-            if (swapchain_image_format == format.format) {
-                swapchain_image_format_found = true;
-                swapchain_image_color_space = format.color_space;
-                break;
-            }
-        }
-
-        // Try fallback format if preferred not found
-        if (!swapchain_image_format_found) {
-            swapchain_image_format = .r8g8b8a8_srgb;
-            for (surface_formats) |format| {
-                if (swapchain_image_format == format.format) {
-                    swapchain_image_format_found = true;
-                    swapchain_image_color_space = format.color_space;
-                    break;
-                }
-            }
-
-            if (!swapchain_image_format_found) {
-                std.log.err("Cannot find suitable swapchain image format", .{});
-                return error.SwapchainCreationFailed;
-            }
-        }
-
-        const surface_capabilities = try instance_dispatch.getPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface);
-
-        // Create swapchain
-        const min_image_count = if (surface_capabilities.min_image_count > 3) surface_capabilities.min_image_count else 3;
-
-        const swapchain_extent = vk.Extent2D{
-            .width = window_width,
-            .height = window_height,
+        const swapchain_image_format = blk: {
+            const preferred_format: vk.SurfaceFormatKHR = .{ .format = .b8g8r8a8_srgb, .color_space = .srgb_nonlinear_khr };
+            for (surface_formats) |format| if (std.meta.eql(preferred_format, format)) break :blk preferred_format;
+            for (surface_formats) |format| if (preferred_format.format == format.format) break :blk format;
+            return error.SwapchainCreationFailed;
         };
 
+        const surface_capabilities = try instance_dispatch.getPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, window_surface);
+        const min_image_count = @min(surface_capabilities.min_image_count, 3);
+
+        const swapchain_extent: vk.Extent2D = .{ .width = window_width, .height = window_height };
+
         const swapchain_create_info = vk.SwapchainCreateInfoKHR{
-            .surface = surface,
+            .surface = window_surface,
             .min_image_count = min_image_count,
-            .image_format = swapchain_image_format,
-            .image_color_space = swapchain_image_color_space,
+            .image_format = swapchain_image_format.format,
+            .image_color_space = swapchain_image_format.color_space,
             .image_extent = swapchain_extent,
             .image_array_layers = 1,
-            .image_usage = .{
-                .transfer_src_bit = true,
-                .color_attachment_bit = true,
-                .transfer_dst_bit = true,
-            },
+            .image_usage = .{ .transfer_src_bit = true, .color_attachment_bit = true, .transfer_dst_bit = true },
             .image_sharing_mode = .exclusive,
             .queue_family_index_count = 0,
             .p_queue_family_indices = null,
@@ -2218,44 +2160,30 @@ const vk_init = struct {
 
         // Allocate arrays for images and image views
         var image_views = try alloc.alloc(vk.ImageView, images.len);
+        errdefer for (image_views) |view| if (view != .null_handle) device.destroyImageView(view, null);
         errdefer alloc.free(image_views);
 
         // Create image views for each swapchain image
-        const subresource_range = vk.ImageSubresourceRange{
-            .aspect_mask = .{ .color_bit = true },
-            .base_mip_level = 0,
-            .level_count = 1,
-            .base_array_layer = 0,
-            .layer_count = 1,
-        };
-
         for (images, 0..) |image, i| {
-            const image_view_create_info = vk.ImageViewCreateInfo{
+            image_views[i] = try device.createImageView(&.{
                 .image = image,
                 .view_type = .@"2d",
-                .format = swapchain_image_format,
-                .components = .{
-                    .r = .identity,
-                    .g = .identity,
-                    .b = .identity,
-                    .a = .identity,
+                .format = swapchain_image_format.format,
+                .components = .{ .r = .identity, .g = .identity, .b = .identity, .a = .identity },
+                .subresource_range = .{
+                    .aspect_mask = .{ .color_bit = true },
+                    .base_mip_level = 0,
+                    .level_count = 1,
+                    .base_array_layer = 0,
+                    .layer_count = 1,
                 },
-                .subresource_range = subresource_range,
-            };
-
-            errdefer {
-                for (image_views[0..i]) |view| {
-                    device.destroyImageView(view, null);
-                }
-            }
-
-            image_views[i] = try device.createImageView(&image_view_create_info, null);
+            }, null);
         }
 
         return .{
             .handle = swapchain_handle,
-            .image_format = swapchain_image_format,
-            .image_color_space = swapchain_image_color_space,
+            .image_format = swapchain_image_format.format,
+            .image_color_space = swapchain_image_format.color_space,
             .images = images,
             .image_views = image_views,
             .extent = swapchain_extent,
@@ -2265,7 +2193,7 @@ const vk_init = struct {
 
 fn loadShader(relative_path: []const u8, allocator: Allocator) !ShaderData {
     const data = try std.fs.cwd().readFileAllocOptions(allocator, relative_path, 1e6, null, @alignOf(u32), null);
-    return ShaderData{ .ptr = @ptrCast(data.ptr), .size = data.len };
+    return .{ .ptr = @ptrCast(data.ptr), .size = data.len };
 }
 
 const ComputeEffect = struct {
