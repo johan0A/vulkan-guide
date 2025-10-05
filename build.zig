@@ -72,18 +72,25 @@ pub fn build(b: *std.Build) !void {
 
         const vulkan_headers_dep = b.dependency("vulkan_headers", .{});
 
-        const cimgui_dep = b.dependency("dcimgui", .{
+        const ImguiBackend = @import("dcimgui").Backend;
+        const dcimgui_dep = b.dependency("dcimgui", .{
             .target = target,
             .optimize = optimize,
-            .@"include-path-list" = @as([]const std.Build.LazyPath, &.{
+            .docking = true,
+            .backends = &[_]ImguiBackend{ .imgui_impl_sdl3, .imgui_impl_vulkan },
+            .@"include-path-list" = &[_]std.Build.LazyPath{
                 vulkan_headers_dep.namedLazyPath("vulkan-headers"),
                 sdl_dep.artifact("SDL3").getEmittedIncludeTree(),
-            }),
+            },
+            .imconfig = b.addWriteFiles().add("imconfig.h",
+                \\ #pragma once
+                \\ #define IMGUI_IMPL_VULKAN_NO_PROTOTYPES 
+            ),
         });
-        root_module.linkLibrary(cimgui_dep.artifact("cimgui_clib"));
+        root_module.linkLibrary(dcimgui_dep.artifact("dcimgui"));
 
         const c_translate = b.addTranslateC(.{
-            .root_source_file = b.addWriteFiles().add("c.h",
+            .root_source_file = b.addWriteFiles().add("stub.h",
                 \\#include <SDL3/SDL.h>
                 \\#include <SDL3/SDL_vulkan.h>
                 \\#include <vk_mem_alloc.h>
@@ -96,7 +103,7 @@ pub fn build(b: *std.Build) !void {
         });
         c_translate.addIncludePath(sdl_dep.artifact("SDL3").getEmittedIncludeTree());
         c_translate.addIncludePath(vma_dep.artifact("VulkanMemoryAllocator").getEmittedIncludeTree());
-        c_translate.addIncludePath(cimgui_dep.artifact("cimgui_clib").getEmittedIncludeTree());
+        c_translate.addIncludePath(dcimgui_dep.artifact("dcimgui").getEmittedIncludeTree());
         root_module.addImport("c", c_translate.createModule());
     }
 
@@ -164,7 +171,8 @@ fn shadersModule(
             b.fmt("pub const {s} = \"{s}/{s}.spv\";\n", .{ stem, compiled_shaders_path, stem }),
         ) catch @panic("OOM");
 
-        const slang_path = b.dependency("zig_slang_binaries", .{}).namedLazyPath("binaries");
+        const slang_dep = b.dependency("zig_slang_binaries", .{});
+        const slang_path = slang_dep.namedLazyPath("binaries");
         const slang_exe_path = slang_path.join(b.allocator, "bin/slangc") catch @panic("OOM");
 
         const system_command = b.addSystemCommand(&.{slang_exe_path.getPath2(b, null)});

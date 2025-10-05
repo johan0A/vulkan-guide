@@ -1055,19 +1055,23 @@ pub const Engine = struct {
                 .MinImageCount = 3,
                 .ImageCount = 3,
                 .UseDynamicRendering = true,
-                //dynamic rendering parameters for imgui to use
-                .PipelineRenderingCreateInfo = .{
-                    .sType = c.VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
-                    .colorAttachmentCount = 1,
-                    .pColorAttachmentFormats = @ptrCast(&swapchain.image_format),
+                .PipelineInfoMain = .{
+                    //dynamic rendering parameters for imgui to use
+                    .PipelineRenderingCreateInfo = .{
+                        .sType = c.VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+                        .colorAttachmentCount = 1,
+                        .pColorAttachmentFormats = @ptrCast(&swapchain.image_format),
+                    },
+                    .MSAASamples = c.VK_SAMPLE_COUNT_1_BIT,
                 },
-                .MSAASamples = c.VK_SAMPLE_COUNT_1_BIT,
-                .CustomFragShader = frag_shader.ptr,
-                .CustomFragShaderSize = frag_shader.size,
+                .CustomShaderFragCreateInfo = .{
+                    .sType = c.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                    .pCode = frag_shader.ptr,
+                    .codeSize = frag_shader.size,
+                },
             };
 
             _ = c.cImGui_ImplVulkan_Init(&init_info);
-            _ = c.cImGui_ImplVulkan_CreateFontsTexture();
 
             try main_deletion_queue.append(allocator, .{ .descriptor_pool = imgui_pool });
             try main_deletion_queue.append(allocator, .imgui_impl_vulkan);
@@ -1686,7 +1690,7 @@ const descriptors = struct {
                 .descriptor_type = @"type",
                 .p_image_info = info[0..1],
 
-                .dst_array_element = undefined, // TODO undefined correct here?
+                .dst_array_element = 0,
                 .p_buffer_info = undefined,
                 .p_texel_buffer_view = undefined,
             });
@@ -1703,7 +1707,7 @@ const descriptors = struct {
                 .descriptor_type = @"type",
                 .p_buffer_info = info[0..1],
 
-                .dst_array_element = undefined, // TODO undefined correct here?
+                .dst_array_element = 0,
                 .p_image_info = undefined,
                 .p_texel_buffer_view = undefined,
             });
