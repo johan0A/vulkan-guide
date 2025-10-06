@@ -12,10 +12,21 @@ pub fn build(b: *std.Build) !void {
         .link_libc = true,
     });
 
+    const is_release = b.option(bool, "release", "build a release") orelse false;
+
+    if (is_release) {
+        const install = b.addInstallDirectory(.{
+            .install_subdir = "assets",
+            .install_dir = .{ .custom = "release" },
+            .source_dir = b.path("assets"),
+        });
+        b.getInstallStep().dependOn(&install.step);
+    }
+
     const options = .{
-        .assets_path = b.option([]const u8, "assets-path", "") orelse "./assets",
-        .shaders_path = b.option([]const u8, "shaders-path", "") orelse "./zig-out/shaders",
-        .enable_validation_layers = if (b.option(bool, "no-validation-layers", "")) |result| !result else true,
+        .assets_path = b.option([]const u8, "assets-path", "") orelse "assets",
+        .shaders_path = b.option([]const u8, "shaders-path", "") orelse if (is_release) "shaders" else "zig-out/shaders",
+        .enable_validation_layers = if (b.option(bool, "no-validation-layers", "")) |result| !result else !is_release,
     };
 
     {
@@ -26,8 +37,40 @@ pub fn build(b: *std.Build) !void {
         root_module.addImport("options", options_step.createModule());
     }
 
-    const shader_module = shadersModule(b, b.path("./shaders"), options.shaders_path);
-    root_module.addImport("shaders", shader_module);
+    {
+        var generated_file: std.Io.Writer.Allocating = .init(b.allocator);
+
+        const slang_dep = b.dependency("zig_slang_binaries", .{});
+        const slang_path = slang_dep.namedLazyPath("binaries").path(b, "bin/slangc");
+
+        const shaders_path = b.path("shaders");
+
+        const shaders_dir = try b.build_root.handle.openDir("shaders", .{ .iterate = true });
+        var it = shaders_dir.iterate();
+        while (try it.next()) |entry| {
+            switch (entry.kind) {
+                .file => if (std.mem.endsWith(u8, entry.name, ".slang")) {
+                    const command: *std.Build.Step.Run = .create(b, b.fmt("compile shader {s}", .{entry.name}));
+                    command.addFileArg(slang_path);
+                    command.addFileArg(shaders_path.path(b, entry.name));
+                    command.addArg("-o");
+                    const stem = std.fs.path.stem(entry.name);
+                    const out_path = command.addOutputFileArg(b.fmt("{s}.spv", .{stem}));
+
+                    const install = b.addInstallFile(out_path, b.fmt("{s}/{s}.spv", .{ if (is_release) "release/shaders" else "shaders", stem }));
+                    b.getInstallStep().dependOn(&install.step);
+
+                    try generated_file.writer.print("pub const {s} = \"{s}/{s}.spv\";\n", .{ stem, options.shaders_path, stem });
+                },
+                else => {},
+            }
+        }
+
+        const shaders_paths_mod = b.createModule(.{
+            .root_source_file = b.addWriteFiles().add("shaders.zig", generated_file.written()),
+        });
+        root_module.addImport("shaders", shaders_paths_mod);
+    }
 
     const vulkan_headers_dep = b.dependency("vulkan_headers", .{});
 
@@ -108,14 +151,12 @@ pub fn build(b: *std.Build) !void {
     }
 
     {
-        const exe = b.addExecutable(.{ .name = name orelse "zig-exe-template", .root_module = root_module });
-        exe.subsystem = if (b.option(
-            bool,
-            "no-console",
-            "on Windows: disables console output and opening a console window with the app window",
-        )) |option| (if (option) .Windows else null) else null;
+        const exe = b.addExecutable(.{ .name = name orelse "vulkan-tutorial", .root_module = root_module });
+        exe.subsystem = if (is_release) .Windows else null;
 
-        b.installArtifact(exe);
+        b.getInstallStep().dependOn(&b.addInstallArtifact(exe, .{
+            .dest_dir = if (is_release) .{ .override = .{ .custom = "release" } } else .default,
+        }).step);
         const run_cmd = b.addRunArtifact(exe);
         run_cmd.cwd = b.path("");
         run_cmd.step.dependOn(b.getInstallStep());
@@ -146,45 +187,4 @@ pub fn build(b: *std.Build) !void {
         check.dependOn(&exe_check.step);
         check.dependOn(&tests_check.step);
     }
-}
-
-fn shadersModule(
-    b: *std.Build,
-    path: std.Build.LazyPath,
-    compiled_shaders_path: []const u8,
-) *std.Build.Module {
-    const shaders_dir = std.fs.openDirAbsolute(path.getPath2(b, null), .{ .iterate = true }) catch @panic("failed to open shader directory");
-    var shaders_files_it = shaders_dir.iterate();
-
-    var generated_file: std.ArrayListUnmanaged(u8) = .empty;
-
-    const module = b.createModule(.{});
-
-    while (shaders_files_it.next() catch @panic("failed to iterate on shader file")) |shader_file| {
-        if (shader_file.kind != .file) continue;
-        if (!std.mem.eql(u8, std.fs.path.extension(shader_file.name), ".slang")) continue;
-
-        const stem = std.fs.path.stem(shader_file.name);
-
-        generated_file.appendSlice(
-            b.allocator,
-            b.fmt("pub const {s} = \"{s}/{s}.spv\";\n", .{ stem, compiled_shaders_path, stem }),
-        ) catch @panic("OOM");
-
-        const slang_dep = b.dependency("zig_slang_binaries", .{});
-        const slang_path = slang_dep.namedLazyPath("binaries");
-        const slang_exe_path = slang_path.join(b.allocator, "bin/slangc") catch @panic("OOM");
-
-        const system_command = b.addSystemCommand(&.{slang_exe_path.getPath2(b, null)});
-        system_command.addFileArg(path.join(b.allocator, shader_file.name) catch @panic("OOM"));
-        system_command.addArg("-o");
-        const out_path = system_command.addOutputFileArg(b.fmt("{s}.spv", .{stem}));
-
-        const install = b.addInstallFile(out_path, b.fmt("shaders/{s}.spv", .{stem}));
-        b.getInstallStep().dependOn(&install.step);
-    }
-
-    module.root_source_file = b.addWriteFiles().add("shaders.zig", generated_file.items);
-
-    return module;
 }
