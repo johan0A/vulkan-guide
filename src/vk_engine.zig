@@ -1591,7 +1591,7 @@ const descriptors = struct {
 
                     try device.allocateDescriptorSets(&allocInfo, (&result)[0..1]);
                 },
-                error.OutOfHostMemory, error.OutOfDeviceMemory, error.Unknown => |e| return e,
+                error.OutOfHostMemory, error.OutOfDeviceMemory, error.Unknown, error.ValidationFailed => |e| return e,
             };
 
             try self.readyPools.append(allocator, poolToUse);

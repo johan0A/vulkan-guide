@@ -29,9 +29,11 @@ pub fn build(b: *std.Build) !void {
     const shader_module = shadersModule(b, b.path("./shaders"), options.shaders_path);
     root_module.addImport("shaders", shader_module);
 
+    const vulkan_headers_dep = b.dependency("vulkan_headers", .{});
+
     {
         const vulkan = b.dependency("vulkan", .{
-            .registry = b.path("vendor/vk.xml"),
+            .registry = vulkan_headers_dep.path("registry/vk.xml"),
         });
         root_module.addImport("vulkan", vulkan.module("vulkan-zig"));
 
@@ -70,8 +72,6 @@ pub fn build(b: *std.Build) !void {
         });
         root_module.linkLibrary(vma_dep.artifact("VulkanMemoryAllocator"));
 
-        const vulkan_headers_dep = b.dependency("vulkan_headers", .{});
-
         const ImguiBackend = @import("dcimgui").Backend;
         const dcimgui_dep = b.dependency("dcimgui", .{
             .target = target,
@@ -79,7 +79,7 @@ pub fn build(b: *std.Build) !void {
             .docking = true,
             .backends = &[_]ImguiBackend{ .imgui_impl_sdl3, .imgui_impl_vulkan },
             .@"include-path-list" = &[_]std.Build.LazyPath{
-                vulkan_headers_dep.namedLazyPath("vulkan-headers"),
+                vulkan_headers_dep.path("include"),
                 sdl_dep.artifact("SDL3").getEmittedIncludeTree(),
             },
             .imconfig = b.addWriteFiles().add("imconfig.h",

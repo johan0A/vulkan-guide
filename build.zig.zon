@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.15.1",
     .dependencies = .{
         .vulkan_headers = .{
-            .url = "git+https://github.com/johan0A/vulkan-headers-zig#acab9467e982b249203db493dd5a3089aeb4c767",
-            .hash = "vulkan_headers-0.1.0+1.4.326-IPSI1uADAACG8vYTRpu3hY-wLEy_WGmJ5YwI_v2ajFAp",
+            .url = "git+https://github.com/KhronosGroup/Vulkan-Headers?ref=v1.4.326#d1cd37e925510a167d4abef39340dbdea47d8989",
+            .hash = "N-V-__8AAESg9gHKzlANbo03d4Fcb5m_5aZXJXIhYbWzCe4G",
         },
         .vulkan = .{
             .url = "git+https://github.com/Snektron/vulkan-zig#c9c4dae70356766f0954ae7d2b8aba4d1dd53a2a",
