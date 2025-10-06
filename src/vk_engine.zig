@@ -1,16 +1,3 @@
-const std = @import("std");
-const Allocator = std.mem.Allocator;
-
-const vk = @import("vulkan");
-const c = @import("c");
-const tracy = @import("tracy");
-const shaders = @import("shaders");
-const loader = @import("loader.zig");
-const zla = @import("zla");
-const vec = zla.vec;
-const Mat4 = zla.Mat(f32, 4, 4);
-const options = @import("options");
-
 // TODO: make those not globals?
 const validation_layers = [_][:0]const u8{"VK_LAYER_KHRONOS_validation"};
 const required_device_extensions = [_][:0]const u8{vk.extensions.khr_swapchain.name};
@@ -156,8 +143,8 @@ pub const PipelineBuilder = struct {
 
             .p_dynamic_state = &dynamic_info,
 
-            .subpass = 0, // undefined
-            .base_pipeline_index = 0, // undefined
+            .subpass = 0,
+            .base_pipeline_index = 0,
         };
 
         // TODO: handle error ???
@@ -1961,11 +1948,7 @@ const vk_init = struct {
         const available_extensions = try base_dispatch.enumerateInstanceExtensionPropertiesAlloc(null, temp_alloc);
         for (sdl_required_extensions) |required_ext| {
             for (available_extensions) |available_ext| {
-                if (std.mem.eql(
-                    u8,
-                    std.mem.span(required_ext),
-                    std.mem.span(@as([*:0]const u8, @ptrCast(&available_ext.extension_name))),
-                )) break;
+                if (std.mem.eql(u8, std.mem.span(required_ext), std.mem.sliceTo(&available_ext.extension_name, 0))) break;
             } else {
                 return error.extensionRequiredBySdlIsNotAvailable;
             }
@@ -2013,7 +1996,8 @@ const vk_init = struct {
             const is_suitable = blk: {
                 const formats = try instance.getPhysicalDeviceSurfaceFormatsAllocKHR(physical_device, surface, temp_alloc);
                 const present_modes = try instance.getPhysicalDeviceSurfacePresentModesAllocKHR(physical_device, surface, temp_alloc);
-                break :blk (try findQueueFamilies(physical_device, instance.wrapper.*, surface, temp_alloc)).graphics_family != null and
+                const graphics_family = (try findQueueFamilies(physical_device, instance.wrapper.*, surface, temp_alloc)).graphics_family;
+                break :blk graphics_family != null and
                     try checkDeviceExtensionSupport(physical_device, instance.wrapper.*, temp_alloc) and
                     formats.len > 0 and
                     present_modes.len > 0;
@@ -2043,7 +2027,7 @@ const vk_init = struct {
         }
 
         for (queue_families, 0..) |_, i| {
-            if ((try instance_dispatch.getPhysicalDeviceSurfaceSupportKHR(physical_device, @intCast(i), surface) == .true)) {
+            if (try instance_dispatch.getPhysicalDeviceSurfaceSupportKHR(physical_device, @intCast(i), surface) == .true) {
                 indices.present_family = @intCast(i);
                 break;
             }
@@ -2063,11 +2047,7 @@ const vk_init = struct {
 
         for (required_device_extensions) |required_device_extension| {
             for (available_extensions) |available_extension| {
-                if (std.mem.eql(
-                    u8,
-                    std.mem.span(@as([*:0]const u8, @ptrCast(&available_extension.extension_name))),
-                    required_device_extension,
-                )) break;
+                if (std.mem.eql(u8, std.mem.sliceTo(&available_extension.extension_name, 0), required_device_extension)) break;
             } else {
                 return false;
             }
@@ -2240,3 +2220,16 @@ const ComputeEffect = struct {
         }
     };
 };
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+const vk = @import("vulkan");
+const c = @import("c");
+const tracy = @import("tracy");
+const shaders = @import("shaders");
+const loader = @import("loader.zig");
+const zla = @import("zla");
+const vec = zla.vec;
+const Mat4 = zla.Mat(f32, 4, 4);
+const options = @import("options");

@@ -1,8 +1,3 @@
-const std = @import("std");
-const tracy = @import("tracy");
-const VulkanEngine = @import("vk_engine.zig").Engine;
-const c = @import("c");
-
 pub fn main() !void {
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
     defer _ = debug_allocator.deinit();
@@ -39,3 +34,8 @@ pub fn main() !void {
         }
     }
 }
+
+const std = @import("std");
+const tracy = @import("tracy");
+const VulkanEngine = @import("vk_engine.zig").Engine;
+const c = @import("c");

@@ -1,8 +1,3 @@
-const std = @import("std");
-const Gltf = @import("gltf").Gltf;
-const vk_engine = @import("vk_engine.zig");
-const assert = std.debug.assert;
-
 pub const GeoSurface = struct {
     start_index: u32,
     count: u32,
@@ -28,7 +23,6 @@ pub fn loadGltfMeshes(
 
     var gltf: Gltf = .init(temp);
     defer gltf.deinit();
-
     try gltf.parse(try file.readToEndAllocOptions(temp, 1e9, null, .@"4", null));
 
     var meshes: std.ArrayListUnmanaged(MeshAsset) = .empty;
@@ -40,30 +34,23 @@ pub fn loadGltfMeshes(
         defer indices.clearRetainingCapacity();
         defer vertices.clearRetainingCapacity();
 
-        var new_mesh: MeshAsset = .{
-            .name = try arena.dupe(u8, mesh.name.?),
-            .surfaces = .empty,
-            .mesh_buffers = undefined,
-        };
+        var surfaces: std.ArrayListUnmanaged(GeoSurface) = .empty;
 
-        for (mesh.primitives) |primitive_| {
-            const primitive: Gltf.Primitive = @as(Gltf.Primitive, primitive_); // FIXME: this is to fix bug with zls, should report it probably
+        for (mesh.primitives) |primitive| {
+            const vertex_indices = gltf.data.accessors[primitive.indices.?];
 
             const new_surface: GeoSurface = .{
                 .start_index = @intCast(indices.items.len),
-                .count = @intCast(gltf.data.accessors[primitive.indices.?].count),
+                .count = @intCast(vertex_indices.count),
             };
-            try new_mesh.surfaces.append(arena, new_surface);
+            try surfaces.append(arena, new_surface);
 
             const initial_vertex: u32 = @intCast(vertices.items.len);
 
-            // load indexes
-            {
-                var it = gltf.data.accessors[primitive.indices.?].iterator(u16, &gltf, gltf.glb_binary.?);
-                while (it.next()) |idx| {
-                    assert(idx.len == 1);
-                    try indices.append(arena, initial_vertex + idx[0]);
-                }
+            var vert_idx_it = vertex_indices.iterator(u16, &gltf, gltf.glb_binary.?);
+            while (vert_idx_it.next()) |idx| {
+                assert(idx.len == 1);
+                try indices.append(arena, initial_vertex + idx[0]);
             }
 
             // load attributes
@@ -112,24 +99,28 @@ pub fn loadGltfMeshes(
                         }
                     },
                     else => {
-                        std.log.info("attribute not handled when loading mesh from gltf file: {s}", .{@tagName(attribute)});
+                        std.log.warn("attribute not handled when loading mesh from gltf file: {s}", .{@tagName(attribute)});
                     },
                 }
             }
         }
 
-        // display the vertex normals
+        // display the vertex normals TODO: remove
         const OverrideColors = true;
-        if (OverrideColors) {
-            for (vertices.items) |*vtx| {
-                vtx.color = .{ vtx.normal[0], vtx.normal[1], vtx.normal[2], 1 };
-            }
-        }
+        if (OverrideColors) for (vertices.items) |*vtx| {
+            vtx.color = .{ vtx.normal[0], vtx.normal[1], vtx.normal[2], 1 };
+        };
 
-        new_mesh.mesh_buffers = try vk_engine.Engine.uploadMesh(device_ctx, imm, indices.items, vertices.items);
-
-        try meshes.append(arena, new_mesh);
+        try meshes.append(arena, .{
+            .name = try arena.dupe(u8, mesh.name.?),
+            .surfaces = surfaces,
+            .mesh_buffers = try vk_engine.Engine.uploadMesh(device_ctx, imm, indices.items, vertices.items),
+        });
     }
-
     return meshes;
 }
+
+const std = @import("std");
+const Gltf = @import("gltf").Gltf;
+const vk_engine = @import("vk_engine.zig");
+const assert = std.debug.assert;
