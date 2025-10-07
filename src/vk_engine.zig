@@ -65,7 +65,7 @@ pub const GPUMeshBuffers = struct {
 };
 
 // push constants for our mesh object draws
-pub const GPUDrawPushConstants = struct {
+pub const GPUDrawPushConstants = extern struct {
     worldMatrix: Mat4,
     vertexBuffer: vk.DeviceAddress,
 };
@@ -179,9 +179,9 @@ pub const PipelineBuilder = struct {
         self.rasterizer.line_width = 1;
     }
 
-    pub fn setCullMode(self: *PipelineBuilder, cullMode: vk.CullModeFlags, frontFace: vk.FrontFace) void {
-        self.rasterizer.cull_mode = cullMode;
-        self.rasterizer.front_face = frontFace;
+    pub fn setCullMode(self: *PipelineBuilder, cull_mode: vk.CullModeFlags, front_face: vk.FrontFace) void {
+        self.rasterizer.cull_mode = cull_mode;
+        self.rasterizer.front_face = front_face;
     }
 
     pub fn setMultisamplingNone(self: *PipelineBuilder) void {
@@ -225,9 +225,9 @@ pub const PipelineBuilder = struct {
         self.depth_stencil.max_depth_bounds = 1;
     }
 
-    pub fn enableDepthtest(self: *PipelineBuilder, depthWriteEnable: bool, op: vk.CompareOp) void {
+    pub fn enableDepthtest(self: *PipelineBuilder, depth_write_enable: bool, op: vk.CompareOp) void {
         self.depth_stencil.depth_test_enable = .true;
-        self.depth_stencil.depth_write_enable = if (depthWriteEnable) .true else .false;
+        self.depth_stencil.depth_write_enable = if (depth_write_enable) .true else .false;
         self.depth_stencil.depth_compare_op = op;
         self.depth_stencil.depth_bounds_test_enable = .false;
         self.depth_stencil.stencil_test_enable = .false;
@@ -309,14 +309,10 @@ const DeletionQueue = struct {
 
     queue: std.ArrayListUnmanaged(QueueItem),
 
-    pub const init: DeletionQueue = .{
-        .queue = .empty,
-    };
+    pub const init: DeletionQueue = .{ .queue = .empty };
 
     pub fn flush(self: *DeletionQueue, context: DeinitContext) void {
-        for (0..self.queue.items.len) |i| {
-            self.queue.items[self.queue.items.len - i - 1].deinit(context);
-        }
+        for (0..self.queue.items.len) |i| self.queue.items[self.queue.items.len - i - 1].deinit(context);
         self.queue.clearRetainingCapacity();
     }
 
@@ -341,7 +337,7 @@ const DescriptorAllocator = struct {
     pub fn initPool(temp: Allocator, device: vk.DeviceProxy, max_sets: u32, pool_ratios: []const PoolSizeRatio) !DescriptorAllocator {
         const pool_sizes = try temp.alloc(vk.DescriptorPoolSize, pool_ratios.len);
         for (pool_sizes, pool_ratios) |*size, ratio| {
-            size.* = vk.DescriptorPoolSize{
+            size.* = .{
                 .type = ratio.type,
                 .descriptor_count = @intFromFloat(ratio.ratio * @as(f32, @floatFromInt(max_sets))),
             };
@@ -352,10 +348,7 @@ const DescriptorAllocator = struct {
             .pool_size_count = @intCast(pool_sizes.len),
             .p_pool_sizes = pool_sizes.ptr,
         };
-
-        return .{
-            .pool = try device.createDescriptorPool(&pool_info, null),
-        };
+        return .{ .pool = try device.createDescriptorPool(&pool_info, null) };
     }
 
     pub fn clearDescriptors(self: DescriptorAllocator, device: vk.DeviceProxy) void {
@@ -417,9 +410,9 @@ pub const Engine = struct {
         base_dispatch: vk.BaseWrapper,
         instance: vk.InstanceProxy,
 
-        chosen_gpu: vk.PhysicalDevice, // GPU chosen as the default device
-        surface: vk.SurfaceKHR, // Vulkan window surface
-        debug_messenger: vk.DebugUtilsMessengerEXT, // Vulkan debug output handle
+        chosen_gpu: vk.PhysicalDevice,
+        window_surface: vk.SurfaceKHR,
+        debug_messenger: vk.DebugUtilsMessengerEXT,
     };
 
     pub const DeviceContext = struct {
@@ -429,7 +422,6 @@ pub const Engine = struct {
         vma_allocator: c.VmaAllocator,
     };
 
-    // immediate submit structures
     pub const ImmSubmit = struct {
         fence: vk.Fence,
         command_buffer: vk.CommandBuffer,
@@ -452,10 +444,10 @@ pub const Engine = struct {
     main_deletion_queue: DeletionQueue,
 
     //draw resources
-    draw_image: AllocatedImage,
     depth_image: AllocatedImage,
     draw_extent: vk.Extent2D,
 
+    draw_image: AllocatedImage,
     draw_image_descriptors: vk.DescriptorSet,
     draw_image_descriptor_set_layout: vk.DescriptorSetLayout,
 
@@ -1072,7 +1064,7 @@ pub const Engine = struct {
 
         //build the pipeline layout that controls the inputs/outputs of the shader
         //we are not using descriptor sets or other systems yet, so no need to use anything other than empty default
-        const triangle_pipeline_layout = try device_proxy.createPipelineLayout(&vk_init.pipelineLayoutCreateInfo(), null);
+        const triangle_pipeline_layout = try device_proxy.createPipelineLayout(&.{}, null);
 
         const triangle_pipeline = blk: {
             var pipelineBuilder: PipelineBuilder = .{};
@@ -1105,7 +1097,7 @@ pub const Engine = struct {
             .stage_flags = .{ .vertex_bit = true },
         };
 
-        var mesh_pipeline_layout_info: vk.PipelineLayoutCreateInfo = vk_init.pipelineLayoutCreateInfo();
+        var mesh_pipeline_layout_info: vk.PipelineLayoutCreateInfo = .{};
         mesh_pipeline_layout_info.p_push_constant_ranges = (&bufferRange)[0..1];
         mesh_pipeline_layout_info.push_constant_range_count = 1;
 
@@ -1146,10 +1138,10 @@ pub const Engine = struct {
 
         // init_default_data {
         const rect_vertices: [4]Vertex = .{
-            .{ .position = .{ 0.5, -0.5, 0 }, .color = .{ 0, 0, 0, 1 }, .uv_x = 0, .uv_y = 0, .normal = @splat(0) },
-            .{ .position = .{ 0.5, 0.5, 0 }, .color = .{ 0.5, 0.5, 0.5, 1 }, .uv_x = 0, .uv_y = 0, .normal = @splat(0) },
-            .{ .position = .{ -0.5, -0.5, 0 }, .color = .{ 1, 0, 0, 1 }, .uv_x = 0, .uv_y = 0, .normal = @splat(0) },
-            .{ .position = .{ -0.5, 0.5, 0 }, .color = .{ 0, 1, 0, 1 }, .uv_x = 0, .uv_y = 0, .normal = @splat(0) },
+            .{ .position = .{ 0.5, -0.5, 0.5 }, .color = .{ 0, 0, 0, 1 }, .uv_x = 0, .uv_y = 0, .normal = @splat(0) },
+            .{ .position = .{ 0.5, 0.5, 0.5 }, .color = .{ 0.5, 0.5, 0.5, 1 }, .uv_x = 0, .uv_y = 0, .normal = @splat(0) },
+            .{ .position = .{ -0.5, -0.5, 0.5 }, .color = .{ 1, 0, 0, 1 }, .uv_x = 0, .uv_y = 0, .normal = @splat(0) },
+            .{ .position = .{ -0.5, 0.5, 0.5 }, .color = .{ 0, 1, 0, 1 }, .uv_x = 0, .uv_y = 0, .normal = @splat(0) },
         };
         const rect_indices: [6]u32 = .{ 0, 1, 2, 2, 1, 3 };
         const device_ctx: DeviceContext = .{
@@ -1176,7 +1168,7 @@ pub const Engine = struct {
             .vk_ctx = .{
                 .base_dispatch = base_dispatch,
                 .instance = instance_proxy,
-                .surface = sdl_window_surface,
+                .window_surface = sdl_window_surface,
                 .chosen_gpu = physical_device,
                 .debug_messenger = .null_handle,
             },
@@ -1251,7 +1243,7 @@ pub const Engine = struct {
             temp_arena.allocator(),
             self.vk_ctx.chosen_gpu,
             device,
-            self.vk_ctx.surface,
+            self.vk_ctx.window_surface,
             self.swapchain.extent.width,
             self.swapchain.extent.height,
             self.vk_ctx.instance.wrapper.*,
@@ -1292,7 +1284,7 @@ pub const Engine = struct {
         self.swapchain.deinit(allocator, device);
 
         device.destroyDevice(null);
-        self.vk_ctx.instance.destroySurfaceKHR(self.vk_ctx.surface, null);
+        self.vk_ctx.instance.destroySurfaceKHR(self.vk_ctx.window_surface, null);
         self.vk_ctx.instance.destroyInstance(null);
 
         c.SDL_DestroyWindow(self.window);
@@ -1384,7 +1376,8 @@ pub const Engine = struct {
             // invert the Y direction on projection matrix so that we are more similar
             // to opengl and gltf axis
             projection.items[1][1] *= -1;
-            push_constants.worldMatrix = projection.mul(view);
+            const rot = Mat4.rotate(.identity, 30 * (std.math.pi / 180.0), .{ 1, 1, 0 });
+            push_constants.worldMatrix = projection.mul(view).mul(rot);
             push_constants.vertexBuffer = self.test_meshes.items[2].mesh_buffers.vertexBufferAddress;
 
             device.cmdPushConstants(cmd, self.mesh_pipeline_layout, .{ .vertex_bit = true }, 0, @sizeOf(GPUDrawPushConstants), &push_constants);
@@ -1791,22 +1784,8 @@ const vk_image = struct {
 };
 
 const vk_init = struct {
-    pub fn pipelineLayoutCreateInfo() vk.PipelineLayoutCreateInfo {
-        return .{ //empty defaults
-            .flags = .{},
-            .set_layout_count = 0,
-            .p_set_layouts = null,
-            .push_constant_range_count = 0,
-            .p_push_constant_ranges = null,
-        };
-    }
-
     pub fn pipelineShaderStageCreateInfo(stage: vk.ShaderStageFlags, shader_module: vk.ShaderModule) vk.PipelineShaderStageCreateInfo {
-        return .{
-            .stage = stage,
-            .module = shader_module,
-            .p_name = "main",
-        };
+        return .{ .stage = stage, .module = shader_module, .p_name = "main" };
     }
 
     fn renderingInfo(render_extent: vk.Extent2D, color_attachment: *const vk.RenderingAttachmentInfo, depth_attachment: ?*const vk.RenderingAttachmentInfo) vk.RenderingInfo {
