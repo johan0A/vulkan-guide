@@ -20,7 +20,7 @@ struct Constants {
 [shader("vertex")]
 VSOutput main(
     uniform Constants PushConstants,
-    uint vertexID: SV_VertexID
+    uint vertexID: SV_VulkanVertexID
 ) {
     Vertex v = PushConstants.vertices[vertexID];
 

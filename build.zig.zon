@@ -25,8 +25,8 @@
             .hash = "tracy-0.11.1-bsH_anHeFgA_A2ponF7NaLtN9Nn7NqVpOqXTPLjjToce",
         },
         .zig_slang_binaries = .{
-            .url = "git+https://github.com/johan0A/zig-slang-binaries#9b776e868ca613e3c5b5762619f99a31a37e6d97",
-            .hash = "zig_slang_binaries-0.1.0+2025.6.3-nZ4kSOEKAAA41Wh130owX9LYMJfF_0FPNJMokU4EXE7v",
+            .url = "git+https://github.com/johan0A/zig-slang-binaries#3b96c085a47f4daa87cf4f83e9bacfa5f14ab519",
+            .hash = "zig_slang_binaries-0.1.0+2025.6.3-nZ4kSNgKAACJee-ysSqUoUfX-rjzB_CRGpsmamwoSjWH",
         },
         .dcimgui = .{
             .url = "git+https://github.com/johan0A/zig-dcimgui#8c76d03bf09c13b15cc819b5bf3446309113d905",

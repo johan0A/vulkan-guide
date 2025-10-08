@@ -1,6 +1,6 @@
 // TODO: make those not globals?
 const validation_layers = [_][:0]const u8{"VK_LAYER_KHRONOS_validation"};
-const required_device_extensions = [_][:0]const u8{vk.extensions.khr_swapchain.name};
+const required_device_extensions = [_][*:0]const u8{vk.extensions.khr_swapchain.name};
 
 const ShaderData = struct {
     ptr: [*]const u32,
@@ -918,8 +918,6 @@ pub const Engine = struct {
         const background_effects = try init_alloc.alloc(ComputeEffect, effect_infos.len);
 
         for (effect_infos, background_effects) |effect_info, *background_effect| {
-            const shader_data = try loadShader(effect_info.path, temp_alloc);
-
             const pushConstant: vk.PushConstantRange = .{
                 .offset = 0,
                 .size = @intCast(effect_info.default_data.size()),
@@ -935,6 +933,7 @@ pub const Engine = struct {
 
             const gradient_pipeline_layout = try device_proxy.createPipelineLayout(&computeLayout, null);
 
+            const shader_data = try loadShader(effect_info.path, temp_alloc);
             const computeDrawShader: vk.ShaderModule = try vk_init.loadShaderModule(shader_data, device_proxy);
             defer device_proxy.destroyShaderModule(computeDrawShader, null);
 
@@ -1072,10 +1071,10 @@ pub const Engine = struct {
             try pipelineBuilder.setShaders(triangleVertexShader, triangleFragShader, temp_alloc);
             pipelineBuilder.setInputTopology(.triangle_list);
             pipelineBuilder.setPolygonMode(.fill);
-            pipelineBuilder.setCullMode(.{}, .clockwise);
+            pipelineBuilder.setCullMode(.{ .back_bit = true }, .counter_clockwise);
             pipelineBuilder.setMultisamplingNone();
             pipelineBuilder.disableBlending();
-            pipelineBuilder.enableDepthtest(true, .greater_or_equal);
+            pipelineBuilder.enableDepthtest(true, .less_or_equal);
             pipelineBuilder.setColorAttachmentFormat(draw_allocated_image.image_format);
             pipelineBuilder.setDepthFormat(depth_allocated_image.image_format);
             break :blk try pipelineBuilder.buildPipeline(device_proxy);
@@ -1118,14 +1117,14 @@ pub const Engine = struct {
             //filled triangles
             pipelineBuilder.setPolygonMode(.fill);
             //no backface culling
-            pipelineBuilder.setCullMode(.{}, .clockwise);
+            pipelineBuilder.setCullMode(.{ .back_bit = true }, .counter_clockwise);
             //no multisampling
             pipelineBuilder.setMultisamplingNone();
             //no blending
             pipelineBuilder.disableBlending();
             //no depth testing
             // pipelineBuilder.disableDepthtest();
-            pipelineBuilder.enableDepthtest(true, .greater_or_equal);
+            pipelineBuilder.enableDepthtest(true, .less_or_equal);
 
             //connect the image format we will draw into, from draw image
             pipelineBuilder.setColorAttachmentFormat(draw_allocated_image.image_format);
@@ -1355,29 +1354,32 @@ pub const Engine = struct {
         device.cmdSetScissor(cmd, 0, 1, (&scissor)[0..1]);
 
         //launch a draw command to draw 3 vertices
-        device.cmdDraw(cmd, 3, 1, 0, 0);
+        // device.cmdDraw(cmd, 3, 1, 0, 0);
 
         {
             device.cmdBindPipeline(cmd, .graphics, self.mesh_pipeline);
 
             var push_constants: GPUDrawPushConstants = .{
-                .worldMatrix = .identity,
+                .worldMatrix = .translate(.identity, .{ 0, 0, -1.5 }),
                 .vertexBuffer = self.rectangle.vertexBufferAddress,
             };
 
-            // device.cmdPushConstants(cmd, self.mesh_pipeline_layout, .{ .vertex_bit = true }, 0, @sizeOf(GPUDrawPushConstants), &push_constants);
-            // device.cmdBindIndexBuffer(cmd, self.rectangle.indexBuffer.buffer, 0, .uint32);
+            device.cmdPushConstants(cmd, self.mesh_pipeline_layout, .{ .vertex_bit = true }, 0, @sizeOf(GPUDrawPushConstants), &push_constants);
+            device.cmdBindIndexBuffer(cmd, self.rectangle.indexBuffer.buffer, 0, .uint32);
 
-            // device.cmdDrawIndexed(cmd, 6, 1, 0, 0, 0);
+            device.cmdDrawIndexed(cmd, 6, 1, 0, 0, 0);
 
             // draw monkey
             const view = Mat4.identity.translate(.{ 0, 0, -5 });
-            var projection: Mat4 = .perspective(70, @as(f32, @floatFromInt(self.draw_extent.width)) / @as(f32, @floatFromInt(self.draw_extent.height)), 10000, 0.1);
+
+            var projection: Mat4 = .perspective(1.22, @as(f32, @floatFromInt(self.draw_extent.width)) / @as(f32, @floatFromInt(self.draw_extent.height)), 0.1, 1000);
             // invert the Y direction on projection matrix so that we are more similar
             // to opengl and gltf axis
             projection.items[1][1] *= -1;
-            const rot = Mat4.rotate(.identity, 30 * (std.math.pi / 180.0), .{ 1, 1, 0 });
-            push_constants.worldMatrix = projection.mul(view).mul(rot);
+
+            // const model: Mat4 = .rotate(.identity, std.math.pi / 3.0, .{ 0, 1, 0 });
+            const model: Mat4 = .identity;
+            push_constants.worldMatrix = projection.mul(view).mul(model);
             push_constants.vertexBuffer = self.test_meshes.items[2].mesh_buffers.vertexBufferAddress;
 
             device.cmdPushConstants(cmd, self.mesh_pipeline_layout, .{ .vertex_bit = true }, 0, @sizeOf(GPUDrawPushConstants), &push_constants);
@@ -1394,17 +1396,12 @@ pub const Engine = struct {
             try self.currentFrame().deletion_queue.append(allocator, .{ .allocated_buffer = gpuSceneDataBuffer });
 
             // //write the buffer
-            // GPUSceneData* sceneUniformData = (GPUSceneData*)gpuSceneDataBuffer.allocation->GetMappedData();
-            // *sceneUniformData = sceneData;
-
             var data: *GPUSceneData = undefined;
             _ = c.vmaMapMemory(self.device_ctx.vma_allocator, gpuSceneDataBuffer.allocation, @ptrCast(&data)); // TODO: handle error?
             defer c.vmaUnmapMemory(self.device_ctx.vma_allocator, gpuSceneDataBuffer.allocation);
             data.* = self.scene_data;
 
             // //create a descriptor set that binds that buffer and update it
-            // VkDescriptorSet globalDescriptor = get_current_frame()._frameDescriptors.allocate(_device, _gpuSceneDataDescriptorLayout);
-
             const globalDescriptor: vk.DescriptorSet = try self.currentFrame().frame_descriptors.allocate(allocator, temp_alloc, device, self.gpu_scene_data_descriptor_layout, null);
 
             var writer: descriptors.DescriptorWriter = .{};
@@ -1823,7 +1820,7 @@ const vk_init = struct {
             .image_layout = layout orelse .color_attachment_optimal,
             .load_op = .clear,
             .store_op = .store,
-            .clear_value = .{ .depth_stencil = .{ .depth = 0, .stencil = 0 } },
+            .clear_value = .{ .depth_stencil = .{ .depth = 1, .stencil = 0 } },
             .resolve_mode = .{},
             .resolve_image_layout = .undefined,
         };
@@ -1938,7 +1935,7 @@ const vk_init = struct {
         const create_info = vk.InstanceCreateInfo{
             .p_application_info = &appinfo,
             .enabled_extension_count = @intCast(sdl_required_extensions.len),
-            .pp_enabled_extension_names = @ptrCast(sdl_required_extensions.ptr),
+            .pp_enabled_extension_names = @ptrCast(sdl_required_extensions),
             .pp_enabled_layer_names = if (enable_validation_layers) @ptrCast(&validation_layers) else null,
             .enabled_layer_count = if (enable_validation_layers) @intCast(validation_layers.len) else 0,
         };
@@ -2026,7 +2023,11 @@ const vk_init = struct {
 
         for (required_device_extensions) |required_device_extension| {
             for (available_extensions) |available_extension| {
-                if (std.mem.eql(u8, std.mem.sliceTo(&available_extension.extension_name, 0), required_device_extension)) break;
+                if (std.mem.eql(
+                    u8,
+                    std.mem.sliceTo(&available_extension.extension_name, 0),
+                    std.mem.sliceTo(required_device_extension, 0),
+                )) break;
             } else {
                 return false;
             }
@@ -2067,7 +2068,7 @@ const vk_init = struct {
             })[0..1],
             .p_queue_create_infos = queue_create_infos.items.ptr,
             .queue_create_info_count = @intCast(queue_create_infos.items.len),
-            .pp_enabled_extension_names = @ptrCast(&required_device_extensions),
+            .pp_enabled_extension_names = &required_device_extensions,
             .enabled_extension_count = required_device_extensions.len,
         }, null);
     }
@@ -2154,8 +2155,9 @@ const vk_init = struct {
     }
 };
 
-fn loadShader(relative_path: []const u8, allocator: Allocator) !ShaderData {
-    const data = try std.fs.cwd().readFileAllocOptions(allocator, relative_path, 1e6, null, .of(u32), null);
+fn loadShader(file_path: []const u8, allocator: Allocator) !ShaderData {
+    std.log.info("loading {s} shader", .{std.fs.path.basename(file_path)});
+    const data = try std.fs.cwd().readFileAllocOptions(allocator, file_path, 1e6, null, .of(u32), null);
     return .{ .ptr = @ptrCast(data.ptr), .size = data.len };
 }
 

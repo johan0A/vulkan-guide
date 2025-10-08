@@ -3,16 +3,13 @@ const std = @import("std");
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const name = b.option([]const u8, "name", "set the name of the emitted binary");
-
-    const root_module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-
     const is_release = b.option(bool, "release", "build a release") orelse false;
+
+    const options = .{
+        .assets_path = b.option([]const u8, "assets-path", "") orelse "assets",
+        .shaders_path = b.option([]const u8, "shaders-path", "") orelse if (is_release) "shaders" else "zig-out/shaders",
+        .enable_validation_layers = if (b.option(bool, "no-validation-layers", "")) |result| !result else !is_release,
+    };
 
     if (is_release) {
         const install = b.addInstallDirectory(.{
@@ -23,11 +20,12 @@ pub fn build(b: *std.Build) !void {
         b.getInstallStep().dependOn(&install.step);
     }
 
-    const options = .{
-        .assets_path = b.option([]const u8, "assets-path", "") orelse "assets",
-        .shaders_path = b.option([]const u8, "shaders-path", "") orelse if (is_release) "shaders" else "zig-out/shaders",
-        .enable_validation_layers = if (b.option(bool, "no-validation-layers", "")) |result| !result else !is_release,
-    };
+    const root_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
 
     {
         var options_step = b.addOptions();
@@ -151,7 +149,7 @@ pub fn build(b: *std.Build) !void {
     }
 
     {
-        const exe = b.addExecutable(.{ .name = name orelse "vulkan-tutorial", .root_module = root_module });
+        const exe = b.addExecutable(.{ .name = "vulkan-tutorial", .root_module = root_module });
         exe.subsystem = if (is_release) .Windows else null;
 
         b.getInstallStep().dependOn(&b.addInstallArtifact(exe, .{
@@ -168,7 +166,7 @@ pub fn build(b: *std.Build) !void {
     }
 
     {
-        const tests = b.addTest(.{ .name = name orelse "test", .root_module = root_module });
+        const tests = b.addTest(.{ .name = "test", .root_module = root_module });
 
         const run_tests = b.addRunArtifact(tests);
         const test_step = b.step("test", "Run unit tests");

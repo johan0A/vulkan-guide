@@ -5,7 +5,7 @@ struct VSOutput {
 
 [shader("vertex")]
 VSOutput main(
-    uint vertexID: SV_VertexID,
+    uint vertexID: SV_VulkanVertexID,
 ) {
     float scale = 0.3;
     var offset = float3(0.0, -0.05, 0.0);
