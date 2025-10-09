@@ -8,13 +8,14 @@ const ShaderData = struct {
     size: usize,
 };
 
-const AllocatedBuffer = struct {
+pub const VmaGpuBuffer = struct {
     buffer: vk.Buffer,
+    size: usize,
     allocation: c.VmaAllocation,
     info: c.VmaAllocationInfo,
 
-    pub fn create(allocator: c.VmaAllocator, size: usize, usage: vk.BufferUsageFlags, memory_usage: c.VmaMemoryUsage) !AllocatedBuffer {
-        const bufferInfo: vk.BufferCreateInfo = .{
+    pub fn create(allocator: c.VmaAllocator, size: usize, usage: vk.BufferUsageFlags, memory_usage: c.VmaMemoryUsage) !VmaGpuBuffer {
+        const buffer_info: vk.BufferCreateInfo = .{
             .usage = usage,
             .size = size,
 
@@ -26,17 +27,49 @@ const AllocatedBuffer = struct {
             .flags = c.VMA_ALLOCATION_CREATE_MAPPED_BIT,
         };
 
-        var newBuffer: AllocatedBuffer = undefined;
-        const result: vk.Result = @enumFromInt(c.vmaCreateBuffer(allocator, @ptrCast(&bufferInfo), &vma_alloc_info, @ptrCast(&newBuffer.buffer), &newBuffer.allocation, &newBuffer.info));
+        var new_buffer: VmaGpuBuffer = undefined;
+        new_buffer.size = size;
+        const result: vk.Result = @enumFromInt(c.vmaCreateBuffer(allocator, @ptrCast(&buffer_info), &vma_alloc_info, @ptrCast(&new_buffer.buffer), &new_buffer.allocation, &new_buffer.info));
         if (result != .success) {
             std.log.err("vma allocation: error {s}\n", .{@tagName(result)});
             return error.vma_allocation_failed;
         }
-        return newBuffer;
+        return new_buffer;
     }
 
-    pub fn destroy(buffer: AllocatedBuffer, allocator: c.VmaAllocator) void {
+    pub fn destroy(buffer: VmaGpuBuffer, allocator: c.VmaAllocator) void {
         c.vmaDestroyBuffer(allocator, @ptrFromInt(@intFromEnum(buffer.buffer)), buffer.allocation);
+    }
+
+    pub const MapConfig = struct {
+        T: type = u8,
+    };
+
+    // reevaluate after https://github.com/ziglang/zig/issues/23935
+    pub fn map(self: VmaGpuBuffer, allocator: c.VmaAllocator, T: type) ![]T {
+        std.debug.assert(self.size % @sizeOf(T) == 0);
+
+        switch (@typeInfo(T)) {
+            inline .@"struct", .@"union" => |info| switch (info.layout) {
+                .@"extern", .@"packed" => {},
+                .auto => @compileError("T type must have a well defined memory layout"),
+            },
+            .int, .float => {},
+            .pointer => |info| switch (info.size) {
+                .one, .many, .c => {},
+                .slice => @compileError("T type must have a well defined memory layout"),
+            },
+            else => @compileError("unsupported type"),
+        }
+
+        var mapped: [*]T = undefined;
+        _ = c.vmaMapMemory(allocator, self.allocation, @ptrCast(&mapped)); // TODO handle error
+
+        return @alignCast(mapped[0 .. self.size / @sizeOf(T)]);
+    }
+
+    pub fn unMap(self: VmaGpuBuffer, allocator: c.VmaAllocator) void {
+        c.vmaUnmapMemory(allocator, self.allocation);
     }
 };
 
@@ -59,8 +92,8 @@ pub const GPUSceneData = extern struct {
 
 // holds the resources needed for a mesh
 pub const GPUMeshBuffers = struct {
-    indexBuffer: AllocatedBuffer,
-    vertexBuffer: AllocatedBuffer,
+    indexBuffer: VmaGpuBuffer,
+    vertexBuffer: VmaGpuBuffer,
     vertexBufferAddress: vk.DeviceAddress,
 };
 
@@ -287,7 +320,7 @@ const DeletionQueue = struct {
         fence: vk.Fence,
         descriptor_pool: vk.DescriptorPool,
         imgui_impl_vulkan: void,
-        allocated_buffer: AllocatedBuffer,
+        allocated_buffer: VmaGpuBuffer,
 
         fn deinit(self: QueueItem, context: DeinitContext) void {
             switch (self) {
@@ -1108,7 +1141,6 @@ pub const Engine = struct {
         const mesh_pipeline = blk: {
             var pipelineBuilder: PipelineBuilder = .{};
 
-            //use the triangle layout we created
             pipelineBuilder.pipeline_layout = mesh_pipeline_layout;
             //connecting the vertex and pixel shaders to the pipeline
             try pipelineBuilder.setShaders(meshVertexShader, meshFragShader, temp_alloc);
@@ -1116,14 +1148,9 @@ pub const Engine = struct {
             pipelineBuilder.setInputTopology(.triangle_list);
             //filled triangles
             pipelineBuilder.setPolygonMode(.fill);
-            //no backface culling
             pipelineBuilder.setCullMode(.{ .back_bit = true }, .counter_clockwise);
-            //no multisampling
             pipelineBuilder.setMultisamplingNone();
-            //no blending
             pipelineBuilder.disableBlending();
-            //no depth testing
-            // pipelineBuilder.disableDepthtest();
             pipelineBuilder.enableDepthtest(true, .less_or_equal);
 
             //connect the image format we will draw into, from draw image
@@ -1390,22 +1417,20 @@ pub const Engine = struct {
 
         {
             //allocate a new uniform buffer for the scene data
-            const gpuSceneDataBuffer: AllocatedBuffer = try .create(self.device_ctx.vma_allocator, @sizeOf(GPUSceneData), .{ .uniform_buffer_bit = true }, c.VMA_MEMORY_USAGE_CPU_TO_GPU);
+            const gpu_scene_data_buffer: VmaGpuBuffer = try .create(self.device_ctx.vma_allocator, @sizeOf(GPUSceneData), .{ .uniform_buffer_bit = true }, c.VMA_MEMORY_USAGE_CPU_TO_GPU);
 
             //add it to the deletion queue of this frame so it gets deleted once its been used
-            try self.currentFrame().deletion_queue.append(allocator, .{ .allocated_buffer = gpuSceneDataBuffer });
+            try self.currentFrame().deletion_queue.append(allocator, .{ .allocated_buffer = gpu_scene_data_buffer });
 
-            // //write the buffer
-            var data: *GPUSceneData = undefined;
-            _ = c.vmaMapMemory(self.device_ctx.vma_allocator, gpuSceneDataBuffer.allocation, @ptrCast(&data)); // TODO: handle error?
-            defer c.vmaUnmapMemory(self.device_ctx.vma_allocator, gpuSceneDataBuffer.allocation);
-            data.* = self.scene_data;
+            const buffer = try gpu_scene_data_buffer.map(self.device_ctx.vma_allocator, GPUSceneData);
+            buffer[0] = self.scene_data;
+            gpu_scene_data_buffer.unMap(self.device_ctx.vma_allocator);
 
             // //create a descriptor set that binds that buffer and update it
             const globalDescriptor: vk.DescriptorSet = try self.currentFrame().frame_descriptors.allocate(allocator, temp_alloc, device, self.gpu_scene_data_descriptor_layout, null);
 
             var writer: descriptors.DescriptorWriter = .{};
-            try writer.writeBuffer(temp_alloc, 0, gpuSceneDataBuffer.buffer, @sizeOf(GPUSceneData), 0, .uniform_buffer);
+            try writer.writeBuffer(temp_alloc, 0, gpu_scene_data_buffer.buffer, @sizeOf(GPUSceneData), 0, .uniform_buffer);
             writer.updateSet(device, globalDescriptor);
         }
 
@@ -1425,7 +1450,7 @@ pub const Engine = struct {
         const indexBufferSize: usize = indices.len * @sizeOf(u32);
 
         //create vertex buffer
-        const vertexBuffer: AllocatedBuffer = try .create(
+        const vertexBuffer: VmaGpuBuffer = try .create(
             vma_allocator,
             vertexBufferSize,
             .{ .storage_buffer_bit = true, .transfer_dst_bit = true, .shader_device_address_bit = true },
@@ -1437,7 +1462,7 @@ pub const Engine = struct {
         const vertexBufferAddress = device.getBufferDeviceAddress(&deviceAdressInfo);
 
         //create index buffer
-        const indexBuffer: AllocatedBuffer = try .create(
+        const indexBuffer: VmaGpuBuffer = try .create(
             vma_allocator,
             indexBufferSize,
             .{ .storage_buffer_bit = true, .transfer_dst_bit = true, .index_buffer_bit = true },
@@ -1449,7 +1474,7 @@ pub const Engine = struct {
             .vertexBufferAddress = vertexBufferAddress,
         };
 
-        const staging: AllocatedBuffer = try .create(
+        const staging: VmaGpuBuffer = try .create(
             vma_allocator,
             vertexBufferSize + indexBufferSize,
             .{ .transfer_src_bit = true },
@@ -1457,12 +1482,13 @@ pub const Engine = struct {
         );
         defer staging.destroy(vma_allocator);
 
-        var data: [*]u8 = undefined;
-        _ = c.vmaMapMemory(vma_allocator, staging.allocation, @ptrCast(&data)); // TODO: handle error?
-        defer c.vmaUnmapMemory(vma_allocator, staging.allocation);
+        {
+            var data = try staging.map(vma_allocator, u8);
+            defer staging.unMap(vma_allocator);
 
-        @memcpy(@as([*]Vertex, @ptrCast(@alignCast(data))), vertices); // copy vertex buffer
-        @memcpy(@as([*]u32, @ptrCast(@alignCast(data[vertexBufferSize..]))), indices); // copy index buffer
+            @memcpy(@as([*]Vertex, @ptrCast(@alignCast(data.ptr))), vertices); // copy vertex buffer
+            @memcpy(@as([*]u32, @ptrCast(@alignCast(data[vertexBufferSize..]))), indices); // copy index buffer
+        }
 
         {
             try immediateModeBegin(device, imm.fence, imm.command_buffer);
