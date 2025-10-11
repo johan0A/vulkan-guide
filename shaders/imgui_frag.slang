@@ -13,7 +13,7 @@ float3 linear_from_srgb(float3 srgb) {
 [shader("pixel")]
 float4 main(
     Sampler2D gSampler,
-    VertexOutput In: COLOR0,
+    VertexOutput In: COLOR,
 ) : SV_Target0 {
     float4 texColor = gSampler.Sample(In.UV);
     float4 color = In.Color * texColor;

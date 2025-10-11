@@ -311,7 +311,7 @@ const DeletionQueue = struct {
     const QueueItem = union(enum) {
         vma_allocator: c.VmaAllocator,
         image_view: vk.ImageView,
-        vma_allocated_image: struct { image: vk.Image, allocation: c.VmaAllocation },
+        vma_allocated_image: AllocatedImage,
         descriptor_allocator: DescriptorAllocator,
         descriptor_set_layout: vk.DescriptorSetLayout,
         pipeline_layout: vk.PipelineLayout,
@@ -321,12 +321,16 @@ const DeletionQueue = struct {
         descriptor_pool: vk.DescriptorPool,
         imgui_impl_vulkan: void,
         allocated_buffer: VmaGpuBuffer,
+        sampler: vk.Sampler,
 
         fn deinit(self: QueueItem, context: DeinitContext) void {
             switch (self) {
                 .vma_allocator => |item| c.vmaDestroyAllocator(item),
                 .image_view => |item| context.device.destroyImageView(item, null),
-                .vma_allocated_image => |item| c.vmaDestroyImage(context.vma_allocator.?, @ptrFromInt(@intFromEnum(item.image)), item.allocation),
+                .vma_allocated_image => |item| {
+                    c.vmaDestroyImage(context.vma_allocator.?, @ptrFromInt(@intFromEnum(item.image)), item.allocation);
+                    context.device.destroyImageView(item.image_view, null);
+                },
                 .descriptor_allocator => |item| item.destroyPool(context.device),
                 .descriptor_set_layout => |item| context.device.destroyDescriptorSetLayout(item, null),
                 .pipeline_layout => |item| context.device.destroyPipelineLayout(item, null),
@@ -336,6 +340,7 @@ const DeletionQueue = struct {
                 .descriptor_pool => |item| context.device.destroyDescriptorPool(item, null),
                 .imgui_impl_vulkan => c.cImGui_ImplVulkan_Shutdown(),
                 .allocated_buffer => |item| item.destroy(context.vma_allocator.?),
+                .sampler => |item| context.device.destroySampler(item, null),
             }
         }
     };
@@ -504,6 +509,17 @@ pub const Engine = struct {
 
     test_meshes: std.ArrayListUnmanaged(loader.MeshAsset),
 
+    // default images
+    white_image: AllocatedImage,
+    black_image: AllocatedImage,
+    grey_image: AllocatedImage,
+    error_checkerboard_image: AllocatedImage,
+
+    default_sampler_linear: vk.Sampler,
+    default_sampler_nearest: vk.Sampler,
+
+    single_image_descriptor_layout: vk.DescriptorSetLayout,
+
     pub fn draw(self: *Engine, allocator: Allocator) !void {
         const local = struct {
             fn drawBackground(engine: *Engine, cmd: vk.CommandBuffer) void {
@@ -648,6 +664,7 @@ pub const Engine = struct {
         self.frame_number += 1;
     }
 
+    // TODO: use device ctx and return imm_command_buffer?
     fn immediateModeBegin(device: vk.DeviceProxy, imm_fence: vk.Fence, imm_command_buffer: vk.CommandBuffer) !void {
         try device.resetFences(1, (&imm_fence)[0..1]);
         try device.resetCommandBuffer(imm_command_buffer, .{});
@@ -844,8 +861,7 @@ pub const Engine = struct {
         };
 
         //add to deletion queues
-        try main_deletion_queue.append(allocator, .{ .image_view = draw_allocated_image.image_view });
-        try main_deletion_queue.append(allocator, .{ .vma_allocated_image = .{ .image = draw_allocated_image.image, .allocation = draw_allocated_image.allocation } });
+        try main_deletion_queue.append(allocator, .{ .vma_allocated_image = draw_allocated_image });
 
         const depthImageUsages: vk.ImageUsageFlags = .{ .depth_stencil_attachment_bit = true };
 
@@ -868,8 +884,7 @@ pub const Engine = struct {
             .allocation = depth_image_allocation,
         };
 
-        try main_deletion_queue.append(allocator, .{ .image_view = depth_allocated_image.image_view });
-        try main_deletion_queue.append(allocator, .{ .vma_allocated_image = .{ .image = depth_allocated_image.image, .allocation = depth_allocated_image.allocation } });
+        try main_deletion_queue.append(allocator, .{ .vma_allocated_image = depth_allocated_image });
         //}
 
         //create a descriptor pool that will hold 10 sets with 1 image each
@@ -940,6 +955,18 @@ pub const Engine = struct {
 
         try main_deletion_queue.append(allocator, .{ .descriptor_set_layout = draw_image_descriptor_layout });
         try main_deletion_queue.append(allocator, .{ .descriptor_allocator = global_descriptor_allocator });
+
+        // DescriptorLayoutBuilder builder;
+        // builder.add_binding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+        // _singleImageDescriptorLayout = builder.build(_device, VK_SHADER_STAGE_FRAGMENT_BIT);
+
+        var single_image_descriptor_bindings = [_]vk.DescriptorSetLayoutBinding{
+            descriptors.layout.createSetBinding(0, .combined_image_sampler),
+        };
+
+        const single_image_descriptor_layout = try descriptors.layout.createSet(&single_image_descriptor_bindings, device_proxy, .{ .fragment_bit = true }, null, .{});
+        try main_deletion_queue.append(allocator, .{ .descriptor_set_layout = single_image_descriptor_layout });
+
         // }
 
         // backround effects init ------------
@@ -1118,7 +1145,7 @@ pub const Engine = struct {
         // }
 
         // init_mesh_pipeline {
-        const meshFragShader = try vk_init.loadShaderModule(try loadShader(shaders.colored_triangle_frag, temp_alloc), device_proxy);
+        const meshFragShader = try vk_init.loadShaderModule(try loadShader(shaders.tex_image_frag, temp_alloc), device_proxy);
         defer device_proxy.destroyShaderModule(meshFragShader, null);
         const meshVertexShader = try vk_init.loadShaderModule(try loadShader(shaders.colored_triangle_mesh_vert, temp_alloc), device_proxy);
         defer device_proxy.destroyShaderModule(meshVertexShader, null);
@@ -1132,6 +1159,8 @@ pub const Engine = struct {
         var mesh_pipeline_layout_info: vk.PipelineLayoutCreateInfo = .{};
         mesh_pipeline_layout_info.p_push_constant_ranges = (&bufferRange)[0..1];
         mesh_pipeline_layout_info.push_constant_range_count = 1;
+        mesh_pipeline_layout_info.p_set_layouts = (&single_image_descriptor_layout)[0..1];
+        mesh_pipeline_layout_info.set_layout_count = 1;
 
         //build the pipeline layout that controls the inputs/outputs of the shader
         //we are not using descriptor sets or other systems yet, so no need to use anything other than empty default
@@ -1190,6 +1219,70 @@ pub const Engine = struct {
         const testMeshes = try loader.loadGltfMeshes(init_alloc, temp_alloc, device_ctx, imm, options.assets_path ++ "/basicmesh.glb");
         // }
 
+        //{ default images
+        const Color = packed struct(u32) { r: u8, g: u8, b: u8, a: u8 };
+
+        const white: Color = .{ .r = 255, .g = 255, .b = 255, .a = 255 };
+        const white_image = try createAndUploadImage(device_ctx, imm, @ptrCast(&white), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
+        try main_deletion_queue.append(allocator, .{ .vma_allocated_image = white_image });
+
+        const grey: Color = .{ .r = 168, .g = 168, .b = 168, .a = 255 };
+        const grey_image = try createAndUploadImage(device_ctx, imm, @ptrCast(&grey), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
+        try main_deletion_queue.append(allocator, .{ .vma_allocated_image = grey_image });
+
+        const black: Color = .{ .r = 0, .g = 0, .b = 0, .a = 255 };
+        const black_image = try createAndUploadImage(device_ctx, imm, @ptrCast(&black), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
+        try main_deletion_queue.append(allocator, .{ .vma_allocated_image = black_image });
+
+        const error_checkerboard_image = blk: {
+            const magenta: Color = .{ .r = 255, .g = 0, .b = 255, .a = 255 };
+            var pixels: [16][16]Color = undefined;
+            for (0..pixels.len) |x| {
+                for (0..pixels[0].len) |y| {
+                    pixels[x][y] = if ((x % 2) ^ (y % 2) != 0) magenta else black;
+                }
+            }
+            break :blk try createAndUploadImage(device_ctx, imm, @ptrCast(&pixels), .{ .width = 16, .height = 16, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
+        };
+        try main_deletion_queue.append(allocator, .{ .vma_allocated_image = error_checkerboard_image });
+
+        var sampler_create_info: vk.SamplerCreateInfo = .{
+            .mag_filter = .nearest,
+            .min_filter = .nearest,
+            .mipmap_mode = .nearest,
+            .address_mode_u = .repeat,
+            .address_mode_v = .repeat,
+            .address_mode_w = .repeat,
+            .mip_lod_bias = 0,
+            .anisotropy_enable = .false,
+            .max_anisotropy = 0,
+            .compare_enable = .false,
+            .compare_op = .never,
+            .min_lod = 0,
+            .max_lod = 0,
+            .border_color = .float_transparent_black,
+            .unnormalized_coordinates = .false,
+        };
+
+        const default_sampler_nearest = try device_ctx.device.createSampler(&sampler_create_info, null);
+        try main_deletion_queue.append(allocator, .{ .sampler = default_sampler_nearest });
+
+        sampler_create_info.mag_filter = .linear;
+        sampler_create_info.min_filter = .linear;
+        const default_sampler_linear = try device_ctx.device.createSampler(&sampler_create_info, null);
+        try main_deletion_queue.append(allocator, .{ .sampler = default_sampler_linear });
+
+        // _mainDeletionQueue.push_function([&](){
+        // vkDestroySampler(_device,_defaultSamplerNearest,nullptr);
+        // vkDestroySampler(_device,_defaultSamplerLinear,nullptr);
+
+        // destroy_image(_whiteImage);
+        // destroy_image(_greyImage);
+        // destroy_image(_blackImage);
+        // destroy_image(_errorCheckerboardImage);
+        // });
+        //}
+
         return .{
             .vk_ctx = .{
                 .base_dispatch = base_dispatch,
@@ -1246,7 +1339,101 @@ pub const Engine = struct {
             .rectangle = rectangle,
 
             .test_meshes = testMeshes,
+
+            .white_image = white_image,
+            .grey_image = grey_image,
+            .black_image = black_image,
+            .error_checkerboard_image = error_checkerboard_image,
+
+            .default_sampler_nearest = default_sampler_nearest,
+            .default_sampler_linear = default_sampler_linear,
+
+            .single_image_descriptor_layout = single_image_descriptor_layout,
         };
+    }
+
+    pub fn createImage(device_ctx: DeviceContext, size: vk.Extent3D, format: vk.Format, usage: vk.ImageUsageFlags, mipmapped: bool) !AllocatedImage {
+        var img_info: vk.ImageCreateInfo = vk_init.imageCreateInfo(format, usage, size);
+        if (mipmapped) {
+            img_info.mip_levels = std.math.log2(@max(size.width, size.height)) + 1;
+        }
+
+        // always allocate images on dedicated GPU memory
+        const alloc_info: c.VmaAllocationCreateInfo = .{
+            .usage = c.VMA_MEMORY_USAGE_GPU_ONLY,
+            .requiredFlags = c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        };
+
+        var image: vk.Image = undefined;
+        var image_allocation: c.VmaAllocation = undefined;
+        _ = c.vmaCreateImage(device_ctx.vma_allocator, @ptrCast(&img_info), &alloc_info, @ptrCast(&image), &image_allocation, null);
+
+        // if the format is a depth format, we will need to have it use the correct aspect flag
+        const aspect_flag: vk.ImageAspectFlags = switch (format == .d32_sfloat) {
+            true => .{ .depth_bit = true },
+            false => .{ .color_bit = true },
+        };
+
+        // build a image-view for the image
+        var view_info: vk.ImageViewCreateInfo = vk_init.imageViewCreateInfo(format, image, aspect_flag);
+        view_info.subresource_range.level_count = img_info.mip_levels;
+
+        return .{
+            .image_format = format,
+            .image_extent = size,
+            .image = image,
+            .image_view = try device_ctx.device.createImageView(&view_info, null),
+            .allocation = image_allocation,
+        };
+    }
+
+    pub fn createAndUploadImage(device_ctx: DeviceContext, imm: ImmSubmit, data: *const anyopaque, size: vk.Extent3D, format: vk.Format, usage: vk.ImageUsageFlags, mipmapped: bool) !AllocatedImage {
+        const data_size: usize = size.depth * size.width * size.height * 4;
+        const upload_buffer: VmaGpuBuffer = try .create(device_ctx.vma_allocator, data_size, .{ .transfer_src_bit = true }, c.VMA_MEMORY_USAGE_CPU_TO_GPU);
+
+        @memcpy(
+            @as([*]u8, @ptrCast(upload_buffer.info.pMappedData)),
+            @as([*]const u8, @ptrCast(data))[0..data_size],
+        );
+
+        var new_usage = usage;
+        new_usage.transfer_dst_bit = true;
+        new_usage.transfer_src_bit = true;
+        const new_image = try createImage(device_ctx, size, format, new_usage, mipmapped);
+
+        {
+            try immediateModeBegin(device_ctx.device, imm.fence, imm.command_buffer);
+            // vkutil::transition_image(cmd, new_image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+            vk_image.transitionImage(device_ctx.device, imm.command_buffer, new_image.image, .undefined, .transfer_dst_optimal);
+
+            const copy_region = [_]vk.BufferImageCopy{.{
+                .buffer_offset = 0,
+                .buffer_row_length = 0,
+                .buffer_image_height = 0,
+
+                .image_subresource = .{
+                    .aspect_mask = .{ .color_bit = true },
+                    .mip_level = 0,
+                    .base_array_layer = 0,
+                    .layer_count = 1,
+                },
+                .image_extent = size,
+                .image_offset = .{ .x = 0, .y = 0, .z = 0 },
+            }};
+            device_ctx.device.cmdCopyBufferToImage(imm.command_buffer, upload_buffer.buffer, new_image.image, .transfer_dst_optimal, copy_region.len, &copy_region);
+
+            vk_image.transitionImage(device_ctx.device, imm.command_buffer, new_image.image, .transfer_dst_optimal, .read_only_optimal);
+            try immediateModeEnd(device_ctx.device, imm.fence, imm.command_buffer, device_ctx.graphics_queue);
+        }
+
+        upload_buffer.destroy(device_ctx.vma_allocator);
+        return new_image;
+    }
+
+    pub fn destroyImage(self: Engine, img: *AllocatedImage) void {
+        self.device_ctx.device.destroyImageView(img.image_view, null);
+        c.vmaDestroyImage(self.device_ctx.vma_allocator, img.image, img.allocation);
     }
 
     pub fn resizeSwapchain(self: *Engine, alloc: Allocator) !void {
@@ -1386,6 +1573,18 @@ pub const Engine = struct {
         {
             device.cmdBindPipeline(cmd, .graphics, self.mesh_pipeline);
 
+            //bind a texture
+            const image_set: vk.DescriptorSet = try self.currentFrame().frame_descriptors.allocate(allocator, temp_alloc, device, self.single_image_descriptor_layout, null);
+            {
+                var writer: descriptors.DescriptorWriter = .{};
+                defer writer.deinit(allocator);
+                try writer.writeImage(allocator, 0, self.error_checkerboard_image.image_view, self.default_sampler_nearest, .shader_read_only_optimal, .combined_image_sampler);
+
+                writer.updateSet(device, image_set);
+            }
+
+            device.cmdBindDescriptorSets(cmd, .graphics, self.mesh_pipeline_layout, 0, 1, (&image_set)[0..1], 0, null);
+
             var push_constants: GPUDrawPushConstants = .{
                 .worldMatrix = .translate(.identity, .{ 0, 0, -1.5 }),
                 .vertexBuffer = self.rectangle.vertexBufferAddress,
@@ -1517,6 +1716,9 @@ pub const Engine = struct {
 const descriptors = struct {
     const DescriptorAllocatorGrowable = struct {
         // TODO: the design of this is pretty bad
+        // better design: at the start set the ratio to all same
+        // once a pool is full you check wish type has filled how much as a ratio to the one that filled completely and set the ratio for the next pool accordingly
+
         const PoolSizeRatio = struct {
             type: vk.DescriptorType,
             ratio: f32,

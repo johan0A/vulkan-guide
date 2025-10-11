@@ -28,7 +28,7 @@ void main(
     float xCol = (uv.x - time / 3.0f) * 3.0f;
     xCol = fmod(abs(xCol), 3.0f);
     float3 horColour = float3(0.25f, 0.25f, 0.25f);
-    
+
     if (xCol < 1.0f) {
         horColour.r += 1.0f - xCol;
         horColour.g += xCol;
@@ -45,7 +45,7 @@ void main(
     }
 
     uv = (2.0f * uv) - 1.0f;
-    float beamWidth = (0.7f + 
+    float beamWidth = (0.7f +
         0.5f * cos(uv.x * 10.0f * tau * 0.15f * clamp(floor(5.0f + 10.0f * cos(time)), 0.0f, 10.0f)))
         * abs(1.0f / (30.0f * uv.y));
     float3 horBeam = float3(beamWidth, beamWidth, beamWidth);
