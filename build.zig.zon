@@ -24,9 +24,8 @@
             .url = "git+https://github.com/johan0A/zig-tracy#06f7e1bf96c3213bbe3e34414651b2ef76e023c3",
             .hash = "tracy-0.11.1-bsH_anHeFgA_A2ponF7NaLtN9Nn7NqVpOqXTPLjjToce",
         },
-        .zig_slang_binaries = .{
-            .url = "git+https://github.com/johan0A/zig-slang-binaries#3b96c085a47f4daa87cf4f83e9bacfa5f14ab519",
-            .hash = "zig_slang_binaries-0.1.0+2025.6.3-nZ4kSNgKAACJee-ysSqUoUfX-rjzB_CRGpsmamwoSjWH",
+        .zig_slang_binaries = .{ // TODO: dont vendor it after this is fixed: https://github.com/ziglang/zig/issues/25527
+            .path = "vendor/zig-slang-binaries",
         },
         .dcimgui = .{
             .url = "git+https://github.com/johan0A/zig-dcimgui#8c76d03bf09c13b15cc819b5bf3446309113d905",
