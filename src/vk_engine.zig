@@ -45,7 +45,7 @@ pub const VmaGpuBuffer = struct {
         T: type = u8,
     };
 
-    // reevaluate after https://github.com/ziglang/zig/issues/23935
+    // TODO: reevaluate after https://github.com/ziglang/zig/issues/23935
     pub fn map(self: VmaGpuBuffer, allocator: c.VmaAllocator, T: type) ![]T {
         std.debug.assert(self.size % @sizeOf(T) == 0);
 
@@ -410,22 +410,110 @@ const DescriptorAllocator = struct {
 };
 
 const SwapChain = struct {
+    pub const SwapImage = struct {
+        handle: vk.Image,
+        view: vk.ImageView,
+        render_semaphore: vk.Semaphore,
+    };
+
     handle: vk.SwapchainKHR,
     image_format: vk.Format,
     image_color_space: vk.ColorSpaceKHR,
-    images: []vk.Image,
-    image_views: []vk.ImageView,
+    images: []SwapImage,
     extent: vk.Extent2D,
 
-    // TODO: move sapchain creation here
+    // TODO: review this function, not convinced that this is done best
+    fn init(
+        gpa: std.mem.Allocator,
+        scratch: std.mem.Allocator,
+        physical_device: vk.PhysicalDevice,
+        device: vk.DeviceProxy,
+        window_surface: vk.SurfaceKHR,
+        window_width: u32,
+        window_height: u32,
+        instance_dispatch: vk.InstanceWrapper,
+    ) !SwapChain {
+        const surface_formats = try instance_dispatch.getPhysicalDeviceSurfaceFormatsAllocKHR(physical_device, window_surface, scratch);
+
+        const swapchain_image_format = blk: {
+            const preferred_format: vk.SurfaceFormatKHR = .{ .format = .b8g8r8a8_srgb, .color_space = .srgb_nonlinear_khr };
+            for (surface_formats) |format| if (std.meta.eql(preferred_format, format)) break :blk preferred_format;
+            for (surface_formats) |format| if (preferred_format.format == format.format) break :blk format;
+            return error.SwapchainCreationFailed;
+        };
+
+        const surface_capabilities = try instance_dispatch.getPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, window_surface);
+        const min_image_count = @min(surface_capabilities.min_image_count, 3);
+
+        const swapchain_extent: vk.Extent2D = .{ .width = window_width, .height = window_height };
+
+        const swapchain_create_info = vk.SwapchainCreateInfoKHR{
+            .surface = window_surface,
+            .min_image_count = min_image_count,
+            .image_format = swapchain_image_format.format,
+            .image_color_space = swapchain_image_format.color_space,
+            .image_extent = swapchain_extent,
+            .image_array_layers = 1,
+            .image_usage = .{ .transfer_src_bit = true, .color_attachment_bit = true, .transfer_dst_bit = true },
+            .image_sharing_mode = .exclusive,
+            .queue_family_index_count = 0,
+            .p_queue_family_indices = null,
+            .pre_transform = .{ .identity_bit_khr = true },
+            .composite_alpha = .{ .opaque_bit_khr = true },
+            .present_mode = .fifo_khr,
+            .clipped = .false,
+            .old_swapchain = .null_handle,
+        };
+
+        const swapchain_handle = try device.createSwapchainKHR(&swapchain_create_info, null);
+        errdefer device.destroySwapchainKHR(swapchain_handle, null);
+
+        const images = try device.getSwapchainImagesAllocKHR(swapchain_handle, scratch);
+
+        const swap_images = try gpa.alloc(SwapImage, images.len);
+        errdefer {
+            gpa.free(swap_images);
+            for (swap_images) |image| {
+                if (image.view != .null_handle) device.destroyImageView(image.view, null);
+            }
+        }
+
+        for (images, swap_images) |image, *swapchain_image| {
+            swapchain_image.* = .{
+                .handle = image,
+                .render_semaphore = try device.createSemaphore(&.{}, null),
+                .view = try device.createImageView(&.{
+                    .image = image,
+                    .view_type = .@"2d",
+                    .format = swapchain_image_format.format,
+                    .components = .{ .r = .identity, .g = .identity, .b = .identity, .a = .identity },
+                    .subresource_range = .{
+                        .aspect_mask = .{ .color_bit = true },
+                        .base_mip_level = 0,
+                        .level_count = 1,
+                        .base_array_layer = 0,
+                        .layer_count = 1,
+                    },
+                }, null),
+            };
+        }
+
+        return .{
+            .handle = swapchain_handle,
+            .image_format = swapchain_image_format.format,
+            .image_color_space = swapchain_image_format.color_space,
+            .images = swap_images,
+            .extent = swapchain_extent,
+        };
+    }
 
     fn deinit(self: SwapChain, alloc: Allocator, device: vk.DeviceProxy) void {
         device.destroySwapchainKHR(self.handle, null);
-        for (self.image_views) |image_view| {
-            device.destroyImageView(image_view, null);
+        for (self.images) |image| {
+            device.destroyImageView(image.view, null);
+            device.destroySemaphore(image.render_semaphore, null);
         }
         alloc.free(self.images);
-        alloc.free(self.image_views);
     }
 };
 
@@ -433,7 +521,6 @@ const FrameData = struct {
     const FRAME_OVERLAP = 2;
 
     swapchain_semaphore: vk.Semaphore,
-    render_semaphore: vk.Semaphore,
     render_fence: vk.Fence,
 
     command_pool: vk.CommandPool,
@@ -587,9 +674,8 @@ pub const Engine = struct {
             },
             else => |e| return e,
         };
-        const swapchain_image_index: u32 = acquire_next_image_result.image_index;
+        const swapchain_image_index = acquire_next_image_result.image_index;
 
-        //naming it cmd for shorter writing
         const cmd: vk.CommandBuffer = self.currentFrame().main_command_buffer;
 
         self.draw_extent.width = self.draw_image.image_extent.width; // TODO: I dont like this, its duplication of state for no good reasons
@@ -615,19 +701,19 @@ pub const Engine = struct {
             //transtion the draw image and the swapchain image into their correct transfer layouts
             vk_image.transitionImage(device, cmd, self.draw_image.image, .color_attachment_optimal, .transfer_src_optimal);
 
-            vk_image.transitionImage(device, cmd, self.swapchain.images[swapchain_image_index], .undefined, .transfer_dst_optimal);
+            vk_image.transitionImage(device, cmd, self.swapchain.images[swapchain_image_index].handle, .undefined, .transfer_dst_optimal);
 
             // execute a copy from the draw image into the swapchain
-            vk_image.copyImageToImage(device, cmd, self.draw_image.image, self.swapchain.images[swapchain_image_index], self.draw_extent, self.swapchain.extent);
+            vk_image.copyImageToImage(device, cmd, self.draw_image.image, self.swapchain.images[swapchain_image_index].handle, self.draw_extent, self.swapchain.extent);
 
             // set swapchain image layout to Attachment Optimal so we can draw it
-            vk_image.transitionImage(device, cmd, self.swapchain.images[swapchain_image_index], .transfer_dst_optimal, .color_attachment_optimal);
+            vk_image.transitionImage(device, cmd, self.swapchain.images[swapchain_image_index].handle, .transfer_dst_optimal, .color_attachment_optimal);
 
             //draw imgui into the swapchain image
-            self.drawImgui(cmd, self.swapchain.image_views[swapchain_image_index]);
+            self.drawImgui(cmd, self.swapchain.images[swapchain_image_index].view);
 
             // set swapchain image layout to Present so we can show it on the screen
-            vk_image.transitionImage(device, cmd, self.swapchain.images[swapchain_image_index], .color_attachment_optimal, .present_src_khr);
+            vk_image.transitionImage(device, cmd, self.swapchain.images[swapchain_image_index].handle, .color_attachment_optimal, .present_src_khr);
         }
         //finalize the command buffer (we can no longer add commands, but it can now be executed)
         try device.endCommandBuffer(cmd);
@@ -638,7 +724,7 @@ pub const Engine = struct {
         {
             const cmd_info: vk.CommandBufferSubmitInfo = vk_init.commandBufferSubmitInfo(cmd);
             const wait_info: vk.SemaphoreSubmitInfo = vk_init.semaphoreSubmitInfo(.{ .color_attachment_output_bit = true }, self.currentFrame().swapchain_semaphore);
-            const signal_info: vk.SemaphoreSubmitInfo = vk_init.semaphoreSubmitInfo(.{ .all_graphics_bit = true }, self.currentFrame().render_semaphore);
+            const signal_info: vk.SemaphoreSubmitInfo = vk_init.semaphoreSubmitInfo(.{ .all_graphics_bit = true }, self.swapchain.images[swapchain_image_index].render_semaphore);
 
             const submit_info = vk_init.submitInfo(&cmd_info, &signal_info, &wait_info);
 
@@ -650,7 +736,7 @@ pub const Engine = struct {
         const present_info: vk.PresentInfoKHR = .{
             .p_swapchains = (&self.swapchain.handle)[0..1],
             .swapchain_count = 1,
-            .p_wait_semaphores = (&self.currentFrame().render_semaphore)[0..1],
+            .p_wait_semaphores = (&self.swapchain.images[swapchain_image_index].render_semaphore)[0..1],
             .wait_semaphore_count = 1,
             .p_image_indices = (&swapchain_image_index)[0..1],
         };
@@ -756,7 +842,6 @@ pub const Engine = struct {
                 .command_pool = command_pool,
                 .render_fence = try device_proxy.createFence(&fence_create_info, null),
                 .swapchain_semaphore = try device_proxy.createSemaphore(&.{}, null),
-                .render_semaphore = try device_proxy.createSemaphore(&.{}, null),
                 .main_command_buffer = main_command_buffer,
                 .deletion_queue = .init,
 
@@ -1027,7 +1112,16 @@ pub const Engine = struct {
         }
 
         const graphics_queue = device_proxy.getDeviceQueue(queue_family_indices.graphics_family.?, 0);
-        const swapchain = try vk_init.createSwapchain(allocator, temp_alloc, physical_device, device_proxy, sdl_window_surface, window_width, window_height, instance_dispatch.*);
+        const swapchain: SwapChain = try .init(
+            allocator,
+            temp_alloc,
+            physical_device,
+            device_proxy,
+            sdl_window_surface,
+            window_width,
+            window_height,
+            instance_dispatch.*,
+        );
 
         {
             // 1: create descriptor pool for IMGUI
@@ -1451,7 +1545,7 @@ pub const Engine = struct {
         var temp_arena = std.heap.ArenaAllocator.init(alloc);
         defer temp_arena.deinit();
 
-        self.swapchain = try vk_init.createSwapchain(
+        self.swapchain = try .init(
             alloc,
             temp_arena.allocator(),
             self.vk_ctx.chosen_gpu,
@@ -1474,7 +1568,6 @@ pub const Engine = struct {
 
             device.destroyFence(self.frames[i].render_fence, null);
             device.destroySemaphore(self.frames[i].swapchain_semaphore, null);
-            device.destroySemaphore(self.frames[i].render_semaphore, null);
 
             self.frames[i].deletion_queue.deinit(allocator, .{
                 .device = device,
@@ -2299,87 +2392,6 @@ const vk_init = struct {
             .pp_enabled_extension_names = &required_device_extensions,
             .enabled_extension_count = required_device_extensions.len,
         }, null);
-    }
-
-    // TODO: review this function, not convinced that this is done best
-    fn createSwapchain(
-        alloc: std.mem.Allocator,
-        temp_alloc: std.mem.Allocator,
-        physical_device: vk.PhysicalDevice,
-        device: vk.DeviceProxy,
-        window_surface: vk.SurfaceKHR,
-        window_width: u32,
-        window_height: u32,
-        instance_dispatch: vk.InstanceWrapper,
-    ) !SwapChain {
-        const surface_formats = try instance_dispatch.getPhysicalDeviceSurfaceFormatsAllocKHR(physical_device, window_surface, temp_alloc);
-
-        const swapchain_image_format = blk: {
-            const preferred_format: vk.SurfaceFormatKHR = .{ .format = .b8g8r8a8_srgb, .color_space = .srgb_nonlinear_khr };
-            for (surface_formats) |format| if (std.meta.eql(preferred_format, format)) break :blk preferred_format;
-            for (surface_formats) |format| if (preferred_format.format == format.format) break :blk format;
-            return error.SwapchainCreationFailed;
-        };
-
-        const surface_capabilities = try instance_dispatch.getPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, window_surface);
-        const min_image_count = @min(surface_capabilities.min_image_count, 3);
-
-        const swapchain_extent: vk.Extent2D = .{ .width = window_width, .height = window_height };
-
-        const swapchain_create_info = vk.SwapchainCreateInfoKHR{
-            .surface = window_surface,
-            .min_image_count = min_image_count,
-            .image_format = swapchain_image_format.format,
-            .image_color_space = swapchain_image_format.color_space,
-            .image_extent = swapchain_extent,
-            .image_array_layers = 1,
-            .image_usage = .{ .transfer_src_bit = true, .color_attachment_bit = true, .transfer_dst_bit = true },
-            .image_sharing_mode = .exclusive,
-            .queue_family_index_count = 0,
-            .p_queue_family_indices = null,
-            .pre_transform = .{ .identity_bit_khr = true },
-            .composite_alpha = .{ .opaque_bit_khr = true },
-            .present_mode = .fifo_khr,
-            .clipped = .false,
-            .old_swapchain = .null_handle,
-        };
-
-        const swapchain_handle = try device.createSwapchainKHR(&swapchain_create_info, null);
-        errdefer device.destroySwapchainKHR(swapchain_handle, null);
-
-        // Get swapchain images
-        const images = try device.getSwapchainImagesAllocKHR(swapchain_handle, alloc);
-
-        // Allocate arrays for images and image views
-        var image_views = try alloc.alloc(vk.ImageView, images.len);
-        errdefer for (image_views) |view| if (view != .null_handle) device.destroyImageView(view, null);
-        errdefer alloc.free(image_views);
-
-        // Create image views for each swapchain image
-        for (images, 0..) |image, i| {
-            image_views[i] = try device.createImageView(&.{
-                .image = image,
-                .view_type = .@"2d",
-                .format = swapchain_image_format.format,
-                .components = .{ .r = .identity, .g = .identity, .b = .identity, .a = .identity },
-                .subresource_range = .{
-                    .aspect_mask = .{ .color_bit = true },
-                    .base_mip_level = 0,
-                    .level_count = 1,
-                    .base_array_layer = 0,
-                    .layer_count = 1,
-                },
-            }, null);
-        }
-
-        return .{
-            .handle = swapchain_handle,
-            .image_format = swapchain_image_format.format,
-            .image_color_space = swapchain_image_format.color_space,
-            .images = images,
-            .image_views = image_views,
-            .extent = swapchain_extent,
-        };
     }
 };
 
