@@ -2,6 +2,165 @@
 const validation_layers = [_][:0]const u8{"VK_LAYER_KHRONOS_validation"};
 const required_device_extensions = [_][*:0]const u8{vk.extensions.khr_swapchain.name};
 
+const MaterialPass = enum(u8) {
+    main_color,
+    transparent,
+    other,
+};
+
+const MaterialPipeline = struct {
+    pipeline: vk.Pipeline,
+    layout: vk.PipelineLayout,
+};
+
+const MaterialInstance = struct {
+    pipeline: *MaterialPipeline,
+    material_set: vk.DescriptorSet,
+    pass_type: MaterialPass,
+};
+
+const GLTFMetallicRoughness = struct {
+    opaque_pipeline: MaterialPipeline,
+    transparent_pipeline: MaterialPipeline,
+
+    material_layout: vk.DescriptorSetLayout,
+
+    writer: descriptors.DescriptorWriter,
+
+    const MaterialConstants = extern struct {
+        color_factors: [4]f32,
+        metal_rough_factors: [4]f32,
+        //padding, we need it anyway for uniform buffers
+        extra: [14][4]f32,
+    };
+
+    const MaterialResources = struct {
+        color_image: AllocatedImage,
+        color_sampler: vk.Sampler,
+        metal_rough_image: AllocatedImage,
+        metal_rough_sampler: vk.Sampler,
+        data_buffer: vk.Buffer,
+        data_buffer_offset: u32,
+    };
+
+    pub fn init(
+        allocator: Allocator,
+        gpu_scene_data_descriptor_layout: vk.DescriptorSetLayout,
+        draw_image: AllocatedImage,
+        depth_image: AllocatedImage,
+        device_proxy: vk.DeviceProxy,
+        temp_alloc: Allocator,
+    ) !GLTFMetallicRoughness {
+        _ = allocator; // autofix
+        const mesh_frag_shader_data = try loadShader(shaders.mesh_frag, temp_alloc);
+        const mesh_frag_shader = try vk_init.loadShaderModule(mesh_frag_shader_data, device_proxy);
+        defer device_proxy.destroyShaderModule(mesh_frag_shader, null); // TODO: is destroy needed?
+
+        const mesh_vertex_shader_data = try loadShader(shaders.mesh_vert, temp_alloc);
+        const mesh_vertex_shader = try vk_init.loadShaderModule(mesh_vertex_shader_data, device_proxy);
+        defer device_proxy.destroyShaderModule(mesh_vertex_shader, null); // TODO: is destroy needed?
+
+        var material_layout_descriptor_bindings = [_]vk.DescriptorSetLayoutBinding{
+            descriptors.layout.createSetBinding(0, .uniform_buffer),
+            descriptors.layout.createSetBinding(1, .combined_image_sampler),
+            descriptors.layout.createSetBinding(2, .combined_image_sampler),
+        };
+        const material_layout = try descriptors.layout.createSet(&material_layout_descriptor_bindings, device_proxy, .{ .fragment_bit = true, .vertex_bit = true }, null, .{});
+
+        const layouts: []const vk.DescriptorSetLayout = &.{
+            gpu_scene_data_descriptor_layout,
+            material_layout,
+        };
+
+        const matrix_range: vk.PushConstantRange = .{
+            .offset = 0,
+            .size = @sizeOf(GPUDrawPushConstants),
+            .stage_flags = .{ .vertex_bit = true },
+        };
+
+        // const mesh_layout_info: vk.PipelineLayoutCreateInfo = vk_init.pipelineLayoutCreateInfo(); // TODO: check if any more is done inside pipelineLayoutCreateInfo
+        const mesh_layout_info: vk.PipelineLayoutCreateInfo = .{
+            .set_layout_count = @intCast(layouts.len),
+            .p_set_layouts = layouts.ptr,
+            .p_push_constant_ranges = (&matrix_range)[0..1],
+            .push_constant_range_count = 1,
+        };
+
+        const new_layout = try device_proxy.createPipelineLayout(&mesh_layout_info, null);
+
+        // build the stage-create-info for both vertex and fragment stages. This lets
+        // the pipeline know the shader modules per stage
+        var pipeline_builder: PipelineBuilder = .{};
+        try pipeline_builder.setShaders(mesh_vertex_shader, mesh_frag_shader, temp_alloc);
+        pipeline_builder.setInputTopology(.triangle_list);
+        pipeline_builder.setPolygonMode(.fill);
+        pipeline_builder.setCullMode(.{}, .clockwise);
+        pipeline_builder.setMultisamplingNone();
+        pipeline_builder.disableBlending();
+        pipeline_builder.enableDepthtest(true, .greater_or_equal);
+        //render format
+        pipeline_builder.setColorAttachmentFormat(draw_image.image_format);
+        pipeline_builder.setDepthFormat(depth_image.image_format);
+
+        // use the triangle layout we created
+        pipeline_builder.pipeline_layout = new_layout;
+
+        // finally build the pipeline
+        const opaque_pipeline: MaterialPipeline = .{
+            .pipeline = try pipeline_builder.buildPipeline(device_proxy),
+            .layout = new_layout,
+        };
+
+        // create the transparent variant
+        pipeline_builder.enableBlendingAdditive();
+        pipeline_builder.enableDepthtest(false, .greater_or_equal);
+
+        const transparent_pipeline: MaterialPipeline = .{
+            .pipeline = try pipeline_builder.buildPipeline(device_proxy),
+            .layout = new_layout,
+        };
+
+        return .{
+            .opaque_pipeline = opaque_pipeline,
+            .transparent_pipeline = transparent_pipeline,
+            .material_layout = material_layout,
+            .writer = .{},
+        };
+    }
+
+    pub fn deinit(self: *GLTFMetallicRoughness, gpa: Allocator, device: vk.DeviceProxy) void {
+        device.destroyDescriptorSetLayout(self.material_layout, null);
+        device.destroyPipelineLayout(self.transparent_pipeline.layout, null);
+        device.destroyPipeline(self.transparent_pipeline.pipeline, null);
+        device.destroyPipeline(self.opaque_pipeline.pipeline, null);
+        self.writer.deinit(gpa);
+    }
+
+    pub fn writeMaterial(
+        self: *GLTFMetallicRoughness,
+        allocator: Allocator,
+        temp_alloc: Allocator,
+        device: vk.DeviceProxy,
+        pass: MaterialPass,
+        resources: *const MaterialResources,
+        descriptor_allocator: *descriptors.DescriptorAllocatorGrowable,
+    ) !MaterialInstance {
+        const mat_data: MaterialInstance = .{
+            .pass_type = pass,
+            .pipeline = if (pass == .transparent) &self.transparent_pipeline else &self.opaque_pipeline,
+            .material_set = try descriptor_allocator.allocate(allocator, temp_alloc, device, self.material_layout, null),
+        };
+
+        self.writer.clear();
+        try self.writer.writeBuffer(allocator, 0, resources.data_buffer, @sizeOf(MaterialConstants), resources.data_buffer_offset, .uniform_buffer);
+        try self.writer.writeImage(allocator, 1, resources.color_image.image_view, resources.color_sampler, .read_only_optimal, .combined_image_sampler);
+        try self.writer.writeImage(allocator, 2, resources.metal_rough_image.image_view, resources.metal_rough_sampler, .read_only_optimal, .combined_image_sampler);
+        self.writer.updateSet(device, mat_data.material_set);
+
+        return mat_data;
+    }
+};
+
 const ShaderData = struct {
     ptr: [*]const u32,
     /// in bytes
@@ -579,7 +738,7 @@ pub const Engine = struct {
     scene_data: GPUSceneData,
     gpu_scene_data_descriptor_layout: vk.DescriptorSetLayout,
 
-    global_descriptor_allocator: DescriptorAllocator,
+    global_descriptor_allocator: descriptors.DescriptorAllocatorGrowable,
 
     background_effects: []ComputeEffect,
     active_background_effect: u32,
@@ -606,6 +765,10 @@ pub const Engine = struct {
     default_sampler_nearest: vk.Sampler,
 
     single_image_descriptor_layout: vk.DescriptorSetLayout,
+
+    // default material
+    default_data: MaterialInstance,
+    metal_rough_material: GLTFMetallicRoughness,
 
     pub fn draw(self: *Engine, allocator: Allocator) !void {
         const local = struct {
@@ -653,10 +816,7 @@ pub const Engine = struct {
 
         _ = try device.waitForFences(1, (&self.currentFrame().render_fence)[0..1], .true, 1e9);
 
-        self.currentFrame().deletion_queue.flush(.{
-            .device = device,
-            .vma_allocator = self.device_ctx.vma_allocator,
-        });
+        self.currentFrame().deletion_queue.flush(.{ .device = device, .vma_allocator = self.device_ctx.vma_allocator });
 
         try self.currentFrame().frame_descriptors.clearPools(allocator, device);
 
@@ -675,6 +835,7 @@ pub const Engine = struct {
             else => |e| return e,
         };
         const swapchain_image_index = acquire_next_image_result.image_index;
+        const current_swap_image = self.swapchain.images[swapchain_image_index];
 
         const cmd: vk.CommandBuffer = self.currentFrame().main_command_buffer;
 
@@ -701,19 +862,19 @@ pub const Engine = struct {
             //transtion the draw image and the swapchain image into their correct transfer layouts
             vk_image.transitionImage(device, cmd, self.draw_image.image, .color_attachment_optimal, .transfer_src_optimal);
 
-            vk_image.transitionImage(device, cmd, self.swapchain.images[swapchain_image_index].handle, .undefined, .transfer_dst_optimal);
+            vk_image.transitionImage(device, cmd, current_swap_image.handle, .undefined, .transfer_dst_optimal);
 
             // execute a copy from the draw image into the swapchain
-            vk_image.copyImageToImage(device, cmd, self.draw_image.image, self.swapchain.images[swapchain_image_index].handle, self.draw_extent, self.swapchain.extent);
+            vk_image.copyImageToImage(device, cmd, self.draw_image.image, current_swap_image.handle, self.draw_extent, self.swapchain.extent);
 
             // set swapchain image layout to Attachment Optimal so we can draw it
-            vk_image.transitionImage(device, cmd, self.swapchain.images[swapchain_image_index].handle, .transfer_dst_optimal, .color_attachment_optimal);
+            vk_image.transitionImage(device, cmd, current_swap_image.handle, .transfer_dst_optimal, .color_attachment_optimal);
 
             //draw imgui into the swapchain image
-            self.drawImgui(cmd, self.swapchain.images[swapchain_image_index].view);
+            self.drawImgui(cmd, current_swap_image.view);
 
             // set swapchain image layout to Present so we can show it on the screen
-            vk_image.transitionImage(device, cmd, self.swapchain.images[swapchain_image_index].handle, .color_attachment_optimal, .present_src_khr);
+            vk_image.transitionImage(device, cmd, current_swap_image.handle, .color_attachment_optimal, .present_src_khr);
         }
         //finalize the command buffer (we can no longer add commands, but it can now be executed)
         try device.endCommandBuffer(cmd);
@@ -724,7 +885,7 @@ pub const Engine = struct {
         {
             const cmd_info: vk.CommandBufferSubmitInfo = vk_init.commandBufferSubmitInfo(cmd);
             const wait_info: vk.SemaphoreSubmitInfo = vk_init.semaphoreSubmitInfo(.{ .color_attachment_output_bit = true }, self.currentFrame().swapchain_semaphore);
-            const signal_info: vk.SemaphoreSubmitInfo = vk_init.semaphoreSubmitInfo(.{ .all_graphics_bit = true }, self.swapchain.images[swapchain_image_index].render_semaphore);
+            const signal_info: vk.SemaphoreSubmitInfo = vk_init.semaphoreSubmitInfo(.{ .all_graphics_bit = true }, current_swap_image.render_semaphore);
 
             const submit_info = vk_init.submitInfo(&cmd_info, &signal_info, &wait_info);
 
@@ -736,7 +897,7 @@ pub const Engine = struct {
         const present_info: vk.PresentInfoKHR = .{
             .p_swapchains = (&self.swapchain.handle)[0..1],
             .swapchain_count = 1,
-            .p_wait_semaphores = (&self.swapchain.images[swapchain_image_index].render_semaphore)[0..1],
+            .p_wait_semaphores = (&current_swap_image.render_semaphore)[0..1],
             .wait_semaphore_count = 1,
             .p_image_indices = (&swapchain_image_index)[0..1],
         };
@@ -973,8 +1134,13 @@ pub const Engine = struct {
         //}
 
         //create a descriptor pool that will hold 10 sets with 1 image each
-        const sizes: []const DescriptorAllocator.PoolSizeRatio = &.{.{ .type = .storage_image, .ratio = 1 }};
-        const global_descriptor_allocator: DescriptorAllocator = try .initPool(temp_alloc, device_proxy, 10, sizes);
+        var sizes = [_]descriptors.DescriptorAllocatorGrowable.PoolSizeRatio{
+            .{ .type = .storage_image, .ratio = 1 },
+            .{ .type = .uniform_buffer, .ratio = 1 },
+            .{ .type = .combined_image_sampler, .ratio = 1 },
+        };
+        var global_descriptor_allocator: descriptors.DescriptorAllocatorGrowable = .empty;
+        try global_descriptor_allocator.init(allocator, temp_alloc, device_proxy, 10, &sizes);
 
         //make the descriptor set layout for our compute draw
         var image_bindings = [_]vk.DescriptorSetLayoutBinding{
@@ -982,7 +1148,7 @@ pub const Engine = struct {
         };
         const draw_image_descriptor_layout = try descriptors.layout.createSet(&image_bindings, device_proxy, .{ .compute_bit = true }, null, .{});
 
-        const draw_image_descriptors = try global_descriptor_allocator.allocate(device_proxy, draw_image_descriptor_layout);
+        const draw_image_descriptors = try global_descriptor_allocator.allocate(allocator, temp_alloc, device_proxy, draw_image_descriptor_layout, null);
 
         // {
         // const img_info: vk.DescriptorImageInfo = .{
@@ -1039,7 +1205,7 @@ pub const Engine = struct {
         try main_deletion_queue.append(allocator, .{ .descriptor_set_layout = gpu_scene_data_descriptor_layout });
 
         try main_deletion_queue.append(allocator, .{ .descriptor_set_layout = draw_image_descriptor_layout });
-        try main_deletion_queue.append(allocator, .{ .descriptor_allocator = global_descriptor_allocator });
+        // try main_deletion_queue.append(allocator, .{ .descriptor_allocator_growable = global_descriptor_allocator }); TODO
 
         // DescriptorLayoutBuilder builder;
         // builder.add_binding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
@@ -1285,6 +1451,8 @@ pub const Engine = struct {
         try main_deletion_queue.append(allocator, .{ .pipeline = mesh_pipeline });
         // }
 
+        var metal_rough_material: GLTFMetallicRoughness = try .init(allocator, gpu_scene_data_descriptor_layout, draw_allocated_image, depth_allocated_image, device_proxy, temp_alloc);
+
         // init_default_data {
         const rect_vertices: [4]Vertex = .{
             .{ .position = .{ 0.5, -0.5, 0.5 }, .color = .{ 0, 0, 0, 1 }, .uv_x = 0, .uv_y = 0, .normal = @splat(0) },
@@ -1377,6 +1545,31 @@ pub const Engine = struct {
         // });
         //}
 
+        var material_resources: GLTFMetallicRoughness.MaterialResources = .{
+            .color_image = white_image,
+            .color_sampler = default_sampler_linear,
+            .metal_rough_image = white_image,
+            .metal_rough_sampler = default_sampler_linear,
+            .data_buffer = undefined, // TODO: remove usage of undefined if possible
+            .data_buffer_offset = undefined,
+        };
+
+        //set the uniform buffer for the material data
+        const material_constants: VmaGpuBuffer = try .create(vma_allocator, @sizeOf(GLTFMetallicRoughness.MaterialConstants), .{ .uniform_buffer_bit = true }, c.VMA_MEMORY_USAGE_CPU_TO_GPU);
+
+        //write the buffer
+        const scene_uniform_data = try material_constants.map(vma_allocator, GLTFMetallicRoughness.MaterialConstants);
+        defer material_constants.unMap(vma_allocator);
+        scene_uniform_data[0].color_factors = @splat(1);
+        scene_uniform_data[0].metal_rough_factors = .{ 1, 0.5, 0, 0 };
+
+        try main_deletion_queue.append(allocator, .{ .allocated_buffer = material_constants });
+
+        material_resources.data_buffer = material_constants.buffer;
+        material_resources.data_buffer_offset = 0;
+
+        const default_data = try metal_rough_material.writeMaterial(allocator, temp_alloc, device_proxy, .main_color, &material_resources, &global_descriptor_allocator);
+
         return .{
             .vk_ctx = .{
                 .base_dispatch = base_dispatch,
@@ -1443,6 +1636,9 @@ pub const Engine = struct {
             .default_sampler_linear = default_sampler_linear,
 
             .single_image_descriptor_layout = single_image_descriptor_layout,
+
+            .metal_rough_material = metal_rough_material,
+            .default_data = default_data,
         };
     }
 
@@ -1582,10 +1778,14 @@ pub const Engine = struct {
             mesh.mesh_buffers.vertexBuffer.destroy(self.device_ctx.vma_allocator);
         }
 
+        self.metal_rough_material.deinit(allocator, device);
+
         self.main_deletion_queue.deinit(allocator, .{
             .device = device,
             .vma_allocator = self.device_ctx.vma_allocator,
         });
+
+        self.global_descriptor_allocator.deinit(allocator, device);
 
         self.swapchain.deinit(allocator, device);
 
@@ -1810,7 +2010,7 @@ const descriptors = struct {
     const DescriptorAllocatorGrowable = struct {
         // TODO: the design of this is pretty bad
         // better design: at the start set the ratio to all same
-        // once a pool is full you check wish type has filled how much as a ratio to the one that filled completely and set the ratio for the next pool accordingly
+        // once a pool is full check which type has filled how much as a ratio to the one that filled completely and set the ratio for the next pools accordingly
 
         const PoolSizeRatio = struct {
             type: vk.DescriptorType,

@@ -36,37 +36,37 @@ pub fn build(b: *std.Build) !void {
     }
 
     {
-        var generated_file: std.Io.Writer.Allocating = .init(b.allocator);
-
         const slang_dep = b.dependency("zig_slang_binaries", .{});
         const slang_path = slang_dep.namedLazyPath("binaries").path(b, "bin/slangc");
-
         const shaders_path = b.path("shaders");
 
-        const shaders_dir = try b.build_root.handle.openDir("shaders", .{ .iterate = true });
-        var it = shaders_dir.iterate();
-        while (try it.next()) |entry| {
-            switch (entry.kind) {
-                .file => if (std.mem.endsWith(u8, entry.name, ".slang")) {
-                    const command: *std.Build.Step.Run = .create(b, b.fmt("compile shader {s}", .{entry.name}));
-                    command.addFileArg(slang_path);
-                    command.addFileArg(shaders_path.path(b, entry.name));
-                    command.addArg("-o");
-                    const stem = std.fs.path.stem(entry.name);
-                    const out_path = command.addOutputFileArg(b.fmt("{s}.spv", .{stem}));
+        var shader_paths_src = b.addOptions();
 
-                    const install = b.addInstallFile(out_path, b.fmt("{s}/{s}.spv", .{ if (is_release) "release/shaders" else "shaders", stem }));
-                    b.getInstallStep().dependOn(&install.step);
+        for ([_][]const u8{
+            "circle.slang",
+            "color.slang",
+            "colored_triangle_frag.slang",
+            "colored_triangle_mesh_vert.slang",
+            "colored_triangle_vert.slang",
+            "imgui_frag.slang",
+            "mesh_frag.slang",
+            "mesh_vert.slang",
+            "tex_image_frag.slang",
+        }) |name| {
+            const command: *std.Build.Step.Run = .create(b, b.fmt("compile shader {s}", .{name}));
+            command.addFileArg(slang_path);
+            command.addFileArg(shaders_path.path(b, name));
+            command.addArg("-o");
+            const stem = std.fs.path.stem(name);
+            const out_path = command.addOutputFileArg(b.fmt("{s}.spv", .{stem}));
 
-                    try generated_file.writer.print("pub const {s} = \"{s}/{s}.spv\";\n", .{ stem, options.shaders_path, stem });
-                },
-                else => {},
-            }
+            const install = b.addInstallFile(out_path, b.fmt("{s}/{s}.spv", .{ if (is_release) "release/shaders" else "shaders", stem }));
+            b.getInstallStep().dependOn(&install.step);
+
+            shader_paths_src.addOption([]const u8, stem, b.fmt("{s}/{s}.spv", .{ options.shaders_path, stem }));
         }
 
-        const shaders_paths_mod = b.createModule(.{
-            .root_source_file = b.addWriteFiles().add("shaders.zig", generated_file.written()),
-        });
+        const shaders_paths_mod = shader_paths_src.createModule();
         root_module.addImport("shaders", shaders_paths_mod);
     }
 
