@@ -811,9 +811,8 @@ pub const Engine = struct {
                 );
             }
         };
-
         const checkpoint = scratch.checkpoint();
-        scratch.restoreCheckpoint(checkpoint);
+        defer scratch.restoreCheckpoint(checkpoint);
 
         const device = self.device_ctx.device;
 
