@@ -94,6 +94,12 @@ pub fn build(b: *std.Build) !void {
             .optimize = optimize,
         });
         root_module.addImport("gltf", gltf.module("zgltf"));
+
+        const scratch_allocator = b.dependency("scratch_allocator", .{
+            .target = target,
+            .optimize = optimize,
+        });
+        root_module.addImport("scratch_allocator", scratch_allocator.module("scratch_allocator"));
     }
 
     {

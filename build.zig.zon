@@ -39,6 +39,10 @@
             .url = "git+https://github.com/kooparse/zgltf#be1ecfc1d0972d4ff70dbf7b2791669fca8cf242",
             .hash = "zgltf-0.1.0-sX6QAiEYAgChw5-Oje5Q7wuX6dEfIfw-A1iKAE4KPz45",
         },
+        .scratch_allocator = .{
+            .url = "git+https://github.com/johan0A/zig-scratch-allocator#261f89dc7d8aaefd57ca3956dcef2cb290856363",
+            .hash = "scratch_allocator-0.0.1-dalh210fAAAtfDvpANkgj5qqDnjJQO5yad8DFjt3q3hH",
+        },
     },
     .paths = .{
         "build.zig",

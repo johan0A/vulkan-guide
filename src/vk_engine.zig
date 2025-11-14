@@ -44,19 +44,20 @@ const GLTFMetallicRoughness = struct {
     };
 
     pub fn init(
-        allocator: Allocator,
+        scratch: *Scratch,
         gpu_scene_data_descriptor_layout: vk.DescriptorSetLayout,
         draw_image: AllocatedImage,
         depth_image: AllocatedImage,
         device_proxy: vk.DeviceProxy,
-        temp_alloc: Allocator,
     ) !GLTFMetallicRoughness {
-        _ = allocator; // autofix
-        const mesh_frag_shader_data = try loadShader(shaders.mesh_frag, temp_alloc);
+        const checkpoint = scratch.checkpoint();
+        defer scratch.restoreCheckpoint(checkpoint);
+
+        const mesh_frag_shader_data = try loadShader(scratch.allocator(), shaders.mesh_frag);
         const mesh_frag_shader = try vk_init.loadShaderModule(mesh_frag_shader_data, device_proxy);
         defer device_proxy.destroyShaderModule(mesh_frag_shader, null); // TODO: is destroy needed?
 
-        const mesh_vertex_shader_data = try loadShader(shaders.mesh_vert, temp_alloc);
+        const mesh_vertex_shader_data = try loadShader(scratch.allocator(), shaders.mesh_vert);
         const mesh_vertex_shader = try vk_init.loadShaderModule(mesh_vertex_shader_data, device_proxy);
         defer device_proxy.destroyShaderModule(mesh_vertex_shader, null); // TODO: is destroy needed?
 
@@ -91,7 +92,7 @@ const GLTFMetallicRoughness = struct {
         // build the stage-create-info for both vertex and fragment stages. This lets
         // the pipeline know the shader modules per stage
         var pipeline_builder: PipelineBuilder = .{};
-        try pipeline_builder.setShaders(mesh_vertex_shader, mesh_frag_shader, temp_alloc);
+        try pipeline_builder.setShaders(scratch.allocator(), mesh_vertex_shader, mesh_frag_shader);
         pipeline_builder.setInputTopology(.triangle_list);
         pipeline_builder.setPolygonMode(.fill);
         pipeline_builder.setCullMode(.{}, .clockwise);
@@ -138,8 +139,8 @@ const GLTFMetallicRoughness = struct {
 
     pub fn writeMaterial(
         self: *GLTFMetallicRoughness,
-        allocator: Allocator,
-        temp_alloc: Allocator,
+        gpa: Allocator,
+        scratch: *Scratch,
         device: vk.DeviceProxy,
         pass: MaterialPass,
         resources: *const MaterialResources,
@@ -148,13 +149,13 @@ const GLTFMetallicRoughness = struct {
         const mat_data: MaterialInstance = .{
             .pass_type = pass,
             .pipeline = if (pass == .transparent) &self.transparent_pipeline else &self.opaque_pipeline,
-            .material_set = try descriptor_allocator.allocate(allocator, temp_alloc, device, self.material_layout, null),
+            .material_set = try descriptor_allocator.allocate(gpa, scratch, device, self.material_layout, null),
         };
 
         self.writer.clear();
-        try self.writer.writeBuffer(allocator, 0, resources.data_buffer, @sizeOf(MaterialConstants), resources.data_buffer_offset, .uniform_buffer);
-        try self.writer.writeImage(allocator, 1, resources.color_image.image_view, resources.color_sampler, .read_only_optimal, .combined_image_sampler);
-        try self.writer.writeImage(allocator, 2, resources.metal_rough_image.image_view, resources.metal_rough_sampler, .read_only_optimal, .combined_image_sampler);
+        try self.writer.writeBuffer(gpa, 0, resources.data_buffer, @sizeOf(MaterialConstants), resources.data_buffer_offset, .uniform_buffer);
+        try self.writer.writeImage(gpa, 1, resources.color_image.image_view, resources.color_sampler, .read_only_optimal, .combined_image_sampler);
+        try self.writer.writeImage(gpa, 2, resources.metal_rough_image.image_view, resources.metal_rough_sampler, .read_only_optimal, .combined_image_sampler);
         self.writer.updateSet(device, mat_data.material_set);
 
         return mat_data;
@@ -349,14 +350,14 @@ pub const PipelineBuilder = struct {
 
     pub fn setShaders(
         self: *PipelineBuilder,
+        gpa: Allocator,
         vertex_shader: vk.ShaderModule,
         fragment_shader: vk.ShaderModule,
-        alloc: Allocator,
     ) !void {
         self.shader_stages.clearRetainingCapacity();
 
-        try self.shader_stages.append(alloc, vk_init.pipelineShaderStageCreateInfo(.{ .vertex_bit = true }, vertex_shader));
-        try self.shader_stages.append(alloc, vk_init.pipelineShaderStageCreateInfo(.{ .fragment_bit = true }, fragment_shader));
+        try self.shader_stages.append(gpa, vk_init.pipelineShaderStageCreateInfo(.{ .vertex_bit = true }, vertex_shader));
+        try self.shader_stages.append(gpa, vk_init.pipelineShaderStageCreateInfo(.{ .fragment_bit = true }, fragment_shader));
     }
 
     pub fn setInputTopology(self: *PipelineBuilder, topology: vk.PrimitiveTopology) void {
@@ -456,8 +457,8 @@ pub const PipelineBuilder = struct {
         };
     }
 
-    fn deinit(self: *PipelineBuilder, alloc: Allocator) void {
-        self.shader_stages.deinit(alloc);
+    fn deinit(self: *PipelineBuilder, gpa: Allocator) void {
+        self.shader_stages.deinit(gpa);
     }
 };
 
@@ -513,13 +514,13 @@ const DeletionQueue = struct {
         self.queue.clearRetainingCapacity();
     }
 
-    pub fn deinit(self: *DeletionQueue, alloc: Allocator, context: DeinitContext) void {
+    pub fn deinit(self: *DeletionQueue, gpa: Allocator, context: DeinitContext) void {
         self.flush(context);
-        self.queue.deinit(alloc);
+        self.queue.deinit(gpa);
     }
 
-    pub fn append(self: *DeletionQueue, alloc: Allocator, item: QueueItem) !void {
-        try self.queue.append(alloc, item);
+    pub fn append(self: *DeletionQueue, gpa: Allocator, item: QueueItem) !void {
+        try self.queue.append(gpa, item);
     }
 };
 
@@ -584,7 +585,7 @@ const SwapChain = struct {
     // TODO: review this function, not convinced that this is done best
     fn init(
         gpa: std.mem.Allocator,
-        scratch: std.mem.Allocator,
+        scratch: *Scratch,
         physical_device: vk.PhysicalDevice,
         device: vk.DeviceProxy,
         window_surface: vk.SurfaceKHR,
@@ -592,7 +593,10 @@ const SwapChain = struct {
         window_height: u32,
         instance_dispatch: vk.InstanceWrapper,
     ) !SwapChain {
-        const surface_formats = try instance_dispatch.getPhysicalDeviceSurfaceFormatsAllocKHR(physical_device, window_surface, scratch);
+        const checkpoint = scratch.checkpoint();
+        defer scratch.restoreCheckpoint(checkpoint);
+
+        const surface_formats = try instance_dispatch.getPhysicalDeviceSurfaceFormatsAllocKHR(physical_device, window_surface, scratch.allocator());
 
         const swapchain_image_format = blk: {
             const preferred_format: vk.SurfaceFormatKHR = .{ .format = .b8g8r8a8_srgb, .color_space = .srgb_nonlinear_khr };
@@ -627,7 +631,7 @@ const SwapChain = struct {
         const swapchain_handle = try device.createSwapchainKHR(&swapchain_create_info, null);
         errdefer device.destroySwapchainKHR(swapchain_handle, null);
 
-        const images = try device.getSwapchainImagesAllocKHR(swapchain_handle, scratch);
+        const images = try device.getSwapchainImagesAllocKHR(swapchain_handle, scratch.allocator());
 
         const swap_images = try gpa.alloc(SwapImage, images.len);
         errdefer {
@@ -666,13 +670,13 @@ const SwapChain = struct {
         };
     }
 
-    fn deinit(self: SwapChain, alloc: Allocator, device: vk.DeviceProxy) void {
+    fn deinit(self: SwapChain, gpa: Allocator, device: vk.DeviceProxy) void {
         device.destroySwapchainKHR(self.handle, null);
         for (self.images) |image| {
             device.destroyImageView(image.view, null);
             device.destroySemaphore(image.render_semaphore, null);
         }
-        alloc.free(self.images);
+        gpa.free(self.images);
     }
 };
 
@@ -770,7 +774,7 @@ pub const Engine = struct {
     default_data: MaterialInstance,
     metal_rough_material: GLTFMetallicRoughness,
 
-    pub fn draw(self: *Engine, allocator: Allocator) !void {
+    pub fn draw(self: *Engine, gpa: Allocator, scratch: *Scratch) !void {
         const local = struct {
             fn drawBackground(engine: *Engine, cmd: vk.CommandBuffer) void {
                 // bind the gradient drawing compute pipeline
@@ -808,9 +812,8 @@ pub const Engine = struct {
             }
         };
 
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-        const temp_alloc = arena.allocator();
+        const checkpoint = scratch.checkpoint();
+        scratch.restoreCheckpoint(checkpoint);
 
         const device = self.device_ctx.device;
 
@@ -818,7 +821,7 @@ pub const Engine = struct {
 
         self.currentFrame().deletion_queue.flush(.{ .device = device, .vma_allocator = self.device_ctx.vma_allocator });
 
-        try self.currentFrame().frame_descriptors.clearPools(allocator, device);
+        try self.currentFrame().frame_descriptors.clearPools(gpa, device);
 
         _ = try device.resetFences(1, (&self.currentFrame().render_fence)[0..1]);
 
@@ -857,7 +860,7 @@ pub const Engine = struct {
 
             vk_image.transitionImage(device, cmd, self.draw_image.image, .general, .color_attachment_optimal);
             vk_image.transitionImage(device, cmd, self.depth_image.image, .undefined, .depth_attachment_optimal);
-            try self.drawGeometry(allocator, temp_alloc, cmd);
+            try self.drawGeometry(gpa, scratch, cmd);
 
             //transtion the draw image and the swapchain image into their correct transfer layouts
             vk_image.transitionImage(device, cmd, self.draw_image.image, .color_attachment_optimal, .transfer_src_optimal);
@@ -935,7 +938,7 @@ pub const Engine = struct {
         return &self.frames[self.frame_number % FrameData.FRAME_OVERLAP];
     }
 
-    pub fn init(allocator: Allocator) !Engine {
+    pub fn init(gpa: Allocator, scratch: *Scratch) !Engine {
         const tracy_init_engine = tracy.zoneEx(@src(), .{ .name = "init engine" });
         defer tracy_init_engine.end();
 
@@ -943,13 +946,9 @@ pub const Engine = struct {
         if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.engine_init_failure;
         tracy_SDL_Init.end();
 
-        var init_arena: std.heap.ArenaAllocator = .init(allocator);
+        var init_arena: std.heap.ArenaAllocator = .init(gpa);
         errdefer init_arena.deinit();
         const init_alloc = init_arena.allocator();
-
-        var temp_arena: std.heap.ArenaAllocator = .init(allocator);
-        defer temp_arena.deinit();
-        const temp_alloc = temp_arena.allocator();
 
         const window_width = 1080;
         const window_height = 1080;
@@ -962,7 +961,7 @@ pub const Engine = struct {
         const base_dispatch = vk.BaseWrapper.load(@as(vk.PfnGetInstanceProcAddr, @ptrCast(c.SDL_Vulkan_GetVkGetInstanceProcAddr())));
         tracy_load_base_dispatch.end();
 
-        const instance = try vk_init.createVkInstance(base_dispatch, temp_alloc, options.enable_validation_layers);
+        const instance = try vk_init.createVkInstance(scratch, base_dispatch, options.enable_validation_layers);
         const instance_dispatch = try init_alloc.create(vk.InstanceWrapper);
         instance_dispatch.* = vk.InstanceWrapper.load(instance, base_dispatch.dispatch.vkGetInstanceProcAddr.?);
         const instance_proxy: vk.InstanceProxy = .init(instance, instance_dispatch);
@@ -970,8 +969,8 @@ pub const Engine = struct {
         var sdl_window_surface: vk.SurfaceKHR = undefined;
         if (!c.SDL_Vulkan_CreateSurface(window, @ptrFromInt(@intFromEnum(instance)), null, @ptrCast(&sdl_window_surface))) return error.engine_init_failure;
 
-        const physical_device = try vk_init.pickPhysicalDevice(instance_proxy, sdl_window_surface, temp_alloc);
-        const queue_family_indices = try vk_init.findQueueFamilies(physical_device, instance_dispatch.*, sdl_window_surface, temp_alloc);
+        const physical_device = try vk_init.pickPhysicalDevice(scratch, instance_proxy, sdl_window_surface);
+        const queue_family_indices = try vk_init.findQueueFamilies(scratch, physical_device, instance_dispatch.*, sdl_window_surface);
 
         const device = try vk_init.createLogicalDevice(physical_device, instance_dispatch.*, queue_family_indices);
         const device_dispatch = try init_alloc.create(vk.DeviceWrapper);
@@ -1022,10 +1021,10 @@ pub const Engine = struct {
         try device_proxy.allocateCommandBuffers(&cmd_alloc_info, (&imm_command_buffer)[0..1]);
 
         var main_deletion_queue: DeletionQueue = .init;
-        try main_deletion_queue.append(allocator, .{ .command_pool = imm_command_pool });
+        try main_deletion_queue.append(gpa, .{ .command_pool = imm_command_pool });
 
         const imm_fence = try device_proxy.createFence(&fence_create_info, null);
-        try main_deletion_queue.append(allocator, .{ .fence = imm_fence });
+        try main_deletion_queue.append(gpa, .{ .fence = imm_fence });
         // }}
 
         var vma_allocator: c.VmaAllocator = undefined;
@@ -1040,9 +1039,9 @@ pub const Engine = struct {
             },
         }, &vma_allocator) != 0) return error.vma_allocator_init_failed;
 
-        try main_deletion_queue.append(allocator, .{ .vma_allocator = vma_allocator });
+        try main_deletion_queue.append(gpa, .{ .vma_allocator = vma_allocator });
 
-        errdefer main_deletion_queue.deinit(allocator, .{
+        errdefer main_deletion_queue.deinit(gpa, .{
             .device = device_proxy,
             .vma_allocator = vma_allocator,
         }); // TODO: find a way to move this next to the main_deletion_queue's init
@@ -1107,7 +1106,7 @@ pub const Engine = struct {
         };
 
         //add to deletion queues
-        try main_deletion_queue.append(allocator, .{ .vma_allocated_image = draw_allocated_image });
+        try main_deletion_queue.append(gpa, .{ .vma_allocated_image = draw_allocated_image });
 
         const depthImageUsages: vk.ImageUsageFlags = .{ .depth_stencil_attachment_bit = true };
 
@@ -1130,7 +1129,7 @@ pub const Engine = struct {
             .allocation = depth_image_allocation,
         };
 
-        try main_deletion_queue.append(allocator, .{ .vma_allocated_image = depth_allocated_image });
+        try main_deletion_queue.append(gpa, .{ .vma_allocated_image = depth_allocated_image });
         //}
 
         //create a descriptor pool that will hold 10 sets with 1 image each
@@ -1140,7 +1139,7 @@ pub const Engine = struct {
             .{ .type = .combined_image_sampler, .ratio = 1 },
         };
         var global_descriptor_allocator: descriptors.DescriptorAllocatorGrowable = .empty;
-        try global_descriptor_allocator.init(allocator, temp_alloc, device_proxy, 10, &sizes);
+        try global_descriptor_allocator.init(gpa, scratch, device_proxy, 10, &sizes);
 
         //make the descriptor set layout for our compute draw
         var image_bindings = [_]vk.DescriptorSetLayoutBinding{
@@ -1148,7 +1147,7 @@ pub const Engine = struct {
         };
         const draw_image_descriptor_layout = try descriptors.layout.createSet(&image_bindings, device_proxy, .{ .compute_bit = true }, null, .{});
 
-        const draw_image_descriptors = try global_descriptor_allocator.allocate(allocator, temp_alloc, device_proxy, draw_image_descriptor_layout, null);
+        const draw_image_descriptors = try global_descriptor_allocator.allocate(gpa, scratch, device_proxy, draw_image_descriptor_layout, null);
 
         // {
         // const img_info: vk.DescriptorImageInfo = .{
@@ -1173,8 +1172,8 @@ pub const Engine = struct {
         // device_proxy.updateDescriptorSets(1, (&draw_image_write)[0..1], 0, null);
         // TODO: above replaced with below, is abstraction good here?
         var writer: descriptors.DescriptorWriter = .{};
-        defer writer.deinit(allocator);
-        try writer.writeImage(allocator, 0, draw_allocated_image.image_view, .null_handle, .general, .storage_image);
+        defer writer.deinit(gpa);
+        try writer.writeImage(gpa, 0, draw_allocated_image.image_view, .null_handle, .general, .storage_image);
 
         writer.updateSet(device_proxy, draw_image_descriptors);
 
@@ -1187,7 +1186,7 @@ pub const Engine = struct {
             };
 
             frame.frame_descriptors = .empty;
-            try frame.frame_descriptors.init(allocator, temp_alloc, device_proxy, 1000, frame_sizes);
+            try frame.frame_descriptors.init(gpa, scratch, device_proxy, 1000, frame_sizes);
 
             // _mainDeletionQueue.push_function([&, i]() {
             //     _frames[i]._frameDescriptors.destroy_pools(_device);
@@ -1202,9 +1201,9 @@ pub const Engine = struct {
         };
         const gpu_scene_data_descriptor_layout = try descriptors.layout.createSet(&scene_data_bindings, device_proxy, .{ .vertex_bit = true, .fragment_bit = true }, null, .{});
 
-        try main_deletion_queue.append(allocator, .{ .descriptor_set_layout = gpu_scene_data_descriptor_layout });
+        try main_deletion_queue.append(gpa, .{ .descriptor_set_layout = gpu_scene_data_descriptor_layout });
 
-        try main_deletion_queue.append(allocator, .{ .descriptor_set_layout = draw_image_descriptor_layout });
+        try main_deletion_queue.append(gpa, .{ .descriptor_set_layout = draw_image_descriptor_layout });
         // try main_deletion_queue.append(allocator, .{ .descriptor_allocator_growable = global_descriptor_allocator }); TODO
 
         // DescriptorLayoutBuilder builder;
@@ -1216,7 +1215,7 @@ pub const Engine = struct {
         };
 
         const single_image_descriptor_layout = try descriptors.layout.createSet(&single_image_descriptor_bindings, device_proxy, .{ .fragment_bit = true }, null, .{});
-        try main_deletion_queue.append(allocator, .{ .descriptor_set_layout = single_image_descriptor_layout });
+        try main_deletion_queue.append(gpa, .{ .descriptor_set_layout = single_image_descriptor_layout });
 
         // }
 
@@ -1244,7 +1243,7 @@ pub const Engine = struct {
 
             const gradient_pipeline_layout = try device_proxy.createPipelineLayout(&computeLayout, null);
 
-            const shader_data = try loadShader(effect_info.path, temp_alloc);
+            const shader_data = try loadShader(scratch.allocator(), effect_info.path);
             const computeDrawShader: vk.ShaderModule = try vk_init.loadShaderModule(shader_data, device_proxy);
             defer device_proxy.destroyShaderModule(computeDrawShader, null);
 
@@ -1264,8 +1263,8 @@ pub const Engine = struct {
             var gradient_pipeline: vk.Pipeline = undefined;
             _ = try device_proxy.createComputePipelines(.null_handle, 1, (&computePipelineCreateInfo)[0..1], null, (&gradient_pipeline)[0..1]);
 
-            try main_deletion_queue.append(allocator, .{ .pipeline_layout = gradient_pipeline_layout });
-            try main_deletion_queue.append(allocator, .{ .pipeline = gradient_pipeline });
+            try main_deletion_queue.append(gpa, .{ .pipeline_layout = gradient_pipeline_layout });
+            try main_deletion_queue.append(gpa, .{ .pipeline = gradient_pipeline });
 
             background_effect.* = ComputeEffect{
                 .name = effect_info.name,
@@ -1279,8 +1278,8 @@ pub const Engine = struct {
 
         const graphics_queue = device_proxy.getDeviceQueue(queue_family_indices.graphics_family.?, 0);
         const swapchain: SwapChain = try .init(
-            allocator,
-            temp_alloc,
+            gpa,
+            scratch,
             physical_device,
             device_proxy,
             sdl_window_surface,
@@ -1342,7 +1341,7 @@ pub const Engine = struct {
 
             _ = c.cImGui_ImplSDL3_InitForVulkan(window);
 
-            const frag_shader = try loadShader(shaders.imgui_frag, temp_alloc);
+            const frag_shader = try loadShader(scratch.allocator(), shaders.imgui_frag);
 
             var init_info: c.ImGui_ImplVulkan_InitInfo = .{
                 .Instance = @ptrFromInt(@intFromEnum(instance)),
@@ -1371,14 +1370,14 @@ pub const Engine = struct {
 
             _ = c.cImGui_ImplVulkan_Init(&init_info);
 
-            try main_deletion_queue.append(allocator, .{ .descriptor_pool = imgui_pool });
-            try main_deletion_queue.append(allocator, .imgui_impl_vulkan);
+            try main_deletion_queue.append(gpa, .{ .descriptor_pool = imgui_pool });
+            try main_deletion_queue.append(gpa, .imgui_impl_vulkan);
         }
 
         // init_triangle_pipeline {
-        const triangleFragShader = try vk_init.loadShaderModule(try loadShader(shaders.colored_triangle_frag, temp_alloc), device_proxy);
+        const triangleFragShader = try vk_init.loadShaderModule(try loadShader(scratch.allocator(), shaders.colored_triangle_frag), device_proxy);
         defer device_proxy.destroyShaderModule(triangleFragShader, null);
-        const triangleVertexShader = try vk_init.loadShaderModule(try loadShader(shaders.colored_triangle_vert, temp_alloc), device_proxy);
+        const triangleVertexShader = try vk_init.loadShaderModule(try loadShader(scratch.allocator(), shaders.colored_triangle_vert), device_proxy);
         defer device_proxy.destroyShaderModule(triangleVertexShader, null);
 
         //build the pipeline layout that controls the inputs/outputs of the shader
@@ -1388,7 +1387,7 @@ pub const Engine = struct {
         const triangle_pipeline = blk: {
             var pipelineBuilder: PipelineBuilder = .{};
             pipelineBuilder.pipeline_layout = triangle_pipeline_layout;
-            try pipelineBuilder.setShaders(triangleVertexShader, triangleFragShader, temp_alloc);
+            try pipelineBuilder.setShaders(scratch.allocator(), triangleVertexShader, triangleFragShader);
             pipelineBuilder.setInputTopology(.triangle_list);
             pipelineBuilder.setPolygonMode(.fill);
             pipelineBuilder.setCullMode(.{ .back_bit = true }, .counter_clockwise);
@@ -1400,14 +1399,14 @@ pub const Engine = struct {
             break :blk try pipelineBuilder.buildPipeline(device_proxy);
         };
 
-        try main_deletion_queue.append(allocator, .{ .pipeline_layout = triangle_pipeline_layout });
-        try main_deletion_queue.append(allocator, .{ .pipeline = triangle_pipeline });
+        try main_deletion_queue.append(gpa, .{ .pipeline_layout = triangle_pipeline_layout });
+        try main_deletion_queue.append(gpa, .{ .pipeline = triangle_pipeline });
         // }
 
         // init_mesh_pipeline {
-        const meshFragShader = try vk_init.loadShaderModule(try loadShader(shaders.tex_image_frag, temp_alloc), device_proxy);
+        const meshFragShader = try vk_init.loadShaderModule(try loadShader(scratch.allocator(), shaders.tex_image_frag), device_proxy);
         defer device_proxy.destroyShaderModule(meshFragShader, null);
-        const meshVertexShader = try vk_init.loadShaderModule(try loadShader(shaders.colored_triangle_mesh_vert, temp_alloc), device_proxy);
+        const meshVertexShader = try vk_init.loadShaderModule(try loadShader(scratch.allocator(), shaders.colored_triangle_mesh_vert), device_proxy);
         defer device_proxy.destroyShaderModule(meshVertexShader, null);
 
         const bufferRange: vk.PushConstantRange = .{
@@ -1432,7 +1431,7 @@ pub const Engine = struct {
 
             pipelineBuilder.pipeline_layout = mesh_pipeline_layout;
             //connecting the vertex and pixel shaders to the pipeline
-            try pipelineBuilder.setShaders(meshVertexShader, meshFragShader, temp_alloc);
+            try pipelineBuilder.setShaders(scratch.allocator(), meshVertexShader, meshFragShader);
             //it will draw triangles
             pipelineBuilder.setInputTopology(.triangle_list);
             //filled triangles
@@ -1447,11 +1446,11 @@ pub const Engine = struct {
             pipelineBuilder.setDepthFormat(depth_allocated_image.image_format);
             break :blk try pipelineBuilder.buildPipeline(device_proxy);
         };
-        try main_deletion_queue.append(allocator, .{ .pipeline_layout = mesh_pipeline_layout });
-        try main_deletion_queue.append(allocator, .{ .pipeline = mesh_pipeline });
+        try main_deletion_queue.append(gpa, .{ .pipeline_layout = mesh_pipeline_layout });
+        try main_deletion_queue.append(gpa, .{ .pipeline = mesh_pipeline });
         // }
 
-        var metal_rough_material: GLTFMetallicRoughness = try .init(allocator, gpu_scene_data_descriptor_layout, draw_allocated_image, depth_allocated_image, device_proxy, temp_alloc);
+        var metal_rough_material: GLTFMetallicRoughness = try .init(scratch, gpu_scene_data_descriptor_layout, draw_allocated_image, depth_allocated_image, device_proxy);
 
         // init_default_data {
         const rect_vertices: [4]Vertex = .{
@@ -1475,10 +1474,10 @@ pub const Engine = struct {
 
         const rectangle = try uploadMesh(device_ctx, imm, &rect_indices, &rect_vertices);
 
-        try main_deletion_queue.append(allocator, .{ .allocated_buffer = rectangle.indexBuffer });
-        try main_deletion_queue.append(allocator, .{ .allocated_buffer = rectangle.vertexBuffer });
+        try main_deletion_queue.append(gpa, .{ .allocated_buffer = rectangle.indexBuffer });
+        try main_deletion_queue.append(gpa, .{ .allocated_buffer = rectangle.vertexBuffer });
 
-        const testMeshes = try loader.loadGltfMeshes(init_alloc, temp_alloc, device_ctx, imm, options.assets_path ++ "/basicmesh.glb");
+        const testMeshes = try loader.loadGltfMeshes(init_alloc, scratch.allocator(), device_ctx, imm, options.assets_path ++ "/basicmesh.glb");
         // }
 
         //{ default images
@@ -1486,15 +1485,15 @@ pub const Engine = struct {
 
         const white: Color = .{ .r = 255, .g = 255, .b = 255, .a = 255 };
         const white_image = try createAndUploadImage(device_ctx, imm, @ptrCast(&white), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
-        try main_deletion_queue.append(allocator, .{ .vma_allocated_image = white_image });
+        try main_deletion_queue.append(gpa, .{ .vma_allocated_image = white_image });
 
         const grey: Color = .{ .r = 168, .g = 168, .b = 168, .a = 255 };
         const grey_image = try createAndUploadImage(device_ctx, imm, @ptrCast(&grey), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
-        try main_deletion_queue.append(allocator, .{ .vma_allocated_image = grey_image });
+        try main_deletion_queue.append(gpa, .{ .vma_allocated_image = grey_image });
 
         const black: Color = .{ .r = 0, .g = 0, .b = 0, .a = 255 };
         const black_image = try createAndUploadImage(device_ctx, imm, @ptrCast(&black), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
-        try main_deletion_queue.append(allocator, .{ .vma_allocated_image = black_image });
+        try main_deletion_queue.append(gpa, .{ .vma_allocated_image = black_image });
 
         const error_checkerboard_image = blk: {
             const magenta: Color = .{ .r = 255, .g = 0, .b = 255, .a = 255 };
@@ -1506,7 +1505,7 @@ pub const Engine = struct {
             }
             break :blk try createAndUploadImage(device_ctx, imm, @ptrCast(&pixels), .{ .width = 16, .height = 16, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
         };
-        try main_deletion_queue.append(allocator, .{ .vma_allocated_image = error_checkerboard_image });
+        try main_deletion_queue.append(gpa, .{ .vma_allocated_image = error_checkerboard_image });
 
         var sampler_create_info: vk.SamplerCreateInfo = .{
             .mag_filter = .nearest,
@@ -1527,12 +1526,12 @@ pub const Engine = struct {
         };
 
         const default_sampler_nearest = try device_ctx.device.createSampler(&sampler_create_info, null);
-        try main_deletion_queue.append(allocator, .{ .sampler = default_sampler_nearest });
+        try main_deletion_queue.append(gpa, .{ .sampler = default_sampler_nearest });
 
         sampler_create_info.mag_filter = .linear;
         sampler_create_info.min_filter = .linear;
         const default_sampler_linear = try device_ctx.device.createSampler(&sampler_create_info, null);
-        try main_deletion_queue.append(allocator, .{ .sampler = default_sampler_linear });
+        try main_deletion_queue.append(gpa, .{ .sampler = default_sampler_linear });
 
         // _mainDeletionQueue.push_function([&](){
         // vkDestroySampler(_device,_defaultSamplerNearest,nullptr);
@@ -1563,12 +1562,12 @@ pub const Engine = struct {
         scene_uniform_data[0].color_factors = @splat(1);
         scene_uniform_data[0].metal_rough_factors = .{ 1, 0.5, 0, 0 };
 
-        try main_deletion_queue.append(allocator, .{ .allocated_buffer = material_constants });
+        try main_deletion_queue.append(gpa, .{ .allocated_buffer = material_constants });
 
         material_resources.data_buffer = material_constants.buffer;
         material_resources.data_buffer_offset = 0;
 
-        const default_data = try metal_rough_material.writeMaterial(allocator, temp_alloc, device_proxy, .main_color, &material_resources, &global_descriptor_allocator);
+        const default_data = try metal_rough_material.writeMaterial(gpa, scratch, device_proxy, .main_color, &material_resources, &global_descriptor_allocator);
 
         return .{
             .vk_ctx = .{
@@ -1726,11 +1725,11 @@ pub const Engine = struct {
         c.vmaDestroyImage(self.device_ctx.vma_allocator, img.image, img.allocation);
     }
 
-    pub fn resizeSwapchain(self: *Engine, alloc: Allocator) !void {
+    pub fn resizeSwapchain(self: *Engine, gpa: Allocator, scratch: *Scratch) !void {
         const device = self.device_ctx.device;
         try device.deviceWaitIdle();
 
-        self.swapchain.deinit(alloc, device);
+        self.swapchain.deinit(gpa, device);
 
         var w: i32 = undefined;
         var h: i32 = undefined;
@@ -1738,12 +1737,9 @@ pub const Engine = struct {
         self.swapchain.extent.width = @intCast(w);
         self.swapchain.extent.height = @intCast(h);
 
-        var temp_arena = std.heap.ArenaAllocator.init(alloc);
-        defer temp_arena.deinit();
-
         self.swapchain = try .init(
-            alloc,
-            temp_arena.allocator(),
+            gpa,
+            scratch,
             self.vk_ctx.chosen_gpu,
             device,
             self.vk_ctx.window_surface,
@@ -1755,7 +1751,7 @@ pub const Engine = struct {
         self.resize_requested = false;
     }
 
-    pub fn deinit(self: *Engine, allocator: Allocator) void {
+    pub fn deinit(self: *Engine, gpa: Allocator) void {
         const device = self.device_ctx.device;
         device.deviceWaitIdle() catch @panic(""); // TODO
 
@@ -1765,12 +1761,12 @@ pub const Engine = struct {
             device.destroyFence(self.frames[i].render_fence, null);
             device.destroySemaphore(self.frames[i].swapchain_semaphore, null);
 
-            self.frames[i].deletion_queue.deinit(allocator, .{
+            self.frames[i].deletion_queue.deinit(gpa, .{
                 .device = device,
                 .vma_allocator = self.device_ctx.vma_allocator,
             });
 
-            self.frames[i].frame_descriptors.deinit(allocator, device);
+            self.frames[i].frame_descriptors.deinit(gpa, device);
         }
 
         for (self.test_meshes.items) |mesh| {
@@ -1778,16 +1774,16 @@ pub const Engine = struct {
             mesh.mesh_buffers.vertexBuffer.destroy(self.device_ctx.vma_allocator);
         }
 
-        self.metal_rough_material.deinit(allocator, device);
+        self.metal_rough_material.deinit(gpa, device);
 
-        self.main_deletion_queue.deinit(allocator, .{
+        self.main_deletion_queue.deinit(gpa, .{
             .device = device,
             .vma_allocator = self.device_ctx.vma_allocator,
         });
 
-        self.global_descriptor_allocator.deinit(allocator, device);
+        self.global_descriptor_allocator.deinit(gpa, device);
 
-        self.swapchain.deinit(allocator, device);
+        self.swapchain.deinit(gpa, device);
 
         device.destroyDevice(null);
         self.vk_ctx.instance.destroySurfaceKHR(self.vk_ctx.window_surface, null);
@@ -1831,7 +1827,7 @@ pub const Engine = struct {
         device.cmdEndRendering(cmd);
     }
 
-    pub fn drawGeometry(self: *Engine, allocator: Allocator, temp_alloc: Allocator, cmd: vk.CommandBuffer) !void {
+    pub fn drawGeometry(self: *Engine, gpa: Allocator, scratch: *Scratch, cmd: vk.CommandBuffer) !void {
         //begin a render pass  connected to our draw image
         const color_attachment: vk.RenderingAttachmentInfo = vk_init.attachmentInfo(self.draw_image.image_view, null, .attachment_optimal);
         const depthAttachment: vk.RenderingAttachmentInfo = vk_init.depthAttachmentInfo(self.depth_image.image_view, .depth_attachment_optimal);
@@ -1867,11 +1863,11 @@ pub const Engine = struct {
             device.cmdBindPipeline(cmd, .graphics, self.mesh_pipeline);
 
             //bind a texture
-            const image_set: vk.DescriptorSet = try self.currentFrame().frame_descriptors.allocate(allocator, temp_alloc, device, self.single_image_descriptor_layout, null);
+            const image_set: vk.DescriptorSet = try self.currentFrame().frame_descriptors.allocate(gpa, scratch, device, self.single_image_descriptor_layout, null);
             {
                 var writer: descriptors.DescriptorWriter = .{};
-                defer writer.deinit(allocator);
-                try writer.writeImage(allocator, 0, self.error_checkerboard_image.image_view, self.default_sampler_nearest, .shader_read_only_optimal, .combined_image_sampler);
+                defer writer.deinit(gpa);
+                try writer.writeImage(gpa, 0, self.error_checkerboard_image.image_view, self.default_sampler_nearest, .shader_read_only_optimal, .combined_image_sampler);
 
                 writer.updateSet(device, image_set);
             }
@@ -1912,17 +1908,17 @@ pub const Engine = struct {
             const gpu_scene_data_buffer: VmaGpuBuffer = try .create(self.device_ctx.vma_allocator, @sizeOf(GPUSceneData), .{ .uniform_buffer_bit = true }, c.VMA_MEMORY_USAGE_CPU_TO_GPU);
 
             //add it to the deletion queue of this frame so it gets deleted once its been used
-            try self.currentFrame().deletion_queue.append(allocator, .{ .allocated_buffer = gpu_scene_data_buffer });
+            try self.currentFrame().deletion_queue.append(gpa, .{ .allocated_buffer = gpu_scene_data_buffer });
 
             const buffer = try gpu_scene_data_buffer.map(self.device_ctx.vma_allocator, GPUSceneData);
             buffer[0] = self.scene_data;
             gpu_scene_data_buffer.unMap(self.device_ctx.vma_allocator);
 
             // //create a descriptor set that binds that buffer and update it
-            const globalDescriptor: vk.DescriptorSet = try self.currentFrame().frame_descriptors.allocate(allocator, temp_alloc, device, self.gpu_scene_data_descriptor_layout, null);
+            const globalDescriptor: vk.DescriptorSet = try self.currentFrame().frame_descriptors.allocate(gpa, scratch, device, self.gpu_scene_data_descriptor_layout, null);
 
             var writer: descriptors.DescriptorWriter = .{};
-            try writer.writeBuffer(temp_alloc, 0, gpu_scene_data_buffer.buffer, @sizeOf(GPUSceneData), 0, .uniform_buffer);
+            try writer.writeBuffer(scratch.allocator(), 0, gpu_scene_data_buffer.buffer, @sizeOf(GPUSceneData), 0, .uniform_buffer);
             writer.updateSet(device, globalDescriptor);
         }
 
@@ -2031,40 +2027,40 @@ const descriptors = struct {
 
         pub fn init(
             self: *DescriptorAllocatorGrowable,
-            allocator: Allocator,
-            temp_alloc: Allocator,
+            gpa: Allocator,
+            scratch: *Scratch,
             device: vk.DeviceProxy,
             max_sets: u32,
             pool_ratios: []const PoolSizeRatio,
         ) !void {
             self.ratios.clearRetainingCapacity();
-            try self.ratios.appendSlice(allocator, pool_ratios);
+            try self.ratios.appendSlice(gpa, pool_ratios);
 
             self.setsPerPool = @intFromFloat(@as(f64, @floatFromInt(max_sets)) * 1.5); //grow it next allocation
 
-            const new_pool = try createPool(temp_alloc, device, max_sets, pool_ratios);
-            try self.readyPools.append(allocator, new_pool);
+            const new_pool = try createPool(scratch, device, max_sets, pool_ratios);
+            try self.readyPools.append(gpa, new_pool);
         }
 
         fn deinit(
             self: *DescriptorAllocatorGrowable,
-            allocator: Allocator,
+            gpa: Allocator,
             device: vk.DeviceProxy,
         ) void {
             self.destroyPools(device);
-            self.ratios.deinit(allocator);
-            self.fullPools.deinit(allocator);
-            self.readyPools.deinit(allocator);
+            self.ratios.deinit(gpa);
+            self.fullPools.deinit(gpa);
+            self.readyPools.deinit(gpa);
         }
 
-        pub fn clearPools(self: *DescriptorAllocatorGrowable, allocator: Allocator, device: vk.DeviceProxy) !void {
+        pub fn clearPools(self: *DescriptorAllocatorGrowable, gpa: Allocator, device: vk.DeviceProxy) !void {
             for (self.readyPools.items) |pool| {
                 try device.resetDescriptorPool(pool, .{});
             }
 
             for (self.fullPools.items) |pool| {
                 try device.resetDescriptorPool(pool, .{});
-                try self.readyPools.append(allocator, pool);
+                try self.readyPools.append(gpa, pool);
             }
             self.fullPools.clearRetainingCapacity();
         }
@@ -2081,9 +2077,16 @@ const descriptors = struct {
             self.fullPools.clearRetainingCapacity();
         }
 
-        pub fn allocate(self: *DescriptorAllocatorGrowable, allocator: Allocator, temp_alloc: Allocator, device: vk.DeviceProxy, layout_: vk.DescriptorSetLayout, pNext: ?*anyopaque) !vk.DescriptorSet {
+        pub fn allocate(
+            self: *DescriptorAllocatorGrowable,
+            gpa: Allocator,
+            scratch: *Scratch,
+            device: vk.DeviceProxy,
+            layout_: vk.DescriptorSetLayout,
+            pNext: ?*anyopaque,
+        ) !vk.DescriptorSet {
             //get or create a pool to allocate from
-            var poolToUse = try self.getPool(temp_alloc, device);
+            var poolToUse = try self.getPool(scratch, device);
 
             var allocInfo: vk.DescriptorSetAllocateInfo = .{
                 .p_next = pNext,
@@ -2095,9 +2098,9 @@ const descriptors = struct {
             var result: vk.DescriptorSet = undefined;
             device.allocateDescriptorSets(&allocInfo, (&result)[0..1]) catch |err| switch (err) {
                 error.OutOfPoolMemory, error.FragmentedPool => { //allocation failed. Try again
-                    try self.fullPools.append(allocator, poolToUse);
+                    try self.fullPools.append(gpa, poolToUse);
 
-                    poolToUse = try self.getPool(temp_alloc, device);
+                    poolToUse = try self.getPool(scratch, device);
                     allocInfo.descriptor_pool = poolToUse;
 
                     try device.allocateDescriptorSets(&allocInfo, (&result)[0..1]);
@@ -2105,11 +2108,11 @@ const descriptors = struct {
                 error.OutOfHostMemory, error.OutOfDeviceMemory, error.Unknown, error.ValidationFailed => |e| return e,
             };
 
-            try self.readyPools.append(allocator, poolToUse);
+            try self.readyPools.append(gpa, poolToUse);
             return result;
         }
 
-        pub fn getPool(self: *DescriptorAllocatorGrowable, temp_alloc: Allocator, device: vk.DeviceProxy) !vk.DescriptorPool {
+        pub fn getPool(self: *DescriptorAllocatorGrowable, scratch: *Scratch, device: vk.DeviceProxy) !vk.DescriptorPool {
             if (self.readyPools.items.len != 0) {
                 return self.readyPools.pop().?;
             } else {
@@ -2118,14 +2121,17 @@ const descriptors = struct {
                     self.setsPerPool = 4092;
                 }
 
-                return try createPool(temp_alloc, device, self.setsPerPool, self.ratios.items);
+                return try createPool(scratch, device, self.setsPerPool, self.ratios.items);
             }
         }
 
-        pub fn createPool(temp_alloc: Allocator, device: vk.DeviceProxy, setCount: u32, poolRatios: []const PoolSizeRatio) !vk.DescriptorPool {
+        pub fn createPool(scratch: *Scratch, device: vk.DeviceProxy, setCount: u32, poolRatios: []const PoolSizeRatio) !vk.DescriptorPool {
+            const checkpoint = scratch.checkpoint();
+            defer scratch.restoreCheckpoint(checkpoint);
+
             var poolSizes: std.ArrayListUnmanaged(vk.DescriptorPoolSize) = .empty;
             for (poolRatios) |ratio| {
-                try poolSizes.append(temp_alloc, .{ .type = ratio.type, .descriptor_count = @as(u32, @intFromFloat(ratio.ratio)) * setCount });
+                try poolSizes.append(scratch.allocator(), .{ .type = ratio.type, .descriptor_count = @as(u32, @intFromFloat(ratio.ratio)) * setCount });
             }
 
             return try device.createDescriptorPool(&.{
@@ -2177,11 +2183,11 @@ const descriptors = struct {
         bufferInfos: std.SegmentedList(vk.DescriptorBufferInfo, 128) = .{},
         writes: std.ArrayListUnmanaged(vk.WriteDescriptorSet) = .empty,
 
-        pub fn writeImage(self: *DescriptorWriter, allocator: Allocator, binding: u32, image: vk.ImageView, sampler: vk.Sampler, layout_: vk.ImageLayout, @"type": vk.DescriptorType) !void {
-            const info: *vk.DescriptorImageInfo = try self.imageInfos.addOne(allocator);
+        pub fn writeImage(self: *DescriptorWriter, gpa: Allocator, binding: u32, image: vk.ImageView, sampler: vk.Sampler, layout_: vk.ImageLayout, @"type": vk.DescriptorType) !void {
+            const info: *vk.DescriptorImageInfo = try self.imageInfos.addOne(gpa);
             info.* = .{ .sampler = sampler, .image_view = image, .image_layout = layout_ };
 
-            try self.writes.append(allocator, .{
+            try self.writes.append(gpa, .{
                 .dst_binding = binding,
                 .dst_set = .null_handle, // left empty for now until we need to write it
                 .descriptor_count = 1,
@@ -2194,11 +2200,11 @@ const descriptors = struct {
             });
         }
 
-        pub fn writeBuffer(self: *DescriptorWriter, allocator: Allocator, binding: u32, buffer: vk.Buffer, size: usize, offset: usize, @"type": vk.DescriptorType) !void {
-            const info: *vk.DescriptorBufferInfo = try self.bufferInfos.addOne(allocator);
+        pub fn writeBuffer(self: *DescriptorWriter, gpa: Allocator, binding: u32, buffer: vk.Buffer, size: usize, offset: usize, @"type": vk.DescriptorType) !void {
+            const info: *vk.DescriptorBufferInfo = try self.bufferInfos.addOne(gpa);
             info.* = .{ .buffer = buffer, .offset = offset, .range = size };
 
-            try self.writes.append(allocator, .{
+            try self.writes.append(gpa, .{
                 .dst_binding = binding,
                 .dst_set = .null_handle, // left empty for now until we need to write it
                 .descriptor_count = 1,
@@ -2217,10 +2223,10 @@ const descriptors = struct {
             self.bufferInfos.clearRetainingCapacity();
         }
 
-        pub fn deinit(self: *DescriptorWriter, allocator: Allocator) void {
-            self.imageInfos.deinit(allocator);
-            self.writes.deinit(allocator);
-            self.bufferInfos.deinit(allocator);
+        pub fn deinit(self: *DescriptorWriter, gpa: Allocator) void {
+            self.imageInfos.deinit(gpa);
+            self.writes.deinit(gpa);
+            self.bufferInfos.deinit(gpa);
         }
 
         pub fn updateSet(self: *DescriptorWriter, device: vk.DeviceProxy, set: vk.DescriptorSet) void {
@@ -2426,7 +2432,10 @@ const vk_init = struct {
         };
     }
 
-    pub fn createVkInstance(base_dispatch: vk.BaseWrapper, temp_alloc: Allocator, enable_validation_layers: bool) !vk.Instance {
+    pub fn createVkInstance(scratch: *Scratch, base_dispatch: vk.BaseWrapper, enable_validation_layers: bool) !vk.Instance {
+        const checkpoint = scratch.checkpoint();
+        defer scratch.restoreCheckpoint(checkpoint);
+
         const appinfo = vk.ApplicationInfo{
             .p_application_name = "Vulkan Tutorial",
             .application_version = @bitCast(vk.makeApiVersion(1, 0, 0, 0)),
@@ -2442,7 +2451,7 @@ const vk_init = struct {
             break :blk sdl_required_extensions_ptr[0..sdl_required_extensions_count];
         };
 
-        const available_extensions = try base_dispatch.enumerateInstanceExtensionPropertiesAlloc(null, temp_alloc);
+        const available_extensions = try base_dispatch.enumerateInstanceExtensionPropertiesAlloc(null, scratch.allocator());
         for (sdl_required_extensions) |required_ext| {
             for (available_extensions) |available_ext| {
                 if (std.mem.eql(u8, std.mem.span(required_ext), std.mem.sliceTo(&available_ext.extension_name, 0))) break;
@@ -2451,7 +2460,7 @@ const vk_init = struct {
             }
         }
 
-        if (enable_validation_layers) try checkValidationLayerSupport(temp_alloc, base_dispatch);
+        if (enable_validation_layers) try checkValidationLayerSupport(scratch, base_dispatch);
 
         const create_info = vk.InstanceCreateInfo{
             .p_application_info = &appinfo,
@@ -2464,12 +2473,11 @@ const vk_init = struct {
         return try base_dispatch.createInstance(&create_info, null);
     }
 
-    pub fn checkValidationLayerSupport(temp_alloc: Allocator, base_dispatch: vk.BaseWrapper) !void {
-        const zone = tracy.zone(@src());
-        defer zone.end();
+    pub fn checkValidationLayerSupport(scratch: *Scratch, base_dispatch: vk.BaseWrapper) !void {
+        const checkpoint = scratch.checkpoint();
+        defer scratch.restoreCheckpoint(checkpoint);
 
-        const available_layers = try base_dispatch.enumerateInstanceLayerPropertiesAlloc(temp_alloc);
-        defer temp_alloc.free(available_layers);
+        const available_layers = try base_dispatch.enumerateInstanceLayerPropertiesAlloc(scratch.allocator());
 
         for (validation_layers) |validation_layer| {
             for (available_layers) |available_layer| {
@@ -2484,18 +2492,21 @@ const vk_init = struct {
         }
     }
 
-    pub fn pickPhysicalDevice(instance: vk.InstanceProxy, surface: vk.SurfaceKHR, temp_alloc: Allocator) !vk.PhysicalDevice {
-        const physical_devices = try instance.enumeratePhysicalDevicesAlloc(temp_alloc);
+    pub fn pickPhysicalDevice(scratch: *Scratch, instance: vk.InstanceProxy, surface: vk.SurfaceKHR) !vk.PhysicalDevice {
+        const checkpoint = scratch.checkpoint();
+        defer scratch.restoreCheckpoint(checkpoint);
+
+        const physical_devices = try instance.enumeratePhysicalDevicesAlloc(scratch.allocator());
 
         if (physical_devices.len == 0) return error.NoPhysicalDeviceFound;
 
         for (physical_devices) |physical_device| {
             const is_suitable = blk: {
-                const formats = try instance.getPhysicalDeviceSurfaceFormatsAllocKHR(physical_device, surface, temp_alloc);
-                const present_modes = try instance.getPhysicalDeviceSurfacePresentModesAllocKHR(physical_device, surface, temp_alloc);
-                const graphics_family = (try findQueueFamilies(physical_device, instance.wrapper.*, surface, temp_alloc)).graphics_family;
+                const formats = try instance.getPhysicalDeviceSurfaceFormatsAllocKHR(physical_device, surface, scratch.allocator());
+                const present_modes = try instance.getPhysicalDeviceSurfacePresentModesAllocKHR(physical_device, surface, scratch.allocator());
+                const graphics_family = (try findQueueFamilies(scratch, physical_device, instance.wrapper.*, surface)).graphics_family;
                 break :blk graphics_family != null and
-                    try checkDeviceExtensionSupport(physical_device, instance.wrapper.*, temp_alloc) and
+                    try checkDeviceExtensionSupport(physical_device, instance.wrapper.*, scratch) and
                     formats.len > 0 and
                     present_modes.len > 0;
             };
@@ -2507,13 +2518,16 @@ const vk_init = struct {
     }
 
     pub fn findQueueFamilies(
+        scratch: *Scratch,
         physical_device: vk.PhysicalDevice,
         instance_dispatch: vk.InstanceWrapper,
         surface: vk.SurfaceKHR,
-        temp_alloc: Allocator,
     ) !QueueFamilyIndices {
+        const checkpoint = scratch.checkpoint();
+        defer scratch.restoreCheckpoint(checkpoint);
+
         var indices: QueueFamilyIndices = .{ .graphics_family = null, .present_family = null };
-        const queue_families = try instance_dispatch.getPhysicalDeviceQueueFamilyPropertiesAlloc(physical_device, temp_alloc);
+        const queue_families = try instance_dispatch.getPhysicalDeviceQueueFamilyPropertiesAlloc(physical_device, scratch.allocator());
 
         // TODO: prefer queue that supports both graphics and KHR
         for (queue_families, 0..) |queue_familie, i| {
@@ -2536,11 +2550,12 @@ const vk_init = struct {
     pub fn checkDeviceExtensionSupport(
         physical_device: vk.PhysicalDevice,
         instance_dispatch: vk.InstanceWrapper,
-        temp_alloc: Allocator,
+        scratch: *Scratch,
     ) !bool {
-        const zone = tracy.zone(@src());
-        defer zone.end();
-        const available_extensions = try instance_dispatch.enumerateDeviceExtensionPropertiesAlloc(physical_device, null, temp_alloc);
+        const checkpoint = scratch.checkpoint();
+        defer scratch.restoreCheckpoint(checkpoint);
+
+        const available_extensions = try instance_dispatch.enumerateDeviceExtensionPropertiesAlloc(physical_device, null, scratch.allocator());
 
         for (required_device_extensions) |required_device_extension| {
             for (available_extensions) |available_extension| {
@@ -2595,9 +2610,9 @@ const vk_init = struct {
     }
 };
 
-fn loadShader(file_path: []const u8, allocator: Allocator) !ShaderData {
+fn loadShader(gpa: Allocator, file_path: []const u8) !ShaderData {
     std.log.info("loading {s} shader", .{std.fs.path.basename(file_path)});
-    const data = try std.fs.cwd().readFileAllocOptions(allocator, file_path, 1e6, null, .of(u32), null);
+    const data = try std.fs.cwd().readFileAllocOptions(gpa, file_path, 1e6, null, .of(u32), null);
     return .{ .ptr = @ptrCast(data.ptr), .size = data.len };
 }
 
@@ -2654,3 +2669,4 @@ const zla = @import("zla");
 const vec = zla.vec;
 const Mat4 = zla.Mat(f32, 4, 4);
 const options = @import("options");
+const Scratch = @import("scratch_allocator");

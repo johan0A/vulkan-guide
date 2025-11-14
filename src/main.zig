@@ -4,7 +4,10 @@ pub fn main() !void {
     var tracy_allocator = tracy.TracyAllocator.init(debug_allocator.allocator(), "main gpa");
     const allocator = tracy_allocator.allocator();
 
-    var engine = try VulkanEngine.init(allocator);
+    var scratch: Scratch = try .init(allocator);
+    defer scratch.deinit();
+
+    var engine = try VulkanEngine.init(allocator, &scratch);
     defer engine.deinit(allocator);
 
     var stop_rendering: bool = false;
@@ -27,10 +30,10 @@ pub fn main() !void {
             continue;
         }
 
-        try engine.draw(allocator);
+        try engine.draw(allocator, &scratch);
 
         if (engine.resize_requested) {
-            try engine.resizeSwapchain(allocator);
+            try engine.resizeSwapchain(allocator, &scratch);
         }
     }
 }
@@ -38,4 +41,5 @@ pub fn main() !void {
 const std = @import("std");
 const tracy = @import("tracy");
 const VulkanEngine = @import("vk_engine.zig").Engine;
+const Scratch = @import("scratch_allocator");
 const c = @import("c");
