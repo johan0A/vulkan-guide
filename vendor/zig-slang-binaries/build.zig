@@ -19,7 +19,6 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    if (b.lazyDependency(dep_name, .{})) |dep| {
-        b.addNamedLazyPath("binaries", dep.path(""));
-    }
+    const dep = b.dependency(dep_name, .{});
+    b.addNamedLazyPath("binaries", dep.path(""));
 }

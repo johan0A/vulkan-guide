@@ -37,7 +37,10 @@ pub fn build(b: *std.Build) !void {
 
     {
         const slang_dep = b.dependency("zig_slang_binaries", .{});
-        const slang_path = slang_dep.namedLazyPath("binaries").path(b, "bin/slangc");
+        const slang_path = switch (b.graph.host.result.os.tag) {
+            .windows => slang_dep.namedLazyPath("binaries").path(b, "bin/slangc.exe"),
+            else => slang_dep.namedLazyPath("binaries").path(b, "bin/slangc"),
+        };
         const shaders_path = b.path("shaders");
 
         var shader_paths_src = b.addOptions();
@@ -79,7 +82,7 @@ pub fn build(b: *std.Build) !void {
         root_module.addImport("vulkan", vulkan.module("vulkan-zig"));
 
         const tracy = b.dependency("tracy", .{
-            .enable_tracing = b.option(bool, "enable_tracing", "Enable Tracy profile markers") orelse false,
+            .enable_tracy = b.option(bool, "enable_tracy", "Enable Tracy profile markers") orelse false,
         });
         root_module.addImport("tracy", tracy.module("tracy"));
 
@@ -110,12 +113,14 @@ pub fn build(b: *std.Build) !void {
         });
         root_module.linkLibrary(sdl_dep.artifact("SDL3"));
 
+        const vulkan_include_path = vulkan_headers_dep.path("include");
+
         const vma_dep = b.dependency("VulkanMemoryAllocator", .{
             .target = target,
             .optimize = optimize,
-            .macro_static_vulkan_functions = false,
-            .macro_dynamic_vulkan_functions = true,
-            .@"install-vulkan-headers" = true,
+            .@"vulkan-include-path" = vulkan_include_path,
+            .VMA_DYNAMIC_VULKAN_FUNCTIONS = true,
+            .VMA_STATIC_VULKAN_FUNCTIONS = false,
         });
         root_module.linkLibrary(vma_dep.artifact("VulkanMemoryAllocator"));
 
@@ -126,7 +131,7 @@ pub fn build(b: *std.Build) !void {
             .docking = true,
             .backends = &[_]ImguiBackend{ .imgui_impl_sdl3, .imgui_impl_vulkan },
             .@"include-path-list" = &[_]std.Build.LazyPath{
-                vulkan_headers_dep.path("include"),
+                vulkan_include_path,
                 sdl_dep.artifact("SDL3").getEmittedIncludeTree(),
             },
             .imconfig = b.addWriteFiles().add("imconfig.h",
@@ -140,6 +145,7 @@ pub fn build(b: *std.Build) !void {
             .root_source_file = b.addWriteFiles().add("stub.h",
                 \\#include <SDL3/SDL.h>
                 \\#include <SDL3/SDL_vulkan.h>
+                \\#include <vk_mem_alloc_config.h>
                 \\#include <vk_mem_alloc.h>
                 \\#include <dcimgui.h>
                 \\#include <dcimgui_impl_sdl3.h>
@@ -148,6 +154,7 @@ pub fn build(b: *std.Build) !void {
             .target = target,
             .optimize = optimize,
         });
+        c_translate.addIncludePath(vulkan_include_path);
         c_translate.addIncludePath(sdl_dep.artifact("SDL3").getEmittedIncludeTree());
         c_translate.addIncludePath(vma_dep.artifact("VulkanMemoryAllocator").getEmittedIncludeTree());
         c_translate.addIncludePath(dcimgui_dep.artifact("dcimgui").getEmittedIncludeTree());

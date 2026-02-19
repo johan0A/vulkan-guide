@@ -1,14 +1,12 @@
-pub fn main() !void {
-    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = debug_allocator.deinit();
-    var tracy_allocator = tracy.TracyAllocator.init(debug_allocator.allocator(), "main gpa");
-    const allocator = tracy_allocator.allocator();
+pub fn main(init: std.process.Init) !void {
+    var tracy_allocator = tracy.TracyAllocator.init(init.gpa, "main gpa");
+    const gpa = tracy_allocator.allocator();
 
-    var scratch: Scratch = try .init(allocator);
+    var scratch: Scratch = try .init(gpa);
     defer scratch.deinit();
 
-    var engine = try VulkanEngine.init(allocator, &scratch);
-    defer engine.deinit(allocator);
+    var engine = try VulkanEngine.init(gpa, &scratch, init.io);
+    defer engine.deinit(gpa);
 
     var stop_rendering: bool = false;
     var event: c.SDL_Event = undefined;
@@ -26,14 +24,14 @@ pub fn main() !void {
         }
 
         if (stop_rendering) {
-            std.Thread.sleep(std.time.ns_per_ms * 100);
+            try init.io.sleep(.fromMilliseconds(100), .awake);
             continue;
         }
 
-        try engine.draw(allocator, &scratch);
+        try engine.draw(gpa, &scratch);
 
         if (engine.resize_requested) {
-            try engine.resizeSwapchain(allocator, &scratch);
+            try engine.resizeSwapchain(gpa, &scratch);
         }
     }
 }

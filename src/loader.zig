@@ -13,17 +13,19 @@ pub const MeshAsset = struct {
 pub fn loadGltfMeshes(
     arena: std.mem.Allocator,
     temp: std.mem.Allocator,
+    io: std.Io,
     device_ctx: vk_engine.Engine.DeviceContext,
     imm: vk_engine.Engine.ImmSubmit,
     filePath: []const u8,
 ) !std.ArrayListUnmanaged(MeshAsset) {
     std.log.info("Loading GLTF {s}", .{filePath});
 
-    const file = try std.fs.cwd().openFile(filePath, .{});
+    const file = try std.Io.Dir.cwd().openFile(io, filePath, .{});
+    var file_reader = file.reader(io, &.{});
 
     var gltf: Gltf = .init(temp);
     defer gltf.deinit();
-    try gltf.parse(try file.readToEndAllocOptions(temp, 1e9, null, .@"4", null));
+    try gltf.parse(try file_reader.interface.allocRemainingAlignedSentinel(temp, .unlimited, .@"4", null));
 
     var meshes: std.ArrayListUnmanaged(MeshAsset) = .empty;
 

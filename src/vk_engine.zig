@@ -45,6 +45,7 @@ const GLTFMetallicRoughness = struct {
 
     pub fn init(
         scratch: *Scratch,
+        io: std.Io,
         gpu_scene_data_descriptor_layout: vk.DescriptorSetLayout,
         draw_image: AllocatedImage,
         depth_image: AllocatedImage,
@@ -53,11 +54,11 @@ const GLTFMetallicRoughness = struct {
         const checkpoint = scratch.checkpoint();
         defer scratch.restoreCheckpoint(checkpoint);
 
-        const mesh_frag_shader_data = try loadShader(scratch.allocator(), shaders.mesh_frag);
+        const mesh_frag_shader_data = try loadShader(scratch.allocator(), io, shaders.mesh_frag);
         const mesh_frag_shader = try vk_init.loadShaderModule(mesh_frag_shader_data, device_proxy);
         defer device_proxy.destroyShaderModule(mesh_frag_shader, null); // TODO: is destroy needed?
 
-        const mesh_vertex_shader_data = try loadShader(scratch.allocator(), shaders.mesh_vert);
+        const mesh_vertex_shader_data = try loadShader(scratch.allocator(), io, shaders.mesh_vert);
         const mesh_vertex_shader = try vk_init.loadShaderModule(mesh_vertex_shader_data, device_proxy);
         defer device_proxy.destroyShaderModule(mesh_vertex_shader, null); // TODO: is destroy needed?
 
@@ -937,7 +938,7 @@ pub const Engine = struct {
         return &self.frames[self.frame_number % FrameData.FRAME_OVERLAP];
     }
 
-    pub fn init(gpa: Allocator, scratch: *Scratch) !Engine {
+    pub fn init(gpa: Allocator, scratch: *Scratch, io: std.Io) !Engine {
         const tracy_init_engine = tracy.zoneEx(@src(), .{ .name = "init engine" });
         defer tracy_init_engine.end();
 
@@ -1242,7 +1243,7 @@ pub const Engine = struct {
 
             const gradient_pipeline_layout = try device_proxy.createPipelineLayout(&computeLayout, null);
 
-            const shader_data = try loadShader(scratch.allocator(), effect_info.path);
+            const shader_data = try loadShader(scratch.allocator(), io, effect_info.path);
             const computeDrawShader: vk.ShaderModule = try vk_init.loadShaderModule(shader_data, device_proxy);
             defer device_proxy.destroyShaderModule(computeDrawShader, null);
 
@@ -1334,13 +1335,13 @@ pub const Engine = struct {
 
             // 2: initialize imgui library
             _ = c.ImGui_CreateContext(null);
-            const io: *c.ImGuiIO = c.ImGui_GetIO();
-            io.ConfigFlags |= c.ImGuiConfigFlags_NavEnableKeyboard; // Enable Keyboard Controls
-            io.ConfigFlags |= c.ImGuiConfigFlags_NavEnableGamepad; // Enable Gamepad Controls
+            const imgui_io: *c.ImGuiIO = c.ImGui_GetIO();
+            imgui_io.ConfigFlags |= c.ImGuiConfigFlags_NavEnableKeyboard; // Enable Keyboard Controls
+            imgui_io.ConfigFlags |= c.ImGuiConfigFlags_NavEnableGamepad; // Enable Gamepad Controls
 
             _ = c.cImGui_ImplSDL3_InitForVulkan(window);
 
-            const frag_shader = try loadShader(scratch.allocator(), shaders.imgui_frag);
+            const frag_shader = try loadShader(scratch.allocator(), io, shaders.imgui_frag);
 
             var init_info: c.ImGui_ImplVulkan_InitInfo = .{
                 .Instance = @ptrFromInt(@intFromEnum(instance)),
@@ -1374,9 +1375,9 @@ pub const Engine = struct {
         }
 
         // init_triangle_pipeline {
-        const triangleFragShader = try vk_init.loadShaderModule(try loadShader(scratch.allocator(), shaders.colored_triangle_frag), device_proxy);
+        const triangleFragShader = try vk_init.loadShaderModule(try loadShader(scratch.allocator(), io, shaders.colored_triangle_frag), device_proxy);
         defer device_proxy.destroyShaderModule(triangleFragShader, null);
-        const triangleVertexShader = try vk_init.loadShaderModule(try loadShader(scratch.allocator(), shaders.colored_triangle_vert), device_proxy);
+        const triangleVertexShader = try vk_init.loadShaderModule(try loadShader(scratch.allocator(), io, shaders.colored_triangle_vert), device_proxy);
         defer device_proxy.destroyShaderModule(triangleVertexShader, null);
 
         //build the pipeline layout that controls the inputs/outputs of the shader
@@ -1403,9 +1404,9 @@ pub const Engine = struct {
         // }
 
         // init_mesh_pipeline {
-        const meshFragShader = try vk_init.loadShaderModule(try loadShader(scratch.allocator(), shaders.tex_image_frag), device_proxy);
+        const meshFragShader = try vk_init.loadShaderModule(try loadShader(scratch.allocator(), io, shaders.tex_image_frag), device_proxy);
         defer device_proxy.destroyShaderModule(meshFragShader, null);
-        const meshVertexShader = try vk_init.loadShaderModule(try loadShader(scratch.allocator(), shaders.colored_triangle_mesh_vert), device_proxy);
+        const meshVertexShader = try vk_init.loadShaderModule(try loadShader(scratch.allocator(), io, shaders.colored_triangle_mesh_vert), device_proxy);
         defer device_proxy.destroyShaderModule(meshVertexShader, null);
 
         const bufferRange: vk.PushConstantRange = .{
@@ -1449,7 +1450,7 @@ pub const Engine = struct {
         try main_deletion_queue.append(gpa, .{ .pipeline = mesh_pipeline });
         // }
 
-        var metal_rough_material: GLTFMetallicRoughness = try .init(scratch, gpu_scene_data_descriptor_layout, draw_allocated_image, depth_allocated_image, device_proxy);
+        var metal_rough_material: GLTFMetallicRoughness = try .init(scratch, io, gpu_scene_data_descriptor_layout, draw_allocated_image, depth_allocated_image, device_proxy);
 
         // init_default_data {
         const rect_vertices: [4]Vertex = .{
@@ -1476,7 +1477,7 @@ pub const Engine = struct {
         try main_deletion_queue.append(gpa, .{ .allocated_buffer = rectangle.indexBuffer });
         try main_deletion_queue.append(gpa, .{ .allocated_buffer = rectangle.vertexBuffer });
 
-        const testMeshes = try loader.loadGltfMeshes(init_alloc, scratch.allocator(), device_ctx, imm, options.assets_path ++ "/basicmesh.glb");
+        const testMeshes = try loader.loadGltfMeshes(init_alloc, scratch.allocator(), io, device_ctx, imm, options.assets_path ++ "/basicmesh.glb");
         // }
 
         //{ default images
@@ -2178,8 +2179,8 @@ const descriptors = struct {
     };
 
     const DescriptorWriter = struct {
-        imageInfos: std.SegmentedList(vk.DescriptorImageInfo, 128) = .{},
-        bufferInfos: std.SegmentedList(vk.DescriptorBufferInfo, 128) = .{},
+        imageInfos: SegmentedList(vk.DescriptorImageInfo) = .empty,
+        bufferInfos: SegmentedList(vk.DescriptorBufferInfo) = .empty,
         writes: std.ArrayListUnmanaged(vk.WriteDescriptorSet) = .empty,
 
         pub fn writeImage(self: *DescriptorWriter, gpa: Allocator, binding: u32, image: vk.ImageView, sampler: vk.Sampler, layout_: vk.ImageLayout, @"type": vk.DescriptorType) !void {
@@ -2609,9 +2610,9 @@ const vk_init = struct {
     }
 };
 
-fn loadShader(gpa: Allocator, file_path: []const u8) !ShaderData {
+fn loadShader(gpa: Allocator, io: std.Io, file_path: []const u8) !ShaderData {
     std.log.info("loading {s} shader", .{std.fs.path.basename(file_path)});
-    const data = try std.fs.cwd().readFileAllocOptions(gpa, file_path, 1e6, null, .of(u32), null);
+    const data = try std.Io.Dir.cwd().readFileAllocOptions(io, file_path, gpa, .unlimited, .of(u32), null);
     return .{ .ptr = @ptrCast(data.ptr), .size = data.len };
 }
 
@@ -2669,3 +2670,4 @@ const vec = zla.vec;
 const Mat4 = zla.Mat(f32, 4, 4);
 const options = @import("options");
 const Scratch = @import("scratch_allocator");
+const SegmentedList = @import("segmented_list.zig").SegmentedList;
