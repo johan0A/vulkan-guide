@@ -1,21 +1,27 @@
+pub const GltfMaterial = struct {
+    data: engine.MaterialInstance,
+};
+
 pub const GeoSurface = struct {
     start_index: u32,
     count: u32,
+
+    material: ?*GltfMaterial,
 };
 
 pub const MeshAsset = struct {
     name: []const u8,
 
     surfaces: std.ArrayListUnmanaged(GeoSurface),
-    mesh_buffers: vk_engine.GPUMeshBuffers,
+    mesh_buffers: engine.GPUMeshBuffers,
 };
 
 pub fn loadGltfMeshes(
     arena: std.mem.Allocator,
     temp: std.mem.Allocator,
     io: std.Io,
-    device_ctx: vk_engine.Engine.DeviceContext,
-    imm: vk_engine.Engine.ImmSubmit,
+    device_ctx: engine.Engine.DeviceContext,
+    imm: engine.Engine.ImmSubmit,
     filePath: []const u8,
 ) !std.ArrayListUnmanaged(MeshAsset) {
     std.log.info("Loading GLTF {s}", .{filePath});
@@ -30,7 +36,7 @@ pub fn loadGltfMeshes(
     var meshes: std.ArrayListUnmanaged(MeshAsset) = .empty;
 
     var indices: std.ArrayListUnmanaged(u32) = .empty;
-    var vertices: std.ArrayListUnmanaged(vk_engine.Vertex) = .empty;
+    var vertices: std.ArrayListUnmanaged(engine.Vertex) = .empty;
 
     for (gltf.data.meshes) |mesh| {
         defer indices.clearRetainingCapacity();
@@ -44,6 +50,7 @@ pub fn loadGltfMeshes(
             const new_surface: GeoSurface = .{
                 .start_index = @intCast(indices.items.len),
                 .count = @intCast(vertex_indices.count),
+                .material = null,
             };
             try surfaces.append(arena, new_surface);
 
@@ -107,16 +114,16 @@ pub fn loadGltfMeshes(
             }
         }
 
-        // display the vertex normals TODO: remove
-        const OverrideColors = true;
-        if (OverrideColors) for (vertices.items) |*vtx| {
-            vtx.color = .{ vtx.normal[0], vtx.normal[1], vtx.normal[2], 1 };
-        };
+        // // display the vertex normals TODO: remove
+        // const OverrideColors = true;
+        // if (OverrideColors) for (vertices.items) |*vtx| {
+        //     vtx.color = .{ vtx.normal[0], vtx.normal[1], vtx.normal[2], 1 };
+        // };
 
         try meshes.append(arena, .{
             .name = try arena.dupe(u8, mesh.name.?),
             .surfaces = surfaces,
-            .mesh_buffers = try vk_engine.Engine.uploadMesh(device_ctx, imm, indices.items, vertices.items),
+            .mesh_buffers = try engine.Engine.uploadMesh(device_ctx, imm, indices.items, vertices.items),
         });
     }
     return meshes;
@@ -124,5 +131,5 @@ pub fn loadGltfMeshes(
 
 const std = @import("std");
 const Gltf = @import("gltf").Gltf;
-const vk_engine = @import("vk_engine.zig");
+const engine = @import("vk_engine.zig");
 const assert = std.debug.assert;

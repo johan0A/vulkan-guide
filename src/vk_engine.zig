@@ -2,6 +2,59 @@
 const validation_layers = [_][:0]const u8{"VK_LAYER_KHRONOS_validation"};
 const required_device_extensions = [_][*:0]const u8{vk.extensions.khr_swapchain.name};
 
+const Scene = struct {
+    const RenderObject = struct {
+        index_count: u32,
+        first_index: u32,
+        index_buffer: vk.Buffer,
+
+        material: ?*MaterialInstance,
+
+        transform: Mat4,
+        vertex_buffer_address: vk.DeviceAddress,
+    };
+
+    const DrawContext = struct {
+        opaque_surfaces: std.ArrayList(RenderObject),
+    };
+
+    const Node = struct {
+        parent: ?*Node,
+        children: std.ArrayList(Node),
+
+        local_transform: Mat4,
+        world_transform: Mat4,
+
+        mesh: ?loader.MeshAsset,
+
+        fn refreshTransform(self: *Node, parent_matrix: Mat4) void {
+            self.world_transform = parent_matrix.mul(self.local_transform);
+            for (self.children.items) |child| child.refreshTransform(self.world_transform);
+        }
+
+        fn draw(self: Node, gpa: Allocator, top_matrix: Mat4, ctx: *DrawContext) !void {
+            if (self.mesh) |mesh| {
+                const node_matrix = top_matrix.mul(self.world_transform);
+
+                for (mesh.surfaces.items) |surface| {
+                    const def: RenderObject = .{
+                        .index_count = surface.count,
+                        .first_index = surface.start_index,
+                        .index_buffer = mesh.mesh_buffers.index_buffer.buffer,
+                        .material = if (surface.material) |material| &material.data else null,
+
+                        .transform = node_matrix,
+                        .vertex_buffer_address = mesh.mesh_buffers.vertex_buffer_address,
+                    };
+                    try ctx.opaque_surfaces.append(gpa, def);
+                }
+            }
+
+            for (self.children.items) |child| try child.draw(gpa, top_matrix, ctx);
+        }
+    };
+};
+
 const MaterialPass = enum(u8) {
     main_color,
     transparent,
@@ -13,7 +66,7 @@ const MaterialPipeline = struct {
     layout: vk.PipelineLayout,
 };
 
-const MaterialInstance = struct {
+pub const MaterialInstance = struct {
     pipeline: *MaterialPipeline,
     material_set: vk.DescriptorSet,
     pass_type: MaterialPass,
@@ -253,9 +306,9 @@ pub const GPUSceneData = extern struct {
 
 // holds the resources needed for a mesh
 pub const GPUMeshBuffers = struct {
-    indexBuffer: VmaGpuBuffer,
-    vertexBuffer: VmaGpuBuffer,
-    vertexBufferAddress: vk.DeviceAddress,
+    index_buffer: VmaGpuBuffer,
+    vertex_buffer: VmaGpuBuffer,
+    vertex_buffer_address: vk.DeviceAddress,
 };
 
 // push constants for our mesh object draws
@@ -756,8 +809,6 @@ pub const Engine = struct {
     mesh_pipeline_layout: vk.PipelineLayout,
     mesh_pipeline: vk.Pipeline,
 
-    rectangle: GPUMeshBuffers,
-
     test_meshes: std.ArrayListUnmanaged(loader.MeshAsset),
 
     // default images
@@ -775,7 +826,12 @@ pub const Engine = struct {
     default_data: MaterialInstance,
     metal_rough_material: GLTFMetallicRoughness,
 
+    main_draw_context: Scene.DrawContext,
+    loaded_nodes: std.StringHashMapUnmanaged(*Scene.Node),
+
     pub fn draw(self: *Engine, gpa: Allocator, scratch: *Scratch) !void {
+        try self.updateScene(gpa);
+
         const local = struct {
             fn drawBackground(engine: *Engine, cmd: vk.CommandBuffer) void {
                 // bind the gradient drawing compute pipeline
@@ -1474,11 +1530,10 @@ pub const Engine = struct {
 
         const rectangle = try uploadMesh(device_ctx, imm, &rect_indices, &rect_vertices);
 
-        try main_deletion_queue.append(gpa, .{ .allocated_buffer = rectangle.indexBuffer });
-        try main_deletion_queue.append(gpa, .{ .allocated_buffer = rectangle.vertexBuffer });
+        try main_deletion_queue.append(gpa, .{ .allocated_buffer = rectangle.index_buffer });
+        try main_deletion_queue.append(gpa, .{ .allocated_buffer = rectangle.vertex_buffer });
 
         const testMeshes = try loader.loadGltfMeshes(init_alloc, scratch.allocator(), io, device_ctx, imm, options.assets_path ++ "/basicmesh.glb");
-        // }
 
         //{ default images
         const Color = packed struct(u32) { r: u8, g: u8, b: u8, a: u8 };
@@ -1542,7 +1597,6 @@ pub const Engine = struct {
         // destroy_image(_blackImage);
         // destroy_image(_errorCheckerboardImage);
         // });
-        //}
 
         var material_resources: GLTFMetallicRoughness.MaterialResources = .{
             .color_image = white_image,
@@ -1568,6 +1622,35 @@ pub const Engine = struct {
         material_resources.data_buffer_offset = 0;
 
         const default_data = try metal_rough_material.writeMaterial(gpa, scratch, device_proxy, .main_color, &material_resources, &global_descriptor_allocator);
+
+        //}
+
+        var loaded_nodes: std.StringHashMapUnmanaged(*Scene.Node) = .empty;
+
+        for (testMeshes.items) |mesh| {
+            const new_node = try init_alloc.create(Scene.Node);
+
+            new_node.* = .{
+                .children = .empty,
+                .parent = null,
+                .local_transform = .identity,
+                .world_transform = .identity,
+                .mesh = mesh,
+            };
+
+            const default_gltf_material = try init_alloc.create(loader.GltfMaterial);
+            default_gltf_material.* = .{ .data = default_data };
+
+            for (new_node.mesh.?.surfaces.items) |*surface| {
+                surface.material = default_gltf_material;
+            }
+
+            try loaded_nodes.put(gpa, mesh.name, new_node);
+
+            // loadedNodes[mesh.name] = std::move(newNode);
+        }
+
+        // }
 
         return .{
             .vk_ctx = .{
@@ -1622,8 +1705,6 @@ pub const Engine = struct {
             .mesh_pipeline_layout = mesh_pipeline_layout,
             .mesh_pipeline = mesh_pipeline,
 
-            .rectangle = rectangle,
-
             .test_meshes = testMeshes,
 
             .white_image = white_image,
@@ -1638,6 +1719,11 @@ pub const Engine = struct {
 
             .metal_rough_material = metal_rough_material,
             .default_data = default_data,
+
+            .main_draw_context = .{
+                .opaque_surfaces = .empty,
+            },
+            .loaded_nodes = loaded_nodes,
         };
     }
 
@@ -1770,9 +1856,11 @@ pub const Engine = struct {
         }
 
         for (self.test_meshes.items) |mesh| {
-            mesh.mesh_buffers.indexBuffer.destroy(self.device_ctx.vma_allocator);
-            mesh.mesh_buffers.vertexBuffer.destroy(self.device_ctx.vma_allocator);
+            mesh.mesh_buffers.index_buffer.destroy(self.device_ctx.vma_allocator);
+            mesh.mesh_buffers.vertex_buffer.destroy(self.device_ctx.vma_allocator);
         }
+
+        self.loaded_nodes.deinit(gpa);
 
         self.metal_rough_material.deinit(gpa, device);
 
@@ -1782,6 +1870,7 @@ pub const Engine = struct {
         });
 
         self.global_descriptor_allocator.deinit(gpa, device);
+        self.main_draw_context.opaque_surfaces.deinit(gpa);
 
         self.swapchain.deinit(gpa, device);
 
@@ -1827,8 +1916,39 @@ pub const Engine = struct {
         device.cmdEndRendering(cmd);
     }
 
+    pub fn updateScene(self: *Engine, gpa: Allocator) !void {
+        self.main_draw_context.opaque_surfaces.clearRetainingCapacity();
+
+        for (0..3) |x| {
+            const scale: Mat4 = .scale(.identity, @splat(0.2));
+            const translation: Mat4 = .translate(.identity, .{ @floatFromInt(x), 1, 0 });
+
+            try self.loaded_nodes.get("Cube").?.draw(gpa, translation.mul(scale), &self.main_draw_context);
+        }
+
+        try self.loaded_nodes.get("Suzanne").?.draw(gpa, .identity, &self.main_draw_context);
+
+        self.scene_data.view = .translate(.identity, .{ 0, 0, -5 });
+        // camera projection
+        self.scene_data.proj = .perspectiveReverseZ(
+            zla.toRadians(f32, 70),
+            @as(f32, @floatFromInt(self.swapchain.extent.width)) / @as(f32, @floatFromInt(self.swapchain.extent.height)),
+            0.1,
+        );
+
+        // invert the Y direction on projection matrix so that we are more similar
+        // to opengl and gltf axis
+        self.scene_data.proj.items[1][1] *= -1;
+        self.scene_data.viewproj = self.scene_data.proj.mul(self.scene_data.view);
+
+        //some default lighting parameters
+        self.scene_data.ambientColor = @splat(0.1);
+        self.scene_data.sunlightColor = @splat(1);
+        self.scene_data.sunlightDirection = .{ 0, 1, 0.5, 1 };
+    }
+
     pub fn drawGeometry(self: *Engine, gpa: Allocator, scratch: *Scratch, cmd: vk.CommandBuffer) !void {
-        //begin a render pass  connected to our draw image
+        //begin a render pass connected to our draw image
         const color_attachment: vk.RenderingAttachmentInfo = vk_init.attachmentInfo(self.draw_image.image_view, null, .attachment_optimal);
         const depthAttachment: vk.RenderingAttachmentInfo = vk_init.depthAttachmentInfo(self.depth_image.image_view, .depth_attachment_optimal);
 
@@ -1836,7 +1956,6 @@ pub const Engine = struct {
         const device = self.device_ctx.device;
 
         device.cmdBeginRendering(cmd, &render_info);
-        device.cmdBindPipeline(cmd, .graphics, self.triangle_pipeline);
 
         //set dynamic viewport and scissor
         const viewport: vk.Viewport = .{
@@ -1856,53 +1975,6 @@ pub const Engine = struct {
         };
         device.cmdSetScissor(cmd, 0, 1, (&scissor)[0..1]);
 
-        //launch a draw command to draw 3 vertices
-        // device.cmdDraw(cmd, 3, 1, 0, 0);
-
-        {
-            device.cmdBindPipeline(cmd, .graphics, self.mesh_pipeline);
-
-            //bind a texture
-            const image_set: vk.DescriptorSet = try self.currentFrame().frame_descriptors.allocate(gpa, scratch, device, self.single_image_descriptor_layout, null);
-            {
-                var writer: descriptors.DescriptorWriter = .{};
-                defer writer.deinit(gpa);
-                try writer.writeImage(gpa, 0, self.error_checkerboard_image.image_view, self.default_sampler_nearest, .shader_read_only_optimal, .combined_image_sampler);
-
-                writer.updateSet(device, image_set);
-            }
-
-            device.cmdBindDescriptorSets(cmd, .graphics, self.mesh_pipeline_layout, 0, 1, (&image_set)[0..1], 0, null);
-
-            var push_constants: GPUDrawPushConstants = .{
-                .worldMatrix = .translate(.identity, .{ 0, 0, -1.5 }),
-                .vertexBuffer = self.rectangle.vertexBufferAddress,
-            };
-
-            device.cmdPushConstants(cmd, self.mesh_pipeline_layout, .{ .vertex_bit = true }, 0, @sizeOf(GPUDrawPushConstants), &push_constants);
-            device.cmdBindIndexBuffer(cmd, self.rectangle.indexBuffer.buffer, 0, .uint32);
-
-            device.cmdDrawIndexed(cmd, 6, 1, 0, 0, 0);
-
-            // draw monkey
-            const view = Mat4.identity.translate(.{ 0, 0, -5 });
-
-            var projection: Mat4 = .perspective(1.22, @as(f32, @floatFromInt(self.draw_extent.width)) / @as(f32, @floatFromInt(self.draw_extent.height)), 0.1, 1000);
-            // invert the Y direction on projection matrix so that we are more similar
-            // to opengl and gltf axis
-            projection.items[1][1] *= -1;
-
-            // const model: Mat4 = .rotate(.identity, std.math.pi / 3.0, .{ 0, 1, 0 });
-            const model: Mat4 = .identity;
-            push_constants.worldMatrix = projection.mul(view).mul(model);
-            push_constants.vertexBuffer = self.test_meshes.items[2].mesh_buffers.vertexBufferAddress;
-
-            device.cmdPushConstants(cmd, self.mesh_pipeline_layout, .{ .vertex_bit = true }, 0, @sizeOf(GPUDrawPushConstants), &push_constants);
-            device.cmdBindIndexBuffer(cmd, self.test_meshes.items[2].mesh_buffers.indexBuffer.buffer, 0, .uint32);
-
-            device.cmdDrawIndexed(cmd, self.test_meshes.items[2].surfaces.items[0].count, 1, self.test_meshes.items[2].surfaces.items[0].start_index, 0, 0);
-        }
-
         {
             //allocate a new uniform buffer for the scene data
             const gpu_scene_data_buffer: VmaGpuBuffer = try .create(self.device_ctx.vma_allocator, @sizeOf(GPUSceneData), .{ .uniform_buffer_bit = true }, c.VMA_MEMORY_USAGE_CPU_TO_GPU);
@@ -1914,12 +1986,28 @@ pub const Engine = struct {
             buffer[0] = self.scene_data;
             gpu_scene_data_buffer.unMap(self.device_ctx.vma_allocator);
 
-            // //create a descriptor set that binds that buffer and update it
+            //create a descriptor set that binds that buffer and update it
             const globalDescriptor: vk.DescriptorSet = try self.currentFrame().frame_descriptors.allocate(gpa, scratch, device, self.gpu_scene_data_descriptor_layout, null);
 
             var writer: descriptors.DescriptorWriter = .{};
             try writer.writeBuffer(scratch.allocator(), 0, gpu_scene_data_buffer.buffer, @sizeOf(GPUSceneData), 0, .uniform_buffer);
             writer.updateSet(device, globalDescriptor);
+
+            for (self.main_draw_context.opaque_surfaces.items) |surface| {
+                device.cmdBindPipeline(cmd, .graphics, surface.material.?.pipeline.pipeline);
+                device.cmdBindDescriptorSets(cmd, .graphics, surface.material.?.pipeline.layout, 0, 1, (&globalDescriptor)[0..1], 0, null);
+                device.cmdBindDescriptorSets(cmd, .graphics, surface.material.?.pipeline.layout, 1, 1, (&surface.material.?.material_set)[0..1], 0, null);
+
+                device.cmdBindIndexBuffer(cmd, surface.index_buffer, 0, .uint32);
+
+                var push_constants: GPUDrawPushConstants = .{
+                    .worldMatrix = surface.transform,
+                    .vertexBuffer = surface.vertex_buffer_address,
+                };
+                device.cmdPushConstants(cmd, surface.material.?.pipeline.layout, .{ .vertex_bit = true }, 0, @sizeOf(GPUDrawPushConstants), &push_constants);
+
+                device.cmdDrawIndexed(cmd, surface.index_count, 1, surface.first_index, 0, 0);
+            }
         }
 
         device.cmdEndRendering(cmd);
@@ -1957,9 +2045,9 @@ pub const Engine = struct {
             c.VMA_MEMORY_USAGE_GPU_ONLY,
         );
         const newSurface: GPUMeshBuffers = .{
-            .vertexBuffer = vertexBuffer,
-            .indexBuffer = indexBuffer,
-            .vertexBufferAddress = vertexBufferAddress,
+            .vertex_buffer = vertexBuffer,
+            .index_buffer = indexBuffer,
+            .vertex_buffer_address = vertexBufferAddress,
         };
 
         const staging: VmaGpuBuffer = try .create(
@@ -1986,14 +2074,14 @@ pub const Engine = struct {
                 .src_offset = 0,
                 .size = vertexBufferSize,
             };
-            device.cmdCopyBuffer(imm.command_buffer, staging.buffer, newSurface.vertexBuffer.buffer, 1, (&vertexCopy)[0..1]);
+            device.cmdCopyBuffer(imm.command_buffer, staging.buffer, newSurface.vertex_buffer.buffer, 1, (&vertexCopy)[0..1]);
 
             const indexCopy: vk.BufferCopy = .{
                 .dst_offset = 0,
                 .src_offset = vertexBufferSize,
                 .size = indexBufferSize,
             };
-            device.cmdCopyBuffer(imm.command_buffer, staging.buffer, newSurface.indexBuffer.buffer, 1, (&indexCopy)[0..1]);
+            device.cmdCopyBuffer(imm.command_buffer, staging.buffer, newSurface.index_buffer.buffer, 1, (&indexCopy)[0..1]);
 
             try immediateModeEnd(device, imm.fence, imm.command_buffer, device_ctx.graphics_queue);
         }
@@ -2347,7 +2435,7 @@ const vk_init = struct {
             .image_layout = layout orelse .color_attachment_optimal,
             .load_op = .clear,
             .store_op = .store,
-            .clear_value = .{ .depth_stencil = .{ .depth = 1, .stencil = 0 } },
+            .clear_value = .{ .depth_stencil = .{ .depth = 0, .stencil = 0 } },
             .resolve_mode = .{},
             .resolve_image_layout = .undefined,
         };

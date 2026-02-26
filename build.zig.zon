@@ -32,8 +32,7 @@
             .hash = "dcimgui-0.0.0-OPNlzP7xFgCEE0BS7D2F1HeP9IuA4P0_qIFiG4kX34Cs",
         },
         .zla = .{
-            .url = "git+https://github.com/johan0A/zig-linear-algebra#133f25309aebbb42ca975c7af519efb032f7606e",
-            .hash = "zla-0.0.2-zqm18AVoAADBjAORCP5aNMmUT3Dwefl1Qns6qVPWIxS2",
+            .path = "vendor/zla",
         },
         .zgltf = .{
             .url = "git+https://github.com/kooparse/zgltf#ec52d477db346af99d4cdced4e35e67e1670023f",

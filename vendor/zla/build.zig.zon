@@ -1,0 +1,13 @@
+.{
+    .name = .zla,
+    .version = "0.0.2",
+    .fingerprint = 0x55da41f1f0b5a9ce, // Changing this has security and trust implications.
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}
