@@ -9,8 +9,8 @@
             .hash = "N-V-__8AAESg9gHKzlANbo03d4Fcb5m_5aZXJXIhYbWzCe4G",
         },
         .vulkan = .{
-            .url = "git+https://github.com/Snektron/vulkan-zig#30c3a9d582ae39dd7bfd8b44995e0864a442c7af",
-            .hash = "vulkan-0.0.0-r7Ytx_9JAwCBoNziuwO4USPOo-kR-3Ss4bqSUMVgVpYS",
+            .url = "git+https://github.com/johan0A/vulkan-zig?ref=generate-slice-params#3c5857db8520ccdb35ad3b47b240430ff82599ea",
+            .hash = "vulkan-0.0.0-r7Ytx9FpAwDQ-aYc8wzJPJzuQxdagBk1KMG0fmYFgo6e",
         },
         .VulkanMemoryAllocator = .{
             .url = "git+https://github.com/johan0A/VulkanMemoryAllocator#fc1e14f1857c7729db3e92ccd327ee15f96bb11a",

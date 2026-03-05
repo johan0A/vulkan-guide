@@ -398,7 +398,7 @@ pub const PipelineBuilder = struct {
         // // its easy to error out on create graphics pipeline, so we handle it a bit
         // // better than the common VK_CHECK case
         var new_pipeline: vk.Pipeline = undefined;
-        _ = try device.createGraphicsPipelines(.null_handle, 1, (&pipeline_info)[0..1], null, (&new_pipeline)[0..1]);
+        _ = try device.createGraphicsPipelines(.null_handle, &.{pipeline_info}, null, (&new_pipeline)[0..1]);
         return new_pipeline;
     }
 
@@ -844,9 +844,7 @@ pub const Engine = struct {
                     .compute,
                     engine.background_effects[engine.active_background_effect].layout,
                     0,
-                    1,
-                    (&engine.draw_image_descriptors)[0..1],
-                    0,
+                    &.{engine.draw_image_descriptors},
                     null,
                 );
 
@@ -873,13 +871,13 @@ pub const Engine = struct {
 
         const device = self.device_ctx.device;
 
-        _ = try device.waitForFences(1, (&self.currentFrame().render_fence)[0..1], .true, 1e9);
+        _ = try device.waitForFences(&.{self.currentFrame().render_fence}, .true, 1e9);
 
         self.currentFrame().deletion_queue.flush(.{ .device = device, .vma_allocator = self.device_ctx.vma_allocator });
 
         try self.currentFrame().frame_descriptors.clearPools(gpa, device);
 
-        _ = try device.resetFences(1, (&self.currentFrame().render_fence)[0..1]);
+        _ = try device.resetFences(&.{self.currentFrame().render_fence});
 
         const acquire_next_image_result = device.acquireNextImageKHR(
             self.swapchain.handle,
@@ -950,7 +948,7 @@ pub const Engine = struct {
 
             //submit command buffer to the queue and execute it.
             // _render_fence will now block until the graphic commands finish execution
-            try device.queueSubmit2(self.device_ctx.graphics_queue, 1, (&submit_info)[0..1], self.currentFrame().render_fence);
+            try device.queueSubmit2(self.device_ctx.graphics_queue, &.{submit_info}, self.currentFrame().render_fence);
         }
 
         const present_info: vk.PresentInfoKHR = .{
@@ -972,7 +970,7 @@ pub const Engine = struct {
 
     // TODO: use device ctx and return imm_command_buffer?
     fn immediateModeBegin(device: vk.DeviceProxy, imm_fence: vk.Fence, imm_command_buffer: vk.CommandBuffer) !void {
-        try device.resetFences(1, (&imm_fence)[0..1]);
+        try device.resetFences(&.{imm_fence});
         try device.resetCommandBuffer(imm_command_buffer, .{});
 
         try device.beginCommandBuffer(imm_command_buffer, &.{ .flags = .{ .one_time_submit_bit = true } });
@@ -986,8 +984,8 @@ pub const Engine = struct {
 
         // submit command buffer to the queue and execute it.
         //  _renderFence will now block until the graphic commands finish execution
-        try device.queueSubmit2(graphics_queue, 1, (&submit)[0..1], imm_fence);
-        _ = try device.waitForFences(1, (&imm_fence)[0..1], .true, 9999999999);
+        try device.queueSubmit2(graphics_queue, &.{submit}, imm_fence);
+        _ = try device.waitForFences(&.{imm_fence}, .true, 9999999999);
     }
 
     pub inline fn currentFrame(self: *Engine) *FrameData {
@@ -1317,7 +1315,7 @@ pub const Engine = struct {
             };
 
             var gradient_pipeline: vk.Pipeline = undefined;
-            _ = try device_proxy.createComputePipelines(.null_handle, 1, (&computePipelineCreateInfo)[0..1], null, (&gradient_pipeline)[0..1]);
+            _ = try device_proxy.createComputePipelines(.null_handle, &.{computePipelineCreateInfo}, null, (&gradient_pipeline)[0..1]);
 
             try main_deletion_queue.append(gpa, .{ .pipeline_layout = gradient_pipeline_layout });
             try main_deletion_queue.append(gpa, .{ .pipeline = gradient_pipeline });
@@ -1782,7 +1780,7 @@ pub const Engine = struct {
 
             vk_image.transitionImage(device_ctx.device, imm.command_buffer, new_image.image, .undefined, .transfer_dst_optimal);
 
-            const copy_region = [_]vk.BufferImageCopy{.{
+            const copy_region: vk.BufferImageCopy = .{
                 .buffer_offset = 0,
                 .buffer_row_length = 0,
                 .buffer_image_height = 0,
@@ -1795,8 +1793,8 @@ pub const Engine = struct {
                 },
                 .image_extent = size,
                 .image_offset = .{ .x = 0, .y = 0, .z = 0 },
-            }};
-            device_ctx.device.cmdCopyBufferToImage(imm.command_buffer, upload_buffer.buffer, new_image.image, .transfer_dst_optimal, copy_region.len, &copy_region);
+            };
+            device_ctx.device.cmdCopyBufferToImage(imm.command_buffer, upload_buffer.buffer, new_image.image, .transfer_dst_optimal, &.{copy_region});
 
             vk_image.transitionImage(device_ctx.device, imm.command_buffer, new_image.image, .transfer_dst_optimal, .read_only_optimal);
             try immediateModeEnd(device_ctx.device, imm.fence, imm.command_buffer, device_ctx.graphics_queue);
@@ -1967,13 +1965,13 @@ pub const Engine = struct {
             .max_depth = 1,
         };
 
-        device.cmdSetViewport(cmd, 0, 1, (&viewport)[0..1]);
+        device.cmdSetViewport(cmd, 0, &.{viewport});
 
         const scissor: vk.Rect2D = .{
             .offset = .{ .x = 0, .y = 0 },
             .extent = .{ .width = self.draw_extent.width, .height = self.draw_extent.height },
         };
-        device.cmdSetScissor(cmd, 0, 1, (&scissor)[0..1]);
+        device.cmdSetScissor(cmd, 0, &.{scissor});
 
         {
             //allocate a new uniform buffer for the scene data
@@ -1995,8 +1993,8 @@ pub const Engine = struct {
 
             for (self.main_draw_context.opaque_surfaces.items) |surface| {
                 device.cmdBindPipeline(cmd, .graphics, surface.material.?.pipeline.pipeline);
-                device.cmdBindDescriptorSets(cmd, .graphics, surface.material.?.pipeline.layout, 0, 1, (&globalDescriptor)[0..1], 0, null);
-                device.cmdBindDescriptorSets(cmd, .graphics, surface.material.?.pipeline.layout, 1, 1, (&surface.material.?.material_set)[0..1], 0, null);
+                device.cmdBindDescriptorSets(cmd, .graphics, surface.material.?.pipeline.layout, 0, &.{globalDescriptor}, null);
+                device.cmdBindDescriptorSets(cmd, .graphics, surface.material.?.pipeline.layout, 1, &.{surface.material.?.material_set}, null);
 
                 device.cmdBindIndexBuffer(cmd, surface.index_buffer, 0, .uint32);
 
@@ -2074,14 +2072,14 @@ pub const Engine = struct {
                 .src_offset = 0,
                 .size = vertexBufferSize,
             };
-            device.cmdCopyBuffer(imm.command_buffer, staging.buffer, newSurface.vertex_buffer.buffer, 1, (&vertexCopy)[0..1]);
+            device.cmdCopyBuffer(imm.command_buffer, staging.buffer, newSurface.vertex_buffer.buffer, &.{vertexCopy});
 
             const indexCopy: vk.BufferCopy = .{
                 .dst_offset = 0,
                 .src_offset = vertexBufferSize,
                 .size = indexBufferSize,
             };
-            device.cmdCopyBuffer(imm.command_buffer, staging.buffer, newSurface.index_buffer.buffer, 1, (&indexCopy)[0..1]);
+            device.cmdCopyBuffer(imm.command_buffer, staging.buffer, newSurface.index_buffer.buffer, &.{indexCopy});
 
             try immediateModeEnd(device, imm.fence, imm.command_buffer, device_ctx.graphics_queue);
         }
@@ -2319,7 +2317,7 @@ const descriptors = struct {
 
         pub fn updateSet(self: *DescriptorWriter, device: vk.DeviceProxy, set: vk.DescriptorSet) void {
             for (self.writes.items) |*write| write.dst_set = set;
-            device.updateDescriptorSets(@intCast(self.writes.items.len), self.writes.items.ptr, 0, null);
+            device.updateDescriptorSets(self.writes.items, null);
         }
     };
 };
