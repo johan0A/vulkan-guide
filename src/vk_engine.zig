@@ -2,7 +2,57 @@
 const validation_layers = [_][:0]const u8{"VK_LAYER_KHRONOS_validation"};
 const required_device_extensions = [_][*:0]const u8{vk.extensions.khr_swapchain.name};
 
-const Scene = struct {
+const Camera = struct {
+    velocity: @Vector(3, f32) = @splat(0),
+    position: @Vector(3, f32) = @splat(0),
+    // vertical rotation
+    pitch: f32 = 0,
+    // horizontal rotation
+    yaw: f32 = 0,
+
+    fn getViewMatrix(self: Camera) Mat4 {
+        const camera_translation: Mat4 = .translate(.identity, self.position);
+        const camera_rotation: Mat4 = self.getRotationMatrix();
+        return camera_translation.mul(camera_rotation).inverse().?;
+    }
+
+    fn getRotationMatrix(self: Camera) Mat4 {
+        const pitch_rotation: Mat4 = .fromAxisAngle(.{ 1, 0, 0 }, self.pitch);
+        const yaw_rotation: Mat4 = .fromAxisAngle(.{ 0, -1, 0 }, self.yaw);
+        return yaw_rotation.mul(pitch_rotation);
+    }
+
+    pub fn processSDLEvent(self: *Camera, e: *const c.SDL_Event) void {
+        if (e.type == c.SDL_EVENT_KEY_DOWN) {
+            if (e.key.key == c.SDLK_W) self.velocity[2] = -1;
+            if (e.key.key == c.SDLK_S) self.velocity[2] = 1;
+            if (e.key.key == c.SDLK_A) self.velocity[0] = -1;
+            if (e.key.key == c.SDLK_D) self.velocity[0] = 1;
+        }
+
+        if (e.type == c.SDL_EVENT_KEY_UP) {
+            if (e.key.key == c.SDLK_W) self.velocity[2] = 0;
+            if (e.key.key == c.SDLK_S) self.velocity[2] = 0;
+            if (e.key.key == c.SDLK_A) self.velocity[0] = 0;
+            if (e.key.key == c.SDLK_D) self.velocity[0] = 0;
+        }
+
+        if (e.type == c.SDL_EVENT_MOUSE_MOTION) {
+            self.yaw += e.motion.xrel / 200;
+            self.pitch -= e.motion.yrel / 200;
+            self.pitch = std.math.clamp(self.pitch, -std.math.pi / 2.0, std.math.pi / 2.0);
+        }
+    }
+
+    fn update(self: *Camera) void {
+        const camera_rotation = self.getRotationMatrix();
+        var velocity = std.simd.join(self.velocity, @Vector(1, f32){0});
+        velocity *= @splat(0.1);
+        self.position += std.simd.extract(camera_rotation.mulVec(velocity), 0, 3);
+    }
+};
+
+const scene = struct {
     const RenderObject = struct {
         index_count: u32,
         first_index: u32,
@@ -826,8 +876,10 @@ pub const Engine = struct {
     default_data: MaterialInstance,
     metal_rough_material: GLTFMetallicRoughness,
 
-    main_draw_context: Scene.DrawContext,
-    loaded_nodes: std.StringHashMapUnmanaged(*Scene.Node),
+    main_camera: Camera,
+
+    main_draw_context: scene.DrawContext,
+    loaded_nodes: std.StringHashMapUnmanaged(*scene.Node),
 
     pub fn draw(self: *Engine, gpa: Allocator, scratch: *Scratch) !void {
         try self.updateScene(gpa);
@@ -1623,10 +1675,10 @@ pub const Engine = struct {
 
         //}
 
-        var loaded_nodes: std.StringHashMapUnmanaged(*Scene.Node) = .empty;
+        var loaded_nodes: std.StringHashMapUnmanaged(*scene.Node) = .empty;
 
         for (testMeshes.items) |mesh| {
-            const new_node = try init_alloc.create(Scene.Node);
+            const new_node = try init_alloc.create(scene.Node);
 
             new_node.* = .{
                 .children = .empty,
@@ -1717,6 +1769,10 @@ pub const Engine = struct {
 
             .metal_rough_material = metal_rough_material,
             .default_data = default_data,
+
+            .main_camera = .{
+                .position = .{ 0, 0, 5 },
+            },
 
             .main_draw_context = .{
                 .opaque_surfaces = .empty,
@@ -1926,15 +1982,20 @@ pub const Engine = struct {
 
         try self.loaded_nodes.get("Suzanne").?.draw(gpa, .identity, &self.main_draw_context);
 
-        self.scene_data.view = .translate(.identity, .{ 0, 0, -5 });
+        self.main_camera.update();
+
+        const view = self.main_camera.getViewMatrix();
+
         // camera projection
-        self.scene_data.proj = .perspectiveReverseZ(
+        const projection: Mat4 = .perspectiveReverseZ(
             zla.toRadians(f32, 70),
             @as(f32, @floatFromInt(self.swapchain.extent.width)) / @as(f32, @floatFromInt(self.swapchain.extent.height)),
             0.1,
             .{},
         );
 
+        self.scene_data.view = view;
+        self.scene_data.proj = projection;
         self.scene_data.viewproj = self.scene_data.proj.mul(self.scene_data.view);
 
         //some default lighting parameters
