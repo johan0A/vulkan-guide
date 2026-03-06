@@ -1932,11 +1932,9 @@ pub const Engine = struct {
             zla.toRadians(f32, 70),
             @as(f32, @floatFromInt(self.swapchain.extent.width)) / @as(f32, @floatFromInt(self.swapchain.extent.height)),
             0.1,
+            .{},
         );
 
-        // invert the Y direction on projection matrix so that we are more similar
-        // to opengl and gltf axis
-        self.scene_data.proj.items[1][1] *= -1;
         self.scene_data.viewproj = self.scene_data.proj.mul(self.scene_data.view);
 
         //some default lighting parameters
@@ -2753,7 +2751,7 @@ const shaders = @import("shaders");
 const loader = @import("loader.zig");
 const zla = @import("zla");
 const vec = zla.vec;
-const Mat4 = zla.Mat(f32, 4, 4);
+const Mat4 = zla.Mat(.cm, f32, 4, 4);
 const options = @import("options");
 const Scratch = @import("scratch_allocator");
 const SegmentedList = @import("segmented_list.zig").SegmentedList;
