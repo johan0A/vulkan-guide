@@ -2,7 +2,7 @@ const std = @import("std");
 
 const Float = std.meta.Float;
 
-inline fn len(T: type) usize {
+inline fn vecLen(T: type) usize {
     return switch (@typeInfo(T)) {
         .vector => |vector| vector.len,
         .array => |array| array.len,
@@ -10,7 +10,7 @@ inline fn len(T: type) usize {
     };
 }
 
-fn innerVec(vec: anytype) @Vector(len(@TypeOf(vec)), std.meta.Child(@TypeOf(vec))) {
+fn innerVec(vec: anytype) @Vector(vecLen(@TypeOf(vec)), std.meta.Child(@TypeOf(vec))) {
     const type_info = @typeInfo(@TypeOf(vec));
     if (type_info != .vector and type_info != .array) @compileError("Expected vector or array type, got: " ++ @typeName(@TypeOf(vec)));
     return vec;
@@ -70,7 +70,7 @@ pub fn normAdv(vec: anytype, comptime precision: u8) Float(precision) {
     } else {
         const items: blk: {
             if (precision > @bitSizeOf(T)) {
-                break :blk @Vector(len(@TypeOf(inner_vec)), Float(precision));
+                break :blk @Vector(vecLen(@TypeOf(inner_vec)), Float(precision));
             } else {
                 break :blk @TypeOf(inner_vec);
             }
@@ -117,7 +117,7 @@ pub fn dot(vec: anytype, other: anytype) std.meta.Child(@TypeOf(vec)) {
 pub fn cross(vec: anytype, other: anytype) @TypeOf(vec) {
     const inner_vec = innerVec(vec);
     const inner_other: @TypeOf(inner_vec) = other;
-    if (len(@TypeOf(inner_vec)) != 3) @compileError("vector must have three elements for cross() to be defined");
+    if (vecLen(@TypeOf(inner_vec)) != 3) @compileError("vector must have three elements for cross() to be defined");
     const T = @typeInfo(@TypeOf(inner_vec)).vector.child;
 
     const vec1 = @shuffle(T, inner_vec, inner_vec, [3]u8{ 1, 2, 0 });
@@ -169,6 +169,10 @@ pub fn reflect(vec: anytype, normal: anytype) @TypeOf(vec) {
     return inner_vec - (inner_normal *
         @as(@TypeOf(inner_normal), @splat(2)) *
         @as(@TypeOf(inner_normal), @splat(dot_product)));
+}
+
+pub fn splat(comptime len: comptime_int, value: anytype) @Vector(len, @TypeOf(value)) {
+    return @splat(value);
 }
 
 /// Returns a new vector with a direction closest to the original vector, but with a magnitude scaled by the given value.

@@ -52,7 +52,7 @@ const Camera = struct {
     }
 };
 
-const scene = struct {
+pub const scene = struct {
     const RenderObject = struct {
         index_count: u32,
         first_index: u32,
@@ -68,21 +68,40 @@ const scene = struct {
         opaque_surfaces: std.ArrayList(RenderObject),
     };
 
-    const Node = struct {
-        parent: ?*Node,
-        children: std.ArrayList(Node),
+    pub const LoadedGltf = struct {
+        // storage for all the data on a given glTF file
+        meshes: std.StringHashMapUnmanaged(*loader.MeshAsset),
+        nodes: std.StringHashMapUnmanaged(*Node),
+        images: std.StringHashMapUnmanaged(AllocatedImage),
+        materials: std.StringHashMapUnmanaged(*loader.GltfMaterial),
 
-        local_transform: Mat4,
-        world_transform: Mat4,
+        // nodes that dont have a parent, for iterating through the file in tree order
+        top_nodes: std.ArrayListUnmanaged(*Node),
 
-        mesh: ?loader.MeshAsset,
+        samplers: std.ArrayListUnmanaged(vk.Sampler),
 
-        fn refreshTransform(self: *Node, parent_matrix: Mat4) void {
+        descriptor_pool: descriptors.DescriptorAllocatorGrowable,
+
+        material_data_buffer: VmaGpuBuffer,
+    };
+
+    pub const Node = struct {
+        parent: ?*Node = null,
+        children: std.ArrayList(*Node) = .empty,
+
+        local_transform: Mat4 = .identity,
+        world_transform: Mat4 = .identity,
+
+        mesh: ?loader.MeshAsset = null,
+
+        gltf: ?*LoadedGltf = null,
+
+        pub fn refreshTransform(self: *Node, parent_matrix: Mat4) void {
             self.world_transform = parent_matrix.mul(self.local_transform);
             for (self.children.items) |child| child.refreshTransform(self.world_transform);
         }
 
-        fn draw(self: Node, gpa: Allocator, top_matrix: Mat4, ctx: *DrawContext) !void {
+        pub fn draw(self: Node, gpa: Allocator, top_matrix: Mat4, ctx: *DrawContext) !void {
             if (self.mesh) |mesh| {
                 const node_matrix = top_matrix.mul(self.world_transform);
 
@@ -100,12 +119,18 @@ const scene = struct {
                 }
             }
 
+            if (self.gltf) |gltf| {
+                for (gltf.top_nodes.items) |node| {
+                    try node.draw(gpa, top_matrix, ctx);
+                }
+            }
+
             for (self.children.items) |child| try child.draw(gpa, top_matrix, ctx);
         }
     };
 };
 
-const MaterialPass = enum(u8) {
+pub const MaterialPass = enum(u8) {
     main_color,
     transparent,
     other,
@@ -122,7 +147,7 @@ pub const MaterialInstance = struct {
     pass_type: MaterialPass,
 };
 
-const GLTFMetallicRoughness = struct {
+pub const GltfMetallicRoughness = struct {
     opaque_pipeline: MaterialPipeline,
     transparent_pipeline: MaterialPipeline,
 
@@ -130,14 +155,14 @@ const GLTFMetallicRoughness = struct {
 
     writer: descriptors.DescriptorWriter,
 
-    const MaterialConstants = extern struct {
+    pub const MaterialConstants = extern struct {
         color_factors: [4]f32,
         metal_rough_factors: [4]f32,
         //padding, we need it anyway for uniform buffers
-        extra: [14][4]f32,
+        extra: [14][4]f32 = @splat(@splat(0)),
     };
 
-    const MaterialResources = struct {
+    pub const MaterialResources = struct {
         color_image: AllocatedImage,
         color_sampler: vk.Sampler,
         metal_rough_image: AllocatedImage,
@@ -153,7 +178,7 @@ const GLTFMetallicRoughness = struct {
         draw_image: AllocatedImage,
         depth_image: AllocatedImage,
         device_proxy: vk.DeviceProxy,
-    ) !GLTFMetallicRoughness {
+    ) !GltfMetallicRoughness {
         const checkpoint = scratch.checkpoint();
         defer scratch.restoreCheckpoint(checkpoint);
 
@@ -233,7 +258,7 @@ const GLTFMetallicRoughness = struct {
         };
     }
 
-    pub fn deinit(self: *GLTFMetallicRoughness, gpa: Allocator, device: vk.DeviceProxy) void {
+    pub fn deinit(self: *GltfMetallicRoughness, gpa: Allocator, device: vk.DeviceProxy) void {
         device.destroyDescriptorSetLayout(self.material_layout, null);
         device.destroyPipelineLayout(self.transparent_pipeline.layout, null);
         device.destroyPipeline(self.transparent_pipeline.pipeline, null);
@@ -242,7 +267,7 @@ const GLTFMetallicRoughness = struct {
     }
 
     pub fn writeMaterial(
-        self: *GLTFMetallicRoughness,
+        self: *GltfMetallicRoughness,
         gpa: Allocator,
         scratch: *Scratch,
         device: vk.DeviceProxy,
@@ -278,7 +303,21 @@ pub const VmaGpuBuffer = struct {
     allocation: c.VmaAllocation,
     info: c.VmaAllocationInfo,
 
-    pub fn create(allocator: c.VmaAllocator, size: usize, usage: vk.BufferUsageFlags, memory_usage: c.VmaMemoryUsage) !VmaGpuBuffer {
+    const VmaMemoryUsage = enum(c_uint) {
+        unknown = 0,
+        gpu_only = 1,
+        cpu_only = 2,
+        cpu_to_gpu = 3,
+        gpu_to_cpu = 4,
+        cpu_copy = 5,
+        gpu_lazily_allocated = 6,
+        auto = 7,
+        auto_prefer_device = 8,
+        auto_prefer_host = 9,
+        max_enum = 2147483647,
+    };
+
+    pub fn create(allocator: c.VmaAllocator, size: usize, usage: vk.BufferUsageFlags, memory_usage: VmaMemoryUsage) !VmaGpuBuffer {
         const buffer_info: vk.BufferCreateInfo = .{
             .usage = usage,
             .size = size,
@@ -287,7 +326,7 @@ pub const VmaGpuBuffer = struct {
         };
 
         const vma_alloc_info: c.VmaAllocationCreateInfo = .{
-            .usage = memory_usage,
+            .usage = @intFromEnum(memory_usage),
             .flags = c.VMA_ALLOCATION_CREATE_MAPPED_BIT,
         };
 
@@ -367,7 +406,7 @@ pub const GPUDrawPushConstants = extern struct {
     vertexBuffer: vk.DeviceAddress,
 };
 
-const AllocatedImage = struct {
+pub const AllocatedImage = struct {
     image: vk.Image,
     image_view: vk.ImageView,
     allocation: c.VmaAllocation,
@@ -874,12 +913,13 @@ pub const Engine = struct {
 
     // default material
     default_data: MaterialInstance,
-    metal_rough_material: GLTFMetallicRoughness,
+    metal_rough_material: GltfMetallicRoughness,
 
     main_camera: Camera,
 
     main_draw_context: scene.DrawContext,
     loaded_nodes: std.StringHashMapUnmanaged(*scene.Node),
+    loaded_scenes: std.StringHashMapUnmanaged(*scene.Node),
 
     pub fn draw(self: *Engine, gpa: Allocator, scratch: *Scratch) !void {
         try self.updateScene(gpa);
@@ -1556,7 +1596,7 @@ pub const Engine = struct {
         try main_deletion_queue.append(gpa, .{ .pipeline = mesh_pipeline });
         // }
 
-        var metal_rough_material: GLTFMetallicRoughness = try .init(scratch, io, gpu_scene_data_descriptor_layout, draw_allocated_image, depth_allocated_image, device_proxy);
+        var metal_rough_material: GltfMetallicRoughness = try .init(scratch, io, gpu_scene_data_descriptor_layout, draw_allocated_image, depth_allocated_image, device_proxy);
 
         // init_default_data {
         const rect_vertices: [4]Vertex = .{
@@ -1648,7 +1688,7 @@ pub const Engine = struct {
         // destroy_image(_errorCheckerboardImage);
         // });
 
-        var material_resources: GLTFMetallicRoughness.MaterialResources = .{
+        var material_resources: GltfMetallicRoughness.MaterialResources = .{
             .color_image = white_image,
             .color_sampler = default_sampler_linear,
             .metal_rough_image = white_image,
@@ -1658,10 +1698,10 @@ pub const Engine = struct {
         };
 
         //set the uniform buffer for the material data
-        const material_constants: VmaGpuBuffer = try .create(vma_allocator, @sizeOf(GLTFMetallicRoughness.MaterialConstants), .{ .uniform_buffer_bit = true }, c.VMA_MEMORY_USAGE_CPU_TO_GPU);
+        const material_constants: VmaGpuBuffer = try .create(vma_allocator, @sizeOf(GltfMetallicRoughness.MaterialConstants), .{ .uniform_buffer_bit = true }, .cpu_to_gpu);
 
         //write the buffer
-        const scene_uniform_data = try material_constants.map(vma_allocator, GLTFMetallicRoughness.MaterialConstants);
+        const scene_uniform_data = try material_constants.map(vma_allocator, GltfMetallicRoughness.MaterialConstants);
         defer material_constants.unMap(vma_allocator);
         scene_uniform_data[0].color_factors = @splat(1);
         scene_uniform_data[0].metal_rough_factors = .{ 1, 0.5, 0, 0 };
@@ -1686,6 +1726,7 @@ pub const Engine = struct {
                 .local_transform = .identity,
                 .world_transform = .identity,
                 .mesh = mesh,
+                .gltf = null,
             };
 
             const default_gltf_material = try init_alloc.create(loader.GltfMaterial);
@@ -1701,6 +1742,36 @@ pub const Engine = struct {
         }
 
         // }
+
+        const structure_path = options.assets_path ++ "/structure.glb";
+        const structure_file = loader.loadGltf(
+            gpa,
+            scratch,
+            io,
+            &metal_rough_material,
+            default_sampler_linear,
+            white_image,
+            error_checkerboard_image,
+            device_ctx,
+            imm,
+            structure_path,
+        ) catch {
+            const stderr = std.debug.lockStderr(&.{}).terminal();
+            defer std.debug.unlockStderr();
+            std.debug.writeStackTrace(@errorReturnTrace().?, stderr) catch {};
+            return error.errrrr;
+        };
+
+        var loaded_scenes: std.StringHashMapUnmanaged(*scene.Node) = .empty;
+
+        const loaded_scene_node = try gpa.create(scene.Node);
+        loaded_scene_node.* = .{
+            .gltf = structure_file,
+        };
+
+        try loaded_scenes.put(gpa, "structure", loaded_scene_node);
+
+        //  ["structure"] = *structureFile;
 
         return .{
             .vk_ctx = .{
@@ -1778,6 +1849,7 @@ pub const Engine = struct {
                 .opaque_surfaces = .empty,
             },
             .loaded_nodes = loaded_nodes,
+            .loaded_scenes = loaded_scenes,
         };
     }
 
@@ -1818,7 +1890,7 @@ pub const Engine = struct {
 
     pub fn createAndUploadImage(device_ctx: DeviceContext, imm: ImmSubmit, data: *const anyopaque, size: vk.Extent3D, format: vk.Format, usage: vk.ImageUsageFlags, mipmapped: bool) !AllocatedImage {
         const data_size: usize = size.depth * size.width * size.height * 4;
-        const upload_buffer: VmaGpuBuffer = try .create(device_ctx.vma_allocator, data_size, .{ .transfer_src_bit = true }, c.VMA_MEMORY_USAGE_CPU_TO_GPU);
+        const upload_buffer: VmaGpuBuffer = try .create(device_ctx.vma_allocator, data_size, .{ .transfer_src_bit = true }, .cpu_to_gpu);
 
         @memcpy(
             @as([*]u8, @ptrCast(upload_buffer.info.pMappedData)),
@@ -1981,6 +2053,7 @@ pub const Engine = struct {
         }
 
         try self.loaded_nodes.get("Suzanne").?.draw(gpa, .identity, &self.main_draw_context);
+        try self.loaded_scenes.get("structure").?.draw(gpa, .identity, &self.main_draw_context);
 
         self.main_camera.update();
 
@@ -2034,7 +2107,7 @@ pub const Engine = struct {
 
         {
             //allocate a new uniform buffer for the scene data
-            const gpu_scene_data_buffer: VmaGpuBuffer = try .create(self.device_ctx.vma_allocator, @sizeOf(GPUSceneData), .{ .uniform_buffer_bit = true }, c.VMA_MEMORY_USAGE_CPU_TO_GPU);
+            const gpu_scene_data_buffer: VmaGpuBuffer = try .create(self.device_ctx.vma_allocator, @sizeOf(GPUSceneData), .{ .uniform_buffer_bit = true }, .cpu_to_gpu);
 
             //add it to the deletion queue of this frame so it gets deleted once its been used
             try self.currentFrame().deletion_queue.append(gpa, .{ .allocated_buffer = gpu_scene_data_buffer });
@@ -2087,7 +2160,7 @@ pub const Engine = struct {
             vma_allocator,
             vertexBufferSize,
             .{ .storage_buffer_bit = true, .transfer_dst_bit = true, .shader_device_address_bit = true },
-            c.VMA_MEMORY_USAGE_GPU_ONLY,
+            .gpu_only,
         );
 
         //find the adress of the vertex buffer
@@ -2099,7 +2172,7 @@ pub const Engine = struct {
             vma_allocator,
             indexBufferSize,
             .{ .storage_buffer_bit = true, .transfer_dst_bit = true, .index_buffer_bit = true },
-            c.VMA_MEMORY_USAGE_GPU_ONLY,
+            .gpu_only,
         );
         const newSurface: GPUMeshBuffers = .{
             .vertex_buffer = vertexBuffer,
@@ -2111,7 +2184,7 @@ pub const Engine = struct {
             vma_allocator,
             vertexBufferSize + indexBufferSize,
             .{ .transfer_src_bit = true },
-            c.VMA_MEMORY_USAGE_CPU_ONLY,
+            .cpu_only,
         );
         defer staging.destroy(vma_allocator);
 
@@ -2147,13 +2220,13 @@ pub const Engine = struct {
     }
 };
 
-const descriptors = struct {
-    const DescriptorAllocatorGrowable = struct {
+pub const descriptors = struct {
+    pub const DescriptorAllocatorGrowable = struct {
         // TODO: the design of this is pretty bad
         // better design: at the start set the ratio to all same
         // once a pool is full check which type has filled how much as a ratio to the one that filled completely and set the ratio for the next pools accordingly
 
-        const PoolSizeRatio = struct {
+        pub const PoolSizeRatio = struct {
             type: vk.DescriptorType,
             ratio: f32,
         };
@@ -2187,7 +2260,7 @@ const descriptors = struct {
             try self.readyPools.append(gpa, new_pool);
         }
 
-        fn deinit(
+        pub fn deinit(
             self: *DescriptorAllocatorGrowable,
             gpa: Allocator,
             device: vk.DeviceProxy,
@@ -2812,7 +2885,7 @@ const shaders = @import("shaders");
 const loader = @import("loader.zig");
 const zla = @import("zla");
 const vec = zla.vec;
-const Mat4 = zla.Mat(.cm, f32, 4, 4);
+pub const Mat4 = zla.Mat(.cm, f32, 4, 4);
 const options = @import("options");
 const Scratch = @import("scratch_allocator");
 const SegmentedList = @import("segmented_list.zig").SegmentedList;
