@@ -898,8 +898,6 @@ pub const Engine = struct {
     mesh_pipeline_layout: vk.PipelineLayout,
     mesh_pipeline: vk.Pipeline,
 
-    test_meshes: std.ArrayListUnmanaged(loader.MeshAsset),
-
     // default images
     white_image: AllocatedImage,
     black_image: AllocatedImage,
@@ -918,7 +916,6 @@ pub const Engine = struct {
     main_camera: Camera,
 
     main_draw_context: scene.DrawContext,
-    loaded_nodes: std.StringHashMapUnmanaged(*scene.Node),
     loaded_scenes: std.StringHashMapUnmanaged(*scene.Node),
 
     pub fn draw(self: *Engine, gpa: Allocator, scratch: *Scratch) !void {
@@ -1623,8 +1620,6 @@ pub const Engine = struct {
         try main_deletion_queue.append(gpa, .{ .allocated_buffer = rectangle.index_buffer });
         try main_deletion_queue.append(gpa, .{ .allocated_buffer = rectangle.vertex_buffer });
 
-        const testMeshes = try loader.loadGltfMeshes(init_alloc, scratch.allocator(), io, device_ctx, imm, options.assets_path ++ "/basicmesh.glb");
-
         //{ default images
         const Color = packed struct(u32) { r: u8, g: u8, b: u8, a: u8 };
 
@@ -1715,34 +1710,6 @@ pub const Engine = struct {
 
         //}
 
-        var loaded_nodes: std.StringHashMapUnmanaged(*scene.Node) = .empty;
-
-        for (testMeshes.items) |mesh| {
-            const new_node = try init_alloc.create(scene.Node);
-
-            new_node.* = .{
-                .children = .empty,
-                .parent = null,
-                .local_transform = .identity,
-                .world_transform = .identity,
-                .mesh = mesh,
-                .gltf = null,
-            };
-
-            const default_gltf_material = try init_alloc.create(loader.GltfMaterial);
-            default_gltf_material.* = .{ .data = default_data };
-
-            for (new_node.mesh.?.surfaces.items) |*surface| {
-                surface.material = default_gltf_material;
-            }
-
-            try loaded_nodes.put(gpa, mesh.name, new_node);
-
-            // loadedNodes[mesh.name] = std::move(newNode);
-        }
-
-        // }
-
         const structure_path = options.assets_path ++ "/structure.glb";
         const structure_file = loader.loadGltf(
             gpa,
@@ -1826,8 +1793,6 @@ pub const Engine = struct {
             .mesh_pipeline_layout = mesh_pipeline_layout,
             .mesh_pipeline = mesh_pipeline,
 
-            .test_meshes = testMeshes,
-
             .white_image = white_image,
             .grey_image = grey_image,
             .black_image = black_image,
@@ -1848,7 +1813,6 @@ pub const Engine = struct {
             .main_draw_context = .{
                 .opaque_surfaces = .empty,
             },
-            .loaded_nodes = loaded_nodes,
             .loaded_scenes = loaded_scenes,
         };
     }
@@ -1981,13 +1945,6 @@ pub const Engine = struct {
             self.frames[i].frame_descriptors.deinit(gpa, device);
         }
 
-        for (self.test_meshes.items) |mesh| {
-            mesh.mesh_buffers.index_buffer.destroy(self.device_ctx.vma_allocator);
-            mesh.mesh_buffers.vertex_buffer.destroy(self.device_ctx.vma_allocator);
-        }
-
-        self.loaded_nodes.deinit(gpa);
-
         self.metal_rough_material.deinit(gpa, device);
 
         self.main_deletion_queue.deinit(gpa, .{
@@ -2045,14 +2002,6 @@ pub const Engine = struct {
     pub fn updateScene(self: *Engine, gpa: Allocator) !void {
         self.main_draw_context.opaque_surfaces.clearRetainingCapacity();
 
-        for (0..3) |x| {
-            const scale: Mat4 = .scale(.identity, @splat(0.2));
-            const translation: Mat4 = .translate(.identity, .{ @floatFromInt(x), 1, 0 });
-
-            try self.loaded_nodes.get("Cube").?.draw(gpa, translation.mul(scale), &self.main_draw_context);
-        }
-
-        try self.loaded_nodes.get("Suzanne").?.draw(gpa, .identity, &self.main_draw_context);
         try self.loaded_scenes.get("structure").?.draw(gpa, .identity, &self.main_draw_context);
 
         self.main_camera.update();
