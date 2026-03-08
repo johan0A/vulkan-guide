@@ -1,5 +1,7 @@
 pub const vec = @import("vector.zig");
-pub const Mat = @import("matrix.zig").Mat;
+pub const matrix = @import("matrix.zig");
+pub const Mat = matrix.Mat;
+pub const Quat = @import("quaternion.zig").Quat;
 
 pub fn toRadians(T: type, degrees: T) T {
     return degrees * (std.math.pi / 180.0);
