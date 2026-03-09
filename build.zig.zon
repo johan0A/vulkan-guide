@@ -42,6 +42,9 @@
             .url = "git+https://github.com/johan0A/zig-scratch-allocator#261f89dc7d8aaefd57ca3956dcef2cb290856363",
             .hash = "scratch_allocator-0.0.1-dalh210fAAAtfDvpANkgj5qqDnjJQO5yad8DFjt3q3hH",
         },
+        .zigimg = .{ // TODO: dont vendor it after zigimg is updated to 0.16
+            .path = "vendor/zigimg",
+        },
     },
     .paths = .{
         "build.zig",

@@ -1711,7 +1711,7 @@ pub const Engine = struct {
         //}
 
         const structure_path = options.assets_path ++ "/structure.glb";
-        const structure_file = loader.loadGltf(
+        const structure_file = try loader.loadGltf(
             gpa,
             scratch,
             io,
@@ -1722,12 +1722,7 @@ pub const Engine = struct {
             device_ctx,
             imm,
             structure_path,
-        ) catch {
-            const stderr = std.debug.lockStderr(&.{}).terminal();
-            defer std.debug.unlockStderr();
-            std.debug.writeStackTrace(@errorReturnTrace().?, stderr) catch {};
-            return error.errrrr;
-        };
+        );
 
         var loaded_scenes: std.StringHashMapUnmanaged(*scene.Node) = .empty;
 

@@ -20,7 +20,6 @@ pub fn loadGltf(
     gpa: std.mem.Allocator,
     scratch: *Scratch,
     io: std.Io,
-    // engine: vk_engine.Engine,
     metal_rough_material: *vk_engine.GltfMetallicRoughness,
     default_sampler_linear: vk.Sampler,
     white_image: vk_engine.AllocatedImage,
@@ -33,7 +32,7 @@ pub fn loadGltf(
     const checkpoint = scratch.checkpoint();
     defer scratch.restoreCheckpoint(checkpoint);
 
-    const scene = try gpa.create(LoadedGltf); // TODO: rename
+    const scene = try gpa.create(LoadedGltf);
     scene.* = .{
         .images = .empty,
         .descriptor_pool = .empty,
@@ -45,8 +44,9 @@ pub fn loadGltf(
         .material_data_buffer = undefined,
     };
 
-    const file_ = try std.Io.Dir.cwd().openFile(io, filePath, .{});
-    var file_reader = file_.reader(io, &.{});
+    const base_dir = try std.Io.Dir.cwd().openDir(io, std.Io.Dir.path.dirname(filePath) orelse ".", .{});
+    const file = try std.Io.Dir.cwd().openFile(io, filePath, .{});
+    var file_reader = file.reader(io, &.{});
 
     var gltf: Gltf = .init(scratch.allocator());
     defer gltf.deinit();
@@ -99,8 +99,14 @@ pub fn loadGltf(
     var materials: std.ArrayList(*GltfMaterial) = .empty;
 
     // load all textures
-    for (gltf.data.images) |_| {
-        try images.append(gpa, error_checkerboard_image);
+    for (gltf.data.images) |gltf_image| {
+        if (loadImage(gpa, io, base_dir, gltf, gltf_image, device_ctx, imm)) |image| {
+            try images.append(gpa, image);
+            try scene.images.put(gpa, gltf_image.name.?, image);
+        } else |_| {
+            try images.append(gpa, error_checkerboard_image);
+            std.log.warn("gltf failed to load texture: {s}", .{gltf_image.name.?});
+        }
     }
 
     // create buffer to hold the material data
@@ -331,6 +337,57 @@ fn extractMipmapMode(filter: Gltf.MinFilter) vk.SamplerMipmapMode {
     };
 }
 
+fn loadImage(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    base_dir: std.Io.Dir,
+    gltf: Gltf,
+    gltf_image: Gltf.Image,
+    device_ctx: vk_engine.Engine.DeviceContext,
+    imm: vk_engine.Engine.ImmSubmit,
+) !vk_engine.AllocatedImage {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+
+    var image = if (gltf_image.data) |data| blk: {
+        break :blk try img.Image.fromMemory(gpa, data);
+    } else if (gltf_image.buffer_view) |_| {
+        _ = gltf;
+        std.debug.panic("TODO", .{});
+    } else if (gltf_image.uri) |uri| blk: {
+        const file = try base_dir.openFile(io, uri, .{});
+        var file_reader = file.reader(io, &.{});
+        const data = try file_reader.interface.allocRemaining(arena.allocator(), .unlimited);
+        break :blk try img.Image.fromMemory(gpa, data);
+    } else {
+        return error.NoImageData;
+    };
+    defer image.deinit(gpa);
+
+    image.convert(gpa, .rgba32) catch |err| switch (err) {
+        error.NoConversionNeeded => {},
+        else => |e| return e,
+    };
+
+    const image_size: vk.Extent3D = .{
+        .width = @intCast(image.width),
+        .height = @intCast(image.height),
+        .depth = 1,
+    };
+
+    const image_buff = image.rawBytes();
+    return try vk_engine.Engine.createAndUploadImage(
+        device_ctx,
+        imm,
+        @ptrCast(image_buff),
+        image_size,
+        .r8g8b8a8_unorm,
+        .{ .sampled_bit = true },
+        false,
+    );
+}
+
+const img = @import("zigimg");
 const std = @import("std");
 const zla = @import("zla");
 const vk = @import("vulkan");

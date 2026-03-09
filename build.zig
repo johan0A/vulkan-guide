@@ -76,6 +76,12 @@ pub fn build(b: *std.Build) !void {
     const vulkan_headers_dep = b.dependency("vulkan_headers", .{});
 
     {
+        const zigimg = b.dependency("zigimg", .{
+            .target = target,
+            .optimize = optimize,
+        });
+        root_module.addImport("zigimg", zigimg.module("zigimg"));
+
         const vulkan = b.dependency("vulkan", .{
             .registry = vulkan_headers_dep.path("registry/vk.xml"),
         });
@@ -88,7 +94,7 @@ pub fn build(b: *std.Build) !void {
 
         const zla = b.dependency("zla", .{
             .target = target,
-            .optimize = optimize, // todo: change to ReleaseFast/ReleaseSafe?
+            .optimize = optimize,
         });
         root_module.addImport("zla", zla.module("zla"));
 
