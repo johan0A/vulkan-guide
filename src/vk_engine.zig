@@ -66,6 +66,7 @@ pub const scene = struct {
 
     const DrawContext = struct {
         opaque_surfaces: std.ArrayList(RenderObject),
+        transparent_surfaces: std.ArrayList(RenderObject),
     };
 
     pub const LoadedGltf = struct {
@@ -1897,6 +1898,7 @@ pub const Engine = struct {
 
             .main_draw_context = .{
                 .opaque_surfaces = .empty,
+                .transparent_surfaces = .empty,
             },
             .loaded_scenes = loaded_scenes,
         };
@@ -2092,6 +2094,7 @@ pub const Engine = struct {
     }
 
     pub fn updateScene(self: *Engine, gpa: Allocator) !void {
+        self.main_draw_context.transparent_surfaces.clearRetainingCapacity();
         self.main_draw_context.opaque_surfaces.clearRetainingCapacity();
 
         try self.loaded_scenes.get("structure").?.draw(gpa, .identity, &self.main_draw_context);
@@ -2164,20 +2167,25 @@ pub const Engine = struct {
             try writer.writeBuffer(scratch.allocator(), 0, gpu_scene_data_buffer.buffer, @sizeOf(GPUSceneData), 0, .uniform_buffer);
             writer.updateSet(device, globalDescriptor);
 
-            for (self.main_draw_context.opaque_surfaces.items) |surface| {
-                device.cmdBindPipeline(cmd, .graphics, surface.material.?.pipeline.pipeline);
-                device.cmdBindDescriptorSets(cmd, .graphics, surface.material.?.pipeline.layout, 0, &.{globalDescriptor}, null);
-                device.cmdBindDescriptorSets(cmd, .graphics, surface.material.?.pipeline.layout, 1, &.{surface.material.?.material_set}, null);
+            inline for (.{
+                self.main_draw_context.opaque_surfaces.items,
+                self.main_draw_context.transparent_surfaces.items,
+            }) |sufaces| {
+                for (sufaces) |surface| {
+                    device.cmdBindPipeline(cmd, .graphics, surface.material.?.pipeline.pipeline);
+                    device.cmdBindDescriptorSets(cmd, .graphics, surface.material.?.pipeline.layout, 0, &.{globalDescriptor}, null);
+                    device.cmdBindDescriptorSets(cmd, .graphics, surface.material.?.pipeline.layout, 1, &.{surface.material.?.material_set}, null);
 
-                device.cmdBindIndexBuffer(cmd, surface.index_buffer, 0, .uint32);
+                    device.cmdBindIndexBuffer(cmd, surface.index_buffer, 0, .uint32);
 
-                var push_constants: GPUDrawPushConstants = .{
-                    .worldMatrix = surface.transform,
-                    .vertexBuffer = surface.vertex_buffer_address,
-                };
-                device.cmdPushConstants(cmd, surface.material.?.pipeline.layout, .{ .vertex_bit = true }, 0, @sizeOf(GPUDrawPushConstants), &push_constants);
+                    var push_constants: GPUDrawPushConstants = .{
+                        .worldMatrix = surface.transform,
+                        .vertexBuffer = surface.vertex_buffer_address,
+                    };
+                    device.cmdPushConstants(cmd, surface.material.?.pipeline.layout, .{ .vertex_bit = true }, 0, @sizeOf(GPUDrawPushConstants), &push_constants);
 
-                device.cmdDrawIndexed(cmd, surface.index_count, 1, surface.first_index, 0, 0);
+                    device.cmdDrawIndexed(cmd, surface.index_count, 1, surface.first_index, 0, 0);
+                }
             }
         }
 
