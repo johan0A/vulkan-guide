@@ -94,9 +94,13 @@ pub fn loadGltf(
 
     // temporal arrays for all the objects to use while creating the GLTF data
     var meshes: std.ArrayList(*MeshAsset) = .empty;
+    defer meshes.deinit(gpa);
     var nodes: std.ArrayList(*vk_engine.scene.Node) = .empty;
+    defer nodes.deinit(gpa);
     var images: std.ArrayList(vk_engine.AllocatedImage) = .empty;
+    defer images.deinit(gpa);
     var materials: std.ArrayList(*GltfMaterial) = .empty;
+    defer materials.deinit(gpa);
 
     // load all textures
     for (gltf.data.images) |gltf_image| {
@@ -174,7 +178,9 @@ pub fn loadGltf(
     // use the same vectors for all meshes so that the memory doesnt reallocate as
     // // often
     var indices: std.ArrayList(u32) = .empty;
+    defer indices.deinit(gpa);
     var vertices: std.ArrayList(vk_engine.Vertex) = .empty;
+    defer vertices.deinit(gpa);
 
     for (gltf.data.meshes) |mesh| {
         defer indices.clearRetainingCapacity();

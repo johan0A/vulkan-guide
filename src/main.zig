@@ -1,5 +1,9 @@
 pub fn main(init: std.process.Init) !void {
-    var tracy_allocator = tracy.TracyAllocator.init(init.gpa, "main gpa");
+    var debug_allocator: std.heap.DebugAllocator(.{
+        .stack_trace_frames = 8,
+    }) = .init;
+    defer _ = debug_allocator.deinit();
+    var tracy_allocator = tracy.TracyAllocator.init(debug_allocator.allocator(), "main gpa");
     const gpa = tracy_allocator.allocator();
 
     var scratch: Scratch = try .init(gpa);

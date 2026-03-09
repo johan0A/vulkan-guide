@@ -127,6 +127,61 @@ pub const scene = struct {
 
             for (self.children.items) |child| try child.draw(gpa, top_matrix, ctx);
         }
+
+        pub fn clearAll(self: *Node, gpa: Allocator, engine: *const Engine) void {
+            const device = engine.device_ctx.device;
+
+            for (self.children.items) |child| {
+                child.clearAll(gpa, engine);
+            }
+            self.children.deinit(gpa);
+
+            if (self.gltf) |gltf| {
+                gltf.descriptor_pool.deinit(gpa, device);
+                gltf.material_data_buffer.destroy(engine.device_ctx.vma_allocator);
+
+                var mesh_it = gltf.meshes.valueIterator();
+                while (mesh_it.next()) |mesh| {
+                    mesh.*.mesh_buffers.index_buffer.destroy(engine.device_ctx.vma_allocator);
+                    mesh.*.mesh_buffers.vertex_buffer.destroy(engine.device_ctx.vma_allocator);
+                    mesh.*.surfaces.deinit(gpa);
+                    gpa.destroy(mesh.*);
+                }
+
+                var image_it = gltf.images.valueIterator();
+                while (image_it.next()) |image| {
+                    if (image.image == engine.error_checkerboard_image.image) {
+                        continue;
+                    }
+
+                    engine.destroyImage(image);
+                }
+
+                var material_it = gltf.materials.valueIterator();
+                while (material_it.next()) |material| {
+                    gpa.destroy(material.*);
+                }
+
+                for (gltf.samplers.items) |sampler| {
+                    device.destroySampler(sampler, null);
+                }
+
+                for (gltf.top_nodes.items) |top_node| {
+                    top_node.clearAll(gpa, engine);
+                }
+                gltf.top_nodes.deinit(gpa);
+
+                gltf.images.deinit(gpa);
+                gltf.materials.deinit(gpa);
+                gltf.meshes.deinit(gpa);
+                gltf.samplers.deinit(gpa);
+                gltf.nodes.deinit(gpa);
+
+                gpa.destroy(gltf);
+            }
+
+            gpa.destroy(self);
+        }
     };
 };
 
@@ -142,7 +197,7 @@ const MaterialPipeline = struct {
 };
 
 pub const MaterialInstance = struct {
-    pipeline: *MaterialPipeline,
+    pipeline: MaterialPipeline,
     material_set: vk.DescriptorSet,
     pass_type: MaterialPass,
 };
@@ -277,7 +332,7 @@ pub const GltfMetallicRoughness = struct {
     ) !MaterialInstance {
         const mat_data: MaterialInstance = .{
             .pass_type = pass,
-            .pipeline = if (pass == .transparent) &self.transparent_pipeline else &self.opaque_pipeline,
+            .pipeline = if (pass == .transparent) self.transparent_pipeline else self.opaque_pipeline,
             .material_set = try descriptor_allocator.allocate(gpa, scratch, device, self.material_layout, null),
         };
 
@@ -1733,7 +1788,42 @@ pub const Engine = struct {
 
         try loaded_scenes.put(gpa, "structure", loaded_scene_node);
 
-        //  ["structure"] = *structureFile;
+        const debug_callback = struct {
+            fn debugCallback(
+                message_severity: vk.DebugUtilsMessageSeverityFlagsEXT,
+                message_types: vk.DebugUtilsMessageTypeFlagsEXT,
+                p_callback_data: ?*const vk.DebugUtilsMessengerCallbackDataEXT,
+                p_user_data: ?*anyopaque,
+            ) callconv(vk.vulkan_call_conv) vk.Bool32 {
+                _ = message_types;
+                _ = p_user_data;
+
+                const callback_data = p_callback_data orelse @panic("");
+                const message_ptr = callback_data.p_message orelse "no message";
+
+                const message = std.mem.span(message_ptr);
+
+                if (message_severity.error_bit_ext) {
+                    std.log.err("Validation: {s}", .{message});
+                } else if (message_severity.warning_bit_ext) {
+                    std.log.warn("Validation: {s}", .{message});
+                } else {
+                    std.log.info("Validation: {s}", .{message});
+                }
+
+                std.debug.dumpCurrentStackTrace(.{});
+
+                return .false;
+            }
+        };
+
+        const debug_messenger_info: vk.DebugUtilsMessengerCreateInfoEXT = .{
+            .message_severity = .{ .verbose_bit_ext = true, .warning_bit_ext = true, .error_bit_ext = true },
+            .message_type = .{ .general_bit_ext = true, .validation_bit_ext = true, .performance_bit_ext = true },
+            .pfn_user_callback = debug_callback.debugCallback,
+        };
+
+        const debug_messenger = try instance_proxy.createDebugUtilsMessengerEXT(&debug_messenger_info, null);
 
         return .{
             .vk_ctx = .{
@@ -1741,7 +1831,7 @@ pub const Engine = struct {
                 .instance = instance_proxy,
                 .window_surface = sdl_window_surface,
                 .chosen_gpu = physical_device,
-                .debug_messenger = .null_handle,
+                .debug_messenger = debug_messenger,
             },
 
             .device_ctx = device_ctx,
@@ -1893,7 +1983,7 @@ pub const Engine = struct {
 
     pub fn destroyImage(self: Engine, img: *AllocatedImage) void {
         self.device_ctx.device.destroyImageView(img.image_view, null);
-        c.vmaDestroyImage(self.device_ctx.vma_allocator, img.image, img.allocation);
+        c.vmaDestroyImage(self.device_ctx.vma_allocator, @ptrFromInt(@intFromEnum(img.image)), img.allocation);
     }
 
     pub fn resizeSwapchain(self: *Engine, gpa: Allocator, scratch: *Scratch) !void {
@@ -1940,6 +2030,12 @@ pub const Engine = struct {
             self.frames[i].frame_descriptors.deinit(gpa, device);
         }
 
+        var it = self.loaded_scenes.valueIterator();
+        while (it.next()) |s| {
+            s.*.clearAll(gpa, self);
+        }
+        self.loaded_scenes.deinit(gpa);
+
         self.metal_rough_material.deinit(gpa, device);
 
         self.main_deletion_queue.deinit(gpa, .{
@@ -1954,6 +2050,7 @@ pub const Engine = struct {
 
         device.destroyDevice(null);
         self.vk_ctx.instance.destroySurfaceKHR(self.vk_ctx.window_surface, null);
+        self.vk_ctx.instance.destroyDebugUtilsMessengerEXT(self.vk_ctx.debug_messenger, null);
         self.vk_ctx.instance.destroyInstance(null);
 
         c.SDL_DestroyWindow(self.window);
@@ -2624,10 +2721,16 @@ const vk_init = struct {
 
         if (enable_validation_layers) try checkValidationLayerSupport(scratch, base_dispatch);
 
+        var extensions: std.ArrayList([*:0]const u8) = .empty;
+        try extensions.appendSlice(scratch.allocator(), @ptrCast(sdl_required_extensions));
+        try extensions.appendSlice(scratch.allocator(), &.{
+            vk.extensions.ext_debug_utils.name.ptr,
+        });
+
         const create_info = vk.InstanceCreateInfo{
             .p_application_info = &appinfo,
-            .enabled_extension_count = @intCast(sdl_required_extensions.len),
-            .pp_enabled_extension_names = @ptrCast(sdl_required_extensions),
+            .enabled_extension_count = @intCast(extensions.items.len),
+            .pp_enabled_extension_names = @ptrCast(extensions.items),
             .pp_enabled_layer_names = if (enable_validation_layers) @ptrCast(&validation_layers) else null,
             .enabled_layer_count = if (enable_validation_layers) @intCast(validation_layers.len) else 0,
         };
