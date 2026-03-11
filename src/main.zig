@@ -42,11 +42,15 @@ pub fn main(init: std.process.Init) !void {
             continue;
         }
 
+        tracy.frameMarkStart(null);
+
         try engine.draw(gpa, &scratch);
 
         if (engine.resize_requested) {
             try engine.resizeSwapchain(gpa, &scratch);
         }
+
+        tracy.frameMarkEnd(null);
     }
 }
 

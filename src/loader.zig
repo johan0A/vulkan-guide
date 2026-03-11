@@ -80,8 +80,8 @@ pub fn loadGltf(
             .address_mode_w = .repeat,
             .address_mode_u = .repeat,
             .mip_lod_bias = 0,
-            .anisotropy_enable = .false,
-            .max_anisotropy = 0,
+            .anisotropy_enable = .true,
+            .max_anisotropy = 16,
             .compare_enable = .false,
             .compare_op = .never,
             .border_color = .float_transparent_black,
@@ -387,9 +387,9 @@ fn loadImage(
         imm,
         @ptrCast(image_buff),
         image_size,
-        .r8g8b8a8_unorm,
+        .r8g8b8a8_srgb,
         .{ .sampled_bit = true },
-        false,
+        true,
     );
 }
 

@@ -911,7 +911,7 @@ pub const Engine = struct {
 
     pub const ImmSubmit = struct {
         fence: vk.Fence,
-        command_buffer: vk.CommandBuffer,
+        cmd: vk.CommandBuffer,
         command_pool: vk.CommandPool,
     };
 
@@ -975,6 +975,9 @@ pub const Engine = struct {
     loaded_scenes: std.StringHashMapUnmanaged(*scene.Node),
 
     pub fn draw(self: *Engine, gpa: Allocator, scratch: *Scratch) !void {
+        const zone = tracy.zone(@src());
+        defer zone.end();
+
         try self.updateScene(gpa);
 
         const local = struct {
@@ -1666,7 +1669,7 @@ pub const Engine = struct {
             .vma_allocator = vma_allocator,
         };
         const imm: ImmSubmit = .{
-            .command_buffer = imm_command_buffer,
+            .cmd = imm_command_buffer,
             .command_pool = imm_command_pool,
             .fence = imm_fence,
         };
@@ -1943,10 +1946,9 @@ pub const Engine = struct {
         const data_size: usize = size.depth * size.width * size.height * 4;
         const upload_buffer: VmaGpuBuffer = try .create(device_ctx.vma_allocator, data_size, .{ .transfer_src_bit = true }, .cpu_to_gpu);
 
-        @memcpy(
-            @as([*]u8, @ptrCast(upload_buffer.info.pMappedData)),
-            @as([*]const u8, @ptrCast(data))[0..data_size],
-        );
+        const map = try upload_buffer.map(device_ctx.vma_allocator, u8);
+        @memcpy(map, @as([*]const u8, @ptrCast(data)));
+        upload_buffer.unMap(device_ctx.vma_allocator);
 
         var new_usage = usage;
         new_usage.transfer_dst_bit = true;
@@ -1954,10 +1956,9 @@ pub const Engine = struct {
         const new_image = try createImage(device_ctx, size, format, new_usage, mipmapped);
 
         {
-            try immediateModeBegin(device_ctx.device, imm.fence, imm.command_buffer);
-            // vkutil::transition_image(cmd, new_image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            try immediateModeBegin(device_ctx.device, imm.fence, imm.cmd);
 
-            vk_image.transitionImage(device_ctx.device, imm.command_buffer, new_image.image, .undefined, .transfer_dst_optimal);
+            vk_image.transitionImage(device_ctx.device, imm.cmd, new_image.image, .undefined, .transfer_dst_optimal);
 
             const copy_region: vk.BufferImageCopy = .{
                 .buffer_offset = 0,
@@ -1973,10 +1974,15 @@ pub const Engine = struct {
                 .image_extent = size,
                 .image_offset = .{ .x = 0, .y = 0, .z = 0 },
             };
-            device_ctx.device.cmdCopyBufferToImage(imm.command_buffer, upload_buffer.buffer, new_image.image, .transfer_dst_optimal, &.{copy_region});
+            device_ctx.device.cmdCopyBufferToImage(imm.cmd, upload_buffer.buffer, new_image.image, .transfer_dst_optimal, &.{copy_region});
 
-            vk_image.transitionImage(device_ctx.device, imm.command_buffer, new_image.image, .transfer_dst_optimal, .read_only_optimal);
-            try immediateModeEnd(device_ctx.device, imm.fence, imm.command_buffer, device_ctx.graphics_queue);
+            if (mipmapped) {
+                vk_image.generateMipmaps(device_ctx.device, imm.cmd, new_image.image, .{ .width = new_image.image_extent.width, .height = new_image.image_extent.height });
+            } else {
+                vk_image.transitionImage(device_ctx.device, imm.cmd, new_image.image, .transfer_dst_optimal, .read_only_optimal);
+            }
+
+            try immediateModeEnd(device_ctx.device, imm.fence, imm.cmd, device_ctx.graphics_queue);
         }
 
         upload_buffer.destroy(device_ctx.vma_allocator);
@@ -2094,6 +2100,9 @@ pub const Engine = struct {
     }
 
     pub fn updateScene(self: *Engine, gpa: Allocator) !void {
+        const zone = tracy.zone(@src());
+        defer zone.end();
+
         self.main_draw_context.transparent_surfaces.clearRetainingCapacity();
         self.main_draw_context.opaque_surfaces.clearRetainingCapacity();
 
@@ -2122,6 +2131,11 @@ pub const Engine = struct {
     }
 
     pub fn drawGeometry(self: *Engine, gpa: Allocator, scratch: *Scratch, cmd: vk.CommandBuffer) !void {
+        const checkpoint = scratch.checkpoint();
+        defer scratch.restoreCheckpoint(checkpoint);
+        const zone = tracy.zone(@src());
+        defer zone.end();
+
         //begin a render pass connected to our draw image
         const color_attachment: vk.RenderingAttachmentInfo = vk_init.attachmentInfo(self.draw_image.image_view, null, .attachment_optimal);
         const depthAttachment: vk.RenderingAttachmentInfo = vk_init.depthAttachmentInfo(self.depth_image.image_view, .depth_attachment_optimal);
@@ -2130,24 +2144,6 @@ pub const Engine = struct {
         const device = self.device_ctx.device;
 
         device.cmdBeginRendering(cmd, &render_info);
-
-        //set dynamic viewport and scissor
-        const viewport: vk.Viewport = .{
-            .x = 0,
-            .y = 0,
-            .width = @floatFromInt(self.draw_extent.width),
-            .height = @floatFromInt(self.draw_extent.height),
-            .min_depth = 0,
-            .max_depth = 1,
-        };
-
-        device.cmdSetViewport(cmd, 0, &.{viewport});
-
-        const scissor: vk.Rect2D = .{
-            .offset = .{ .x = 0, .y = 0 },
-            .extent = .{ .width = self.draw_extent.width, .height = self.draw_extent.height },
-        };
-        device.cmdSetScissor(cmd, 0, &.{scissor});
 
         {
             //allocate a new uniform buffer for the scene data
@@ -2161,32 +2157,73 @@ pub const Engine = struct {
             gpu_scene_data_buffer.unMap(self.device_ctx.vma_allocator);
 
             //create a descriptor set that binds that buffer and update it
-            const globalDescriptor: vk.DescriptorSet = try self.currentFrame().frame_descriptors.allocate(gpa, scratch, device, self.gpu_scene_data_descriptor_layout, null);
+            const global_descriptor: vk.DescriptorSet = try self.currentFrame().frame_descriptors.allocate(gpa, scratch, device, self.gpu_scene_data_descriptor_layout, null);
 
             var writer: descriptors.DescriptorWriter = .{};
             try writer.writeBuffer(scratch.allocator(), 0, gpu_scene_data_buffer.buffer, @sizeOf(GPUSceneData), 0, .uniform_buffer);
-            writer.updateSet(device, globalDescriptor);
+            writer.updateSet(device, global_descriptor);
 
-            inline for (.{
+            var draw_calls: usize = 0;
+            var triangle_count: usize = 0;
+
+            var last_pipeline: MaterialPipeline = undefined;
+            var last_material: ?*MaterialInstance = undefined;
+            var last_index_buffer: vk.Buffer = .null_handle;
+
+            for ([_][]scene.RenderObject{
                 self.main_draw_context.opaque_surfaces.items,
                 self.main_draw_context.transparent_surfaces.items,
             }) |sufaces| {
-                for (sufaces) |surface| {
-                    device.cmdBindPipeline(cmd, .graphics, surface.material.?.pipeline.pipeline);
-                    device.cmdBindDescriptorSets(cmd, .graphics, surface.material.?.pipeline.layout, 0, &.{globalDescriptor}, null);
-                    device.cmdBindDescriptorSets(cmd, .graphics, surface.material.?.pipeline.layout, 1, &.{surface.material.?.material_set}, null);
+                for (sufaces) |r| {
+                    if (r.material != last_material) {
+                        last_material = r.material;
 
-                    device.cmdBindIndexBuffer(cmd, surface.index_buffer, 0, .uint32);
+                        if (!std.meta.eql(r.material.?.pipeline, last_pipeline)) {
+                            last_pipeline = r.material.?.pipeline;
+
+                            device.cmdBindPipeline(cmd, .graphics, r.material.?.pipeline.pipeline);
+                            device.cmdBindDescriptorSets(cmd, .graphics, r.material.?.pipeline.layout, 0, &.{global_descriptor}, null);
+
+                            const viewport: vk.Viewport = .{
+                                .x = 0,
+                                .y = 0,
+                                .width = @floatFromInt(self.draw_extent.width),
+                                .height = @floatFromInt(self.draw_extent.height),
+                                .min_depth = 0,
+                                .max_depth = 1,
+                            };
+                            device.cmdSetViewport(cmd, 0, &.{viewport});
+
+                            const scissor: vk.Rect2D = .{
+                                .offset = .{ .x = 0, .y = 0 },
+                                .extent = .{ .width = self.draw_extent.width, .height = self.draw_extent.height },
+                            };
+                            device.cmdSetScissor(cmd, 0, &.{scissor});
+                        }
+
+                        device.cmdBindDescriptorSets(cmd, .graphics, r.material.?.pipeline.layout, 1, &.{r.material.?.material_set}, null);
+                    }
+
+                    if (r.index_buffer != last_index_buffer) {
+                        last_index_buffer = r.index_buffer;
+                        device.cmdBindIndexBuffer(cmd, r.index_buffer, 0, .uint32);
+                    }
 
                     var push_constants: GPUDrawPushConstants = .{
-                        .worldMatrix = surface.transform,
-                        .vertexBuffer = surface.vertex_buffer_address,
+                        .worldMatrix = r.transform,
+                        .vertexBuffer = r.vertex_buffer_address,
                     };
-                    device.cmdPushConstants(cmd, surface.material.?.pipeline.layout, .{ .vertex_bit = true }, 0, @sizeOf(GPUDrawPushConstants), &push_constants);
+                    device.cmdPushConstants(cmd, r.material.?.pipeline.layout, .{ .vertex_bit = true }, 0, @sizeOf(GPUDrawPushConstants), &push_constants);
 
-                    device.cmdDrawIndexed(cmd, surface.index_count, 1, surface.first_index, 0, 0);
+                    device.cmdDrawIndexed(cmd, r.index_count, 1, r.first_index, 0, 0);
+
+                    draw_calls += 1;
+                    triangle_count += r.index_count / 3;
                 }
             }
+
+            tracy.plot("draw calls", @floatFromInt(draw_calls));
+            tracy.plot("triangle count", @floatFromInt(triangle_count));
         }
 
         device.cmdEndRendering(cmd);
@@ -2246,23 +2283,23 @@ pub const Engine = struct {
         }
 
         {
-            try immediateModeBegin(device, imm.fence, imm.command_buffer);
+            try immediateModeBegin(device, imm.fence, imm.cmd);
 
             const vertexCopy: vk.BufferCopy = .{
                 .dst_offset = 0,
                 .src_offset = 0,
                 .size = vertexBufferSize,
             };
-            device.cmdCopyBuffer(imm.command_buffer, staging.buffer, newSurface.vertex_buffer.buffer, &.{vertexCopy});
+            device.cmdCopyBuffer(imm.cmd, staging.buffer, newSurface.vertex_buffer.buffer, &.{vertexCopy});
 
             const indexCopy: vk.BufferCopy = .{
                 .dst_offset = 0,
                 .src_offset = vertexBufferSize,
                 .size = indexBufferSize,
             };
-            device.cmdCopyBuffer(imm.command_buffer, staging.buffer, newSurface.index_buffer.buffer, &.{indexCopy});
+            device.cmdCopyBuffer(imm.cmd, staging.buffer, newSurface.index_buffer.buffer, &.{indexCopy});
 
-            try immediateModeEnd(device, imm.fence, imm.command_buffer, device_ctx.graphics_queue);
+            try immediateModeEnd(device, imm.fence, imm.cmd, device_ctx.graphics_queue);
         }
 
         return newSurface;
@@ -2572,6 +2609,99 @@ const vk_image = struct {
             .p_regions = (&blitRegion)[0..1],
         });
     }
+
+    pub fn generateMipmaps(
+        device: vk.DeviceProxy,
+        cmd: vk.CommandBuffer,
+        image: vk.Image,
+        image_size: vk.Extent2D,
+    ) void {
+        const mip_levels: u32 = std.math.log2_int(u32, @max(image_size.width, image_size.height)) + 1;
+
+        var previous_image_size = image_size;
+        for (0..mip_levels) |mip| {
+            const half_size: vk.Extent2D = .{
+                .width = @max(previous_image_size.width / 2, 1),
+                .height = @max(previous_image_size.height / 2, 1),
+            };
+
+            const aspect_mask: vk.ImageAspectFlags = .{ .color_bit = true };
+            var subresource_range = vk_init.imageSubresourceRange(aspect_mask);
+            subresource_range.level_count = 1;
+            subresource_range.base_mip_level = @intCast(mip);
+
+            const image_barrier: vk.ImageMemoryBarrier2 = .{
+                .src_stage_mask = .{ .all_commands_bit = true },
+                .src_access_mask = .{ .memory_write_bit = true },
+                .dst_stage_mask = .{ .all_commands_bit = true },
+                .dst_access_mask = .{ .memory_write_bit = true, .memory_read_bit = true },
+
+                .old_layout = .transfer_dst_optimal,
+                .new_layout = .transfer_src_optimal,
+
+                .subresource_range = subresource_range,
+                .image = image,
+
+                .src_queue_family_index = 0,
+                .dst_queue_family_index = 0,
+            };
+
+            const dep_info: vk.DependencyInfo = .{
+                .image_memory_barrier_count = 1,
+                .p_image_memory_barriers = &.{image_barrier},
+            };
+            device.cmdPipelineBarrier2(cmd, &dep_info);
+
+            if (mip < mip_levels - 1) {
+                const blit_region: vk.ImageBlit2 = .{
+                    .src_offsets = .{
+                        .{ .x = 0, .y = 0, .z = 0 },
+                        .{
+                            .x = @intCast(previous_image_size.width),
+                            .y = @intCast(previous_image_size.height),
+                            .z = 1,
+                        },
+                    },
+                    .dst_offsets = .{
+                        .{ .x = 0, .y = 0, .z = 0 },
+                        .{
+                            .x = @intCast(half_size.width),
+                            .y = @intCast(half_size.height),
+                            .z = 1,
+                        },
+                    },
+                    .src_subresource = .{
+                        .aspect_mask = .{ .color_bit = true },
+                        .base_array_layer = 0,
+                        .layer_count = 1,
+                        .mip_level = @intCast(mip),
+                    },
+                    .dst_subresource = .{
+                        .aspect_mask = .{ .color_bit = true },
+                        .base_array_layer = 0,
+                        .layer_count = 1,
+                        .mip_level = @intCast(mip + 1),
+                    },
+                };
+
+                const blit_info: vk.BlitImageInfo2 = .{
+                    .dst_image = image,
+                    .dst_image_layout = .transfer_dst_optimal,
+                    .src_image = image,
+                    .src_image_layout = .transfer_src_optimal,
+                    .filter = .linear,
+                    .region_count = 1,
+                    .p_regions = &.{blit_region},
+                };
+
+                device.cmdBlitImage2(cmd, &blit_info);
+
+                previous_image_size = half_size;
+            }
+        }
+        // transition all mip levels into the final read_only layout
+        vk_image.transitionImage(device, cmd, image, .transfer_src_optimal, .read_only_optimal);
+    }
 };
 
 const vk_init = struct {
@@ -2879,6 +3009,7 @@ const vk_init = struct {
             .queue_create_info_count = @intCast(queue_create_infos.items.len),
             .pp_enabled_extension_names = &required_device_extensions,
             .enabled_extension_count = required_device_extensions.len,
+            .p_enabled_features = &.{ .sampler_anisotropy = .true },
         }, null);
     }
 };
