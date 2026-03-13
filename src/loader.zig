@@ -27,6 +27,8 @@ pub fn loadGltf(
     device_ctx: vk_engine.Engine.DeviceContext,
     imm: vk_engine.Engine.ImmSubmit,
     filePath: []const u8,
+    bindless_descriptors: *vk_engine.BindlessDescriptors,
+    materials_buffer: *vk_engine.GltfMetallicRoughness.MaterialsBuffer,
 ) !*LoadedGltf {
     std.log.info("Loading GLTF: {s}", .{filePath});
     const checkpoint = scratch.checkpoint();
@@ -116,63 +118,55 @@ pub fn loadGltf(
     // create buffer to hold the material data
     scene.material_data_buffer = try .create(
         device_ctx.vma_allocator,
-        @sizeOf(vk_engine.GltfMetallicRoughness.MaterialConstants) * gltf.data.materials.len,
+        @sizeOf(vk_engine.GltfMetallicRoughness.GPUMaterialData) * gltf.data.materials.len,
         .{ .uniform_buffer_bit = true },
         .cpu_to_gpu,
+        .sequential_write,
     );
 
-    {
-        const scene_material_constants = try scene.material_data_buffer.map(device_ctx.vma_allocator, vk_engine.GltfMetallicRoughness.MaterialConstants);
-        defer scene.material_data_buffer.unMap(device_ctx.vma_allocator);
+    for (gltf.data.materials) |material| {
+        const new_mat = try gpa.create(GltfMaterial);
 
-        for (gltf.data.materials, 0..) |material, i| {
-            const new_mat = try gpa.create(GltfMaterial);
+        try materials.append(gpa, new_mat);
+        try scene.materials.put(gpa, material.name.?, new_mat); // TODO: handle null
 
-            try materials.append(gpa, new_mat);
-            try scene.materials.put(gpa, material.name.?, new_mat); // TODO: handle null
+        const pass_type: vk_engine.MaterialPass = switch (material.alpha_mode) {
+            .blend => .transparent,
+            else => .main_color,
+        };
 
-            const constants: vk_engine.GltfMetallicRoughness.MaterialConstants = .{
-                .color_factors = material.metallic_roughness.base_color_factor,
-                .metal_rough_factors = .{
-                    material.metallic_roughness.metallic_factor,
-                    material.metallic_roughness.roughness_factor,
-                    0,
-                    0,
-                },
-            };
+        // default the material textures
+        var material_resources: vk_engine.GltfMetallicRoughness.MaterialResources = .{
+            .color_image = white_image,
+            .color_sampler = default_sampler_linear,
+            .metal_rough_image = white_image,
+            .metal_rough_sampler = default_sampler_linear,
+            .color_factors = material.metallic_roughness.base_color_factor,
+            .metal_rough_factors = .{
+                material.metallic_roughness.metallic_factor,
+                material.metallic_roughness.roughness_factor,
+                0,
+                0,
+            },
+        };
 
-            // write material parameters to buffer
-            scene_material_constants[i] = constants;
+        // grab textures from gltf file
+        if (material.metallic_roughness.base_color_texture != null) {
+            const image = gltf.data.textures[material.metallic_roughness.base_color_texture.?.index].source.?;
+            const sampler = gltf.data.textures[material.metallic_roughness.base_color_texture.?.index].sampler.?;
 
-            const pass_type: vk_engine.MaterialPass = switch (material.alpha_mode) {
-                .blend => .transparent,
-                else => .main_color,
-            };
-
-            // default the material textures
-            var material_resources: vk_engine.GltfMetallicRoughness.MaterialResources = .{
-                .color_image = white_image,
-                .color_sampler = default_sampler_linear,
-                .metal_rough_image = white_image,
-                .metal_rough_sampler = default_sampler_linear,
-                .data_buffer = .null_handle,
-                .data_buffer_offset = 0,
-            };
-
-            // set the uniform buffer for the material data
-            material_resources.data_buffer = scene.material_data_buffer.buffer;
-            material_resources.data_buffer_offset = @intCast(i * @sizeOf(vk_engine.GltfMetallicRoughness.MaterialConstants));
-            // grab textures from gltf file
-            if (material.metallic_roughness.base_color_texture != null) {
-                const image = gltf.data.textures[material.metallic_roughness.base_color_texture.?.index].source.?;
-                const sampler = gltf.data.textures[material.metallic_roughness.base_color_texture.?.index].sampler.?;
-
-                material_resources.color_image = images.items[image];
-                material_resources.color_sampler = scene.samplers.items[sampler];
-            }
-            // build material
-            new_mat.data = try metal_rough_material.writeMaterial(gpa, scratch, device_ctx.device, pass_type, &material_resources, &scene.descriptor_pool);
+            material_resources.color_image = images.items[image];
+            material_resources.color_sampler = scene.samplers.items[sampler];
         }
+
+        new_mat.data = try metal_rough_material.writeMaterial(
+            gpa,
+            device_ctx.device,
+            pass_type,
+            &material_resources,
+            bindless_descriptors,
+            materials_buffer,
+        );
     }
 
     // use the same vectors for all meshes so that the memory doesnt reallocate as

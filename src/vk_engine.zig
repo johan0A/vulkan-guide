@@ -189,17 +189,15 @@ pub const scene = struct {
 pub const MaterialPass = enum(u8) {
     main_color,
     transparent,
-    other,
 };
 
 const MaterialPipeline = struct {
     pipeline: vk.Pipeline,
-    layout: vk.PipelineLayout,
 };
 
 pub const MaterialInstance = struct {
     pipeline: MaterialPipeline,
-    material_set: vk.DescriptorSet,
+    bindless_index: u32,
     pass_type: MaterialPass,
 };
 
@@ -207,15 +205,45 @@ pub const GltfMetallicRoughness = struct {
     opaque_pipeline: MaterialPipeline,
     transparent_pipeline: MaterialPipeline,
 
-    material_layout: vk.DescriptorSetLayout,
-
-    writer: descriptors.DescriptorWriter,
-
-    pub const MaterialConstants = extern struct {
+    /// Packed material data that lives in the global materials SSBO.
+    /// Shader reads this by materialIndex.
+    pub const GPUMaterialData = extern struct {
         color_factors: [4]f32,
         metal_rough_factors: [4]f32,
-        //padding, we need it anyway for uniform buffers
-        extra: [14][4]f32 = @splat(@splat(0)),
+        color_texture: u32, // index into bindless textures[]
+        metal_rough_texture: u32, // index into bindless textures[]
+        _padding: [2]u32 = .{ 0, 0 },
+    };
+
+    pub const MaterialsBuffer = struct {
+        gpu_buffer: VmaGpuBuffer,
+        capacity: u32,
+        len: u32,
+
+        fn init(max_len: u32, allocator: c.VmaAllocator) !MaterialsBuffer {
+            return .{
+                .gpu_buffer = try .create(
+                    allocator,
+                    max_len * @sizeOf(GPUMaterialData),
+                    .{ .storage_buffer_bit = true },
+                    .auto,
+                    .sequential_write,
+                ),
+                .capacity = max_len,
+                .len = 0,
+            };
+        }
+
+        fn deinit(self: MaterialsBuffer, allocator: c.VmaAllocator) void {
+            self.gpu_buffer.destroy(allocator);
+        }
+
+        fn append(self: *MaterialsBuffer, item: GPUMaterialData) u32 {
+            std.debug.assert(self.len < self.capacity);
+            self.gpu_buffer.getMappedSlice(GPUMaterialData)[self.len] = item;
+            defer self.len += 1;
+            return self.len;
+        }
     };
 
     pub const MaterialResources = struct {
@@ -223,14 +251,14 @@ pub const GltfMetallicRoughness = struct {
         color_sampler: vk.Sampler,
         metal_rough_image: AllocatedImage,
         metal_rough_sampler: vk.Sampler,
-        data_buffer: vk.Buffer,
-        data_buffer_offset: u32,
+        color_factors: [4]f32,
+        metal_rough_factors: [4]f32,
     };
 
     pub fn init(
         scratch: *Scratch,
         io: std.Io,
-        gpu_scene_data_descriptor_layout: vk.DescriptorSetLayout,
+        bindless_pipeline_layout: vk.PipelineLayout,
         draw_image: AllocatedImage,
         depth_image: AllocatedImage,
         device_proxy: vk.DeviceProxy,
@@ -240,42 +268,12 @@ pub const GltfMetallicRoughness = struct {
 
         const mesh_frag_shader_data = try loadShader(scratch.allocator(), io, shaders.mesh_frag);
         const mesh_frag_shader = try vk_init.loadShaderModule(mesh_frag_shader_data, device_proxy);
-        defer device_proxy.destroyShaderModule(mesh_frag_shader, null); // TODO: is destroy needed?
+        defer device_proxy.destroyShaderModule(mesh_frag_shader, null);
 
         const mesh_vertex_shader_data = try loadShader(scratch.allocator(), io, shaders.mesh_vert);
         const mesh_vertex_shader = try vk_init.loadShaderModule(mesh_vertex_shader_data, device_proxy);
-        defer device_proxy.destroyShaderModule(mesh_vertex_shader, null); // TODO: is destroy needed?
+        defer device_proxy.destroyShaderModule(mesh_vertex_shader, null);
 
-        var material_layout_descriptor_bindings = [_]vk.DescriptorSetLayoutBinding{
-            descriptors.layout.createSetBinding(0, .uniform_buffer),
-            descriptors.layout.createSetBinding(1, .combined_image_sampler),
-            descriptors.layout.createSetBinding(2, .combined_image_sampler),
-        };
-        const material_layout = try descriptors.layout.createSet(&material_layout_descriptor_bindings, device_proxy, .{ .fragment_bit = true, .vertex_bit = true }, null, .{});
-
-        const layouts: []const vk.DescriptorSetLayout = &.{
-            gpu_scene_data_descriptor_layout,
-            material_layout,
-        };
-
-        const matrix_range: vk.PushConstantRange = .{
-            .offset = 0,
-            .size = @sizeOf(GPUDrawPushConstants),
-            .stage_flags = .{ .vertex_bit = true },
-        };
-
-        // const mesh_layout_info: vk.PipelineLayoutCreateInfo = vk_init.pipelineLayoutCreateInfo(); // TODO: check if any more is done inside pipelineLayoutCreateInfo
-        const mesh_layout_info: vk.PipelineLayoutCreateInfo = .{
-            .set_layout_count = @intCast(layouts.len),
-            .p_set_layouts = layouts.ptr,
-            .p_push_constant_ranges = (&matrix_range)[0..1],
-            .push_constant_range_count = 1,
-        };
-
-        const new_layout = try device_proxy.createPipelineLayout(&mesh_layout_info, null);
-
-        // build the stage-create-info for both vertex and fragment stages. This lets
-        // the pipeline know the shader modules per stage
         var pipeline_builder: PipelineBuilder = .{};
         try pipeline_builder.setShaders(scratch.allocator(), mesh_vertex_shader, mesh_frag_shader);
         pipeline_builder.setInputTopology(.triangle_list);
@@ -284,66 +282,65 @@ pub const GltfMetallicRoughness = struct {
         pipeline_builder.setMultisamplingNone();
         pipeline_builder.disableBlending();
         pipeline_builder.enableDepthtest(true, .greater_or_equal);
-        //render format
         pipeline_builder.setColorAttachmentFormat(draw_image.image_format);
         pipeline_builder.setDepthFormat(depth_image.image_format);
 
-        // use the triangle layout we created
-        pipeline_builder.pipeline_layout = new_layout;
-
-        // finally build the pipeline
         const opaque_pipeline: MaterialPipeline = .{
-            .pipeline = try pipeline_builder.buildPipeline(device_proxy),
-            .layout = new_layout,
+            .pipeline = try pipeline_builder.buildPipeline(device_proxy, bindless_pipeline_layout),
         };
 
-        // create the transparent variant
         pipeline_builder.enableBlendingAdditive();
         pipeline_builder.enableDepthtest(false, .greater_or_equal);
 
         const transparent_pipeline: MaterialPipeline = .{
-            .pipeline = try pipeline_builder.buildPipeline(device_proxy),
-            .layout = new_layout,
+            .pipeline = try pipeline_builder.buildPipeline(device_proxy, bindless_pipeline_layout),
         };
 
         return .{
             .opaque_pipeline = opaque_pipeline,
             .transparent_pipeline = transparent_pipeline,
-            .material_layout = material_layout,
-            .writer = .{},
         };
     }
 
-    pub fn deinit(self: *GltfMetallicRoughness, gpa: Allocator, device: vk.DeviceProxy) void {
-        device.destroyDescriptorSetLayout(self.material_layout, null);
-        device.destroyPipelineLayout(self.transparent_pipeline.layout, null);
+    pub fn deinit(self: *GltfMetallicRoughness, device: vk.DeviceProxy) void {
         device.destroyPipeline(self.transparent_pipeline.pipeline, null);
         device.destroyPipeline(self.opaque_pipeline.pipeline, null);
-        self.writer.deinit(gpa);
     }
 
     pub fn writeMaterial(
         self: *GltfMetallicRoughness,
         gpa: Allocator,
-        scratch: *Scratch,
         device: vk.DeviceProxy,
         pass: MaterialPass,
         resources: *const MaterialResources,
-        descriptor_allocator: *descriptors.DescriptorAllocatorGrowable,
+        bindless: *BindlessDescriptors,
+        materials_buffer: *MaterialsBuffer,
     ) !MaterialInstance {
-        const mat_data: MaterialInstance = .{
+        const color_tex_index = try bindless.registerTexture(
+            gpa,
+            device,
+            resources.color_image.image_view,
+            resources.color_sampler,
+        );
+        const metal_rough_tex_index = try bindless.registerTexture(
+            gpa,
+            device,
+            resources.metal_rough_image.image_view,
+            resources.metal_rough_sampler,
+        );
+
+        const bindless_index = materials_buffer.append(.{
+            .color_factors = resources.color_factors,
+            .metal_rough_factors = resources.metal_rough_factors,
+            .color_texture = color_tex_index,
+            .metal_rough_texture = metal_rough_tex_index,
+        });
+
+        return .{
             .pass_type = pass,
             .pipeline = if (pass == .transparent) self.transparent_pipeline else self.opaque_pipeline,
-            .material_set = try descriptor_allocator.allocate(gpa, scratch, device, self.material_layout, null),
+            .bindless_index = bindless_index,
         };
-
-        self.writer.clear();
-        try self.writer.writeBuffer(gpa, 0, resources.data_buffer, @sizeOf(MaterialConstants), resources.data_buffer_offset, .uniform_buffer);
-        try self.writer.writeImage(gpa, 1, resources.color_image.image_view, resources.color_sampler, .read_only_optimal, .combined_image_sampler);
-        try self.writer.writeImage(gpa, 2, resources.metal_rough_image.image_view, resources.metal_rough_sampler, .read_only_optimal, .combined_image_sampler);
-        self.writer.updateSet(device, mat_data.material_set);
-
-        return mat_data;
     }
 };
 
@@ -357,9 +354,9 @@ pub const VmaGpuBuffer = struct {
     buffer: vk.Buffer,
     size: usize,
     allocation: c.VmaAllocation,
-    info: c.VmaAllocationInfo,
+    mapped: ?[*]u8,
 
-    const VmaMemoryUsage = enum(c_uint) {
+    pub const MemoryUsage = enum(c_uint) {
         unknown = 0,
         gpu_only = 1,
         cpu_only = 2,
@@ -370,65 +367,87 @@ pub const VmaGpuBuffer = struct {
         auto = 7,
         auto_prefer_device = 8,
         auto_prefer_host = 9,
-        max_enum = 2147483647,
     };
 
-    pub fn create(allocator: c.VmaAllocator, size: usize, usage: vk.BufferUsageFlags, memory_usage: VmaMemoryUsage) !VmaGpuBuffer {
+    pub const HostAccess = enum(c_uint) {
+        /// GPU-only, no host access needed
+        none = 0,
+        /// CPU writes, GPU reads (uniforms, dynamic vertex data, staging)
+        sequential_write = c.VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+        /// CPU readback or random access writes
+        random = c.VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+    };
+
+    pub fn create(
+        allocator: c.VmaAllocator,
+        size: usize,
+        usage: vk.BufferUsageFlags,
+        memory_usage: MemoryUsage,
+        host_access: HostAccess,
+    ) !VmaGpuBuffer {
         const buffer_info: vk.BufferCreateInfo = .{
             .usage = usage,
             .size = size,
-
             .sharing_mode = .exclusive,
         };
 
+        const host_flags: c_uint = @intFromEnum(host_access);
+        const mapped_flag: c_uint = if (host_access != .none) c.VMA_ALLOCATION_CREATE_MAPPED_BIT else 0;
+
         const vma_alloc_info: c.VmaAllocationCreateInfo = .{
             .usage = @intFromEnum(memory_usage),
-            .flags = c.VMA_ALLOCATION_CREATE_MAPPED_BIT,
+            .flags = host_flags | mapped_flag,
         };
 
+        var info: c.VmaAllocationInfo = undefined;
         var new_buffer: VmaGpuBuffer = undefined;
         new_buffer.size = size;
-        const result: vk.Result = @enumFromInt(c.vmaCreateBuffer(allocator, @ptrCast(&buffer_info), &vma_alloc_info, @ptrCast(&new_buffer.buffer), &new_buffer.allocation, &new_buffer.info));
+
+        const result: vk.Result = @enumFromInt(c.vmaCreateBuffer(
+            allocator,
+            @ptrCast(&buffer_info),
+            &vma_alloc_info,
+            @ptrCast(&new_buffer.buffer),
+            &new_buffer.allocation,
+            &info,
+        ));
+
         if (result != .success) {
             std.log.err("vma allocation: error {s}\n", .{@tagName(result)});
             return error.vma_allocation_failed;
         }
+
+        new_buffer.mapped = @ptrCast(info.pMappedData);
         return new_buffer;
     }
 
-    pub fn destroy(buffer: VmaGpuBuffer, allocator: c.VmaAllocator) void {
-        c.vmaDestroyBuffer(allocator, @ptrFromInt(@intFromEnum(buffer.buffer)), buffer.allocation);
+    pub fn destroy(self: VmaGpuBuffer, allocator: c.VmaAllocator) void {
+        c.vmaDestroyBuffer(allocator, @ptrFromInt(@intFromEnum(self.buffer)), self.allocation);
     }
 
-    pub const MapConfig = struct {
-        T: type = u8,
-    };
-
-    // TODO: reevaluate after https://github.com/ziglang/zig/issues/23935
-    pub fn map(self: VmaGpuBuffer, allocator: c.VmaAllocator, T: type) ![]T {
+    /// Returns the persistently mapped memory as a typed slice.
+    pub fn getMappedSlice(self: VmaGpuBuffer, comptime T: type) []T {
+        comptime assertMappableType(T);
         std.debug.assert(self.size % @sizeOf(T) == 0);
 
+        const ptr: [*]T = @ptrCast(@alignCast(self.mapped orelse std.debug.panic("getMappedSlice called on unmappable buffer", .{})));
+
+        return ptr[0 .. self.size / @sizeOf(T)];
+    }
+
+    fn assertMappableType(comptime T: type) void {
         switch (@typeInfo(T)) {
             inline .@"struct", .@"union" => |info| switch (info.layout) {
                 .@"extern", .@"packed" => {},
-                .auto => @compileError("T type must have a well defined memory layout"),
+                .auto => @compileError("T must have a well-defined memory layout (extern or packed)"),
             },
             .int, .float => {},
             .pointer => |info| switch (info.size) {
                 .one, .many, .c => {},
-                .slice => @compileError("T type must have a well defined memory layout"),
+                .slice => @compileError("T must have a well-defined memory layout"),
             },
-            else => @compileError("unsupported type"),
+            else => @compileError("unsupported type for buffer mapping"),
         }
-
-        var mapped: [*]T = undefined;
-        _ = c.vmaMapMemory(allocator, self.allocation, @ptrCast(&mapped)); // TODO handle error
-
-        return @alignCast(mapped[0 .. self.size / @sizeOf(T)]);
-    }
-
-    pub fn unMap(self: VmaGpuBuffer, allocator: c.VmaAllocator) void {
-        c.vmaUnmapMemory(allocator, self.allocation);
     }
 };
 
@@ -458,8 +477,10 @@ pub const GPUMeshBuffers = struct {
 
 // push constants for our mesh object draws
 pub const GPUDrawPushConstants = extern struct {
-    worldMatrix: Mat4,
-    vertexBuffer: vk.DeviceAddress,
+    world_matrix: Mat4,
+    vertex_buffer: vk.DeviceAddress,
+    material_index: u32,
+    scene_data_index: u32,
 };
 
 pub const AllocatedImage = struct {
@@ -482,12 +503,11 @@ pub const PipelineBuilder = struct {
     rasterizer: vk.PipelineRasterizationStateCreateInfo = std.mem.zeroInit(vk.PipelineRasterizationStateCreateInfo, .{}),
     color_blend_attachment: vk.PipelineColorBlendAttachmentState = std.mem.zeroInit(vk.PipelineColorBlendAttachmentState, .{}),
     multisampling: vk.PipelineMultisampleStateCreateInfo = std.mem.zeroInit(vk.PipelineMultisampleStateCreateInfo, .{}),
-    pipeline_layout: vk.PipelineLayout = .null_handle,
     depth_stencil: vk.PipelineDepthStencilStateCreateInfo = std.mem.zeroInit(vk.PipelineDepthStencilStateCreateInfo, .{}),
     render_info: vk.PipelineRenderingCreateInfo = std.mem.zeroInit(vk.PipelineRenderingCreateInfo, .{}),
     color_attachmentformat: vk.Format = .undefined,
 
-    pub fn buildPipeline(self: PipelineBuilder, device: vk.DeviceProxy) !vk.Pipeline {
+    pub fn buildPipeline(self: PipelineBuilder, device: vk.DeviceProxy, layout: vk.PipelineLayout) !vk.Pipeline {
         // make viewport state from our stored viewport and scissor.
         // at the moment we wont support multiple viewports or scissors
         const viewport_state: vk.PipelineViewportStateCreateInfo = .{
@@ -531,7 +551,7 @@ pub const PipelineBuilder = struct {
             .p_multisample_state = &self.multisampling,
             .p_color_blend_state = &color_blending,
             .p_depth_stencil_state = &self.depth_stencil,
-            .layout = self.pipeline_layout,
+            .layout = layout,
 
             .p_dynamic_state = &dynamic_info,
 
@@ -889,7 +909,6 @@ const FrameData = struct {
     main_command_buffer: vk.CommandBuffer,
 
     deletion_queue: DeletionQueue,
-    frame_descriptors: descriptors.DescriptorAllocatorGrowable,
 };
 
 pub const Engine = struct {
@@ -939,7 +958,6 @@ pub const Engine = struct {
     draw_image_descriptor_set_layout: vk.DescriptorSetLayout,
 
     scene_data: GPUSceneData,
-    gpu_scene_data_descriptor_layout: vk.DescriptorSetLayout,
 
     global_descriptor_allocator: descriptors.DescriptorAllocatorGrowable,
 
@@ -948,11 +966,8 @@ pub const Engine = struct {
 
     imm: ImmSubmit,
 
-    triangle_pipeline_layout: vk.PipelineLayout,
-    triangle_pipeline: vk.Pipeline,
-
-    mesh_pipeline_layout: vk.PipelineLayout,
-    mesh_pipeline: vk.Pipeline,
+    bindless_descriptors: BindlessDescriptors,
+    bindless_pipeline_layout: vk.PipelineLayout,
 
     // default images
     white_image: AllocatedImage,
@@ -1022,8 +1037,6 @@ pub const Engine = struct {
         _ = try device.waitForFences(&.{self.currentFrame().render_fence}, .true, 1e9);
 
         self.currentFrame().deletion_queue.flush(.{ .device = device, .vma_allocator = self.device_ctx.vma_allocator });
-
-        try self.currentFrame().frame_descriptors.clearPools(gpa, device);
 
         _ = try device.resetFences(&.{self.currentFrame().render_fence});
 
@@ -1136,8 +1149,12 @@ pub const Engine = struct {
         _ = try device.waitForFences(&.{imm_fence}, .true, 9999999999);
     }
 
+    pub inline fn currentFrameIndex(self: *const Engine) usize {
+        return self.frame_number % FrameData.FRAME_OVERLAP;
+    }
+
     pub inline fn currentFrame(self: *Engine) *FrameData {
-        return &self.frames[self.frame_number % FrameData.FRAME_OVERLAP];
+        return &self.frames[self.currentFrameIndex()];
     }
 
     pub fn init(gpa: Allocator, scratch: *Scratch, io: std.Io) !Engine {
@@ -1167,6 +1184,43 @@ pub const Engine = struct {
         const instance_dispatch = try init_alloc.create(vk.InstanceWrapper);
         instance_dispatch.* = vk.InstanceWrapper.load(instance, base_dispatch.dispatch.vkGetInstanceProcAddr.?);
         const instance_proxy: vk.InstanceProxy = .init(instance, instance_dispatch);
+
+        const debug_callback = struct {
+            fn debugCallback(
+                message_severity: vk.DebugUtilsMessageSeverityFlagsEXT,
+                message_types: vk.DebugUtilsMessageTypeFlagsEXT,
+                p_callback_data: ?*const vk.DebugUtilsMessengerCallbackDataEXT,
+                p_user_data: ?*anyopaque,
+            ) callconv(vk.vulkan_call_conv) vk.Bool32 {
+                _ = message_types;
+                _ = p_user_data;
+
+                const callback_data = p_callback_data orelse @panic("");
+                const message_ptr = callback_data.p_message orelse "no message";
+
+                const message = std.mem.span(message_ptr);
+
+                if (message_severity.error_bit_ext) {
+                    std.log.err("Validation: {s}", .{message});
+                } else if (message_severity.warning_bit_ext) {
+                    std.log.warn("Validation: {s}", .{message});
+                } else {
+                    std.log.info("Validation: {s}", .{message});
+                }
+
+                std.debug.dumpCurrentStackTrace(.{});
+
+                return .false;
+            }
+        };
+
+        const debug_messenger_info: vk.DebugUtilsMessengerCreateInfoEXT = .{
+            .message_severity = .{ .verbose_bit_ext = true, .warning_bit_ext = true, .error_bit_ext = true },
+            .message_type = .{ .general_bit_ext = true, .validation_bit_ext = true, .performance_bit_ext = true },
+            .pfn_user_callback = debug_callback.debugCallback,
+        };
+
+        const debug_messenger = try instance_proxy.createDebugUtilsMessengerEXT(&debug_messenger_info, null);
 
         var sdl_window_surface: vk.SurfaceKHR = undefined;
         if (!c.SDL_Vulkan_CreateSurface(window, @ptrFromInt(@intFromEnum(instance)), null, @ptrCast(&sdl_window_surface))) return error.engine_init_failure;
@@ -1206,8 +1260,6 @@ pub const Engine = struct {
                 .swapchain_semaphore = try device_proxy.createSemaphore(&.{}, null),
                 .main_command_buffer = main_command_buffer,
                 .deletion_queue = .init,
-
-                .frame_descriptors = undefined,
             };
         }
 
@@ -1378,32 +1430,6 @@ pub const Engine = struct {
         try writer.writeImage(gpa, 0, draw_allocated_image.image_view, .null_handle, .general, .storage_image);
 
         writer.updateSet(device_proxy, draw_image_descriptors);
-
-        for (&frames) |*frame| {
-            const frame_sizes: []const descriptors.DescriptorAllocatorGrowable.PoolSizeRatio = &.{
-                .{ .type = .storage_image, .ratio = 3 },
-                .{ .type = .storage_buffer, .ratio = 3 },
-                .{ .type = .uniform_buffer, .ratio = 3 },
-                .{ .type = .combined_image_sampler, .ratio = 4 },
-            };
-
-            frame.frame_descriptors = .empty;
-            try frame.frame_descriptors.init(gpa, scratch, device_proxy, 1000, frame_sizes);
-
-            // _mainDeletionQueue.push_function([&, i]() {
-            //     _frames[i]._frameDescriptors.destroy_pools(_device);
-            // });
-
-            // TODO: add to deletion queue
-            // main_deletion_queue.append(allocator, .{ .descriptor_pool =  });
-        }
-
-        var scene_data_bindings = [_]vk.DescriptorSetLayoutBinding{
-            descriptors.layout.createSetBinding(0, .uniform_buffer),
-        };
-        const gpu_scene_data_descriptor_layout = try descriptors.layout.createSet(&scene_data_bindings, device_proxy, .{ .vertex_bit = true, .fragment_bit = true }, null, .{});
-
-        try main_deletion_queue.append(gpa, .{ .descriptor_set_layout = gpu_scene_data_descriptor_layout });
 
         try main_deletion_queue.append(gpa, .{ .descriptor_set_layout = draw_image_descriptor_layout });
         // try main_deletion_queue.append(allocator, .{ .descriptor_allocator_growable = global_descriptor_allocator }); TODO
@@ -1576,83 +1602,22 @@ pub const Engine = struct {
             try main_deletion_queue.append(gpa, .imgui_impl_vulkan);
         }
 
-        // init_triangle_pipeline {
-        const triangleFragShader = try vk_init.loadShaderModule(try loadShader(scratch.allocator(), io, shaders.colored_triangle_frag), device_proxy);
-        defer device_proxy.destroyShaderModule(triangleFragShader, null);
-        const triangleVertexShader = try vk_init.loadShaderModule(try loadShader(scratch.allocator(), io, shaders.colored_triangle_vert), device_proxy);
-        defer device_proxy.destroyShaderModule(triangleVertexShader, null);
+        var bindless_descriptors: BindlessDescriptors = try .init(device_proxy);
 
-        //build the pipeline layout that controls the inputs/outputs of the shader
-        //we are not using descriptor sets or other systems yet, so no need to use anything other than empty default
-        const triangle_pipeline_layout = try device_proxy.createPipelineLayout(&.{}, null);
-
-        const triangle_pipeline = blk: {
-            var pipelineBuilder: PipelineBuilder = .{};
-            pipelineBuilder.pipeline_layout = triangle_pipeline_layout;
-            try pipelineBuilder.setShaders(scratch.allocator(), triangleVertexShader, triangleFragShader);
-            pipelineBuilder.setInputTopology(.triangle_list);
-            pipelineBuilder.setPolygonMode(.fill);
-            pipelineBuilder.setCullMode(.{ .back_bit = true }, .counter_clockwise);
-            pipelineBuilder.setMultisamplingNone();
-            pipelineBuilder.disableBlending();
-            pipelineBuilder.enableDepthtest(true, .less_or_equal);
-            pipelineBuilder.setColorAttachmentFormat(draw_allocated_image.image_format);
-            pipelineBuilder.setDepthFormat(depth_allocated_image.image_format);
-            break :blk try pipelineBuilder.buildPipeline(device_proxy);
-        };
-
-        try main_deletion_queue.append(gpa, .{ .pipeline_layout = triangle_pipeline_layout });
-        try main_deletion_queue.append(gpa, .{ .pipeline = triangle_pipeline });
-        // }
-
-        // init_mesh_pipeline {
-        const meshFragShader = try vk_init.loadShaderModule(try loadShader(scratch.allocator(), io, shaders.tex_image_frag), device_proxy);
-        defer device_proxy.destroyShaderModule(meshFragShader, null);
-        const meshVertexShader = try vk_init.loadShaderModule(try loadShader(scratch.allocator(), io, shaders.colored_triangle_mesh_vert), device_proxy);
-        defer device_proxy.destroyShaderModule(meshVertexShader, null);
-
-        const bufferRange: vk.PushConstantRange = .{
+        const push_range: vk.PushConstantRange = .{
             .offset = 0,
             .size = @sizeOf(GPUDrawPushConstants),
-            .stage_flags = .{ .vertex_bit = true },
+            .stage_flags = .{ .vertex_bit = true, .fragment_bit = true },
         };
 
-        var mesh_pipeline_layout_info: vk.PipelineLayoutCreateInfo = .{};
-        mesh_pipeline_layout_info.p_push_constant_ranges = (&bufferRange)[0..1];
-        mesh_pipeline_layout_info.push_constant_range_count = 1;
-        mesh_pipeline_layout_info.p_set_layouts = (&single_image_descriptor_layout)[0..1];
-        mesh_pipeline_layout_info.set_layout_count = 1;
+        const bindless_pipeline_layout = try device_proxy.createPipelineLayout(&.{
+            .set_layout_count = 1,
+            .p_set_layouts = (&bindless_descriptors.layout)[0..1],
+            .push_constant_range_count = 1,
+            .p_push_constant_ranges = &.{push_range},
+        }, null);
 
-        //build the pipeline layout that controls the inputs/outputs of the shader
-        //we are not using descriptor sets or other systems yet, so no need to use anything other than empty default
-        const mesh_pipeline_layout = try device_proxy.createPipelineLayout(&mesh_pipeline_layout_info, null);
-
-        //finally build the pipeline
-        const mesh_pipeline = blk: {
-            var pipelineBuilder: PipelineBuilder = .{};
-
-            pipelineBuilder.pipeline_layout = mesh_pipeline_layout;
-            //connecting the vertex and pixel shaders to the pipeline
-            try pipelineBuilder.setShaders(scratch.allocator(), meshVertexShader, meshFragShader);
-            //it will draw triangles
-            pipelineBuilder.setInputTopology(.triangle_list);
-            //filled triangles
-            pipelineBuilder.setPolygonMode(.fill);
-            pipelineBuilder.setCullMode(.{ .back_bit = true }, .counter_clockwise);
-            pipelineBuilder.setMultisamplingNone();
-            pipelineBuilder.disableBlending();
-            pipelineBuilder.enableDepthtest(true, .less_or_equal);
-
-            //connect the image format we will draw into, from draw image
-            pipelineBuilder.setColorAttachmentFormat(draw_allocated_image.image_format);
-            pipelineBuilder.setDepthFormat(depth_allocated_image.image_format);
-            break :blk try pipelineBuilder.buildPipeline(device_proxy);
-        };
-        try main_deletion_queue.append(gpa, .{ .pipeline_layout = mesh_pipeline_layout });
-        try main_deletion_queue.append(gpa, .{ .pipeline = mesh_pipeline });
-        // }
-
-        var metal_rough_material: GltfMetallicRoughness = try .init(scratch, io, gpu_scene_data_descriptor_layout, draw_allocated_image, depth_allocated_image, device_proxy);
+        var metal_rough_material: GltfMetallicRoughness = try .init(scratch, io, bindless_pipeline_layout, draw_allocated_image, depth_allocated_image, device_proxy);
 
         // init_default_data {
         const rect_vertices: [4]Vertex = .{
@@ -1742,30 +1707,31 @@ pub const Engine = struct {
         // destroy_image(_errorCheckerboardImage);
         // });
 
+        var materials_buffer: GltfMetallicRoughness.MaterialsBuffer = try .init(1024, vma_allocator);
+        bindless_descriptors.registerBuffer(
+            device_proxy,
+            1,
+            materials_buffer.gpu_buffer.buffer,
+            materials_buffer.capacity * @sizeOf(GltfMetallicRoughness.GPUMaterialData),
+        );
+
         var material_resources: GltfMetallicRoughness.MaterialResources = .{
             .color_image = white_image,
             .color_sampler = default_sampler_linear,
             .metal_rough_image = white_image,
             .metal_rough_sampler = default_sampler_linear,
-            .data_buffer = undefined, // TODO: remove usage of undefined if possible
-            .data_buffer_offset = undefined,
+            .color_factors = @splat(1),
+            .metal_rough_factors = .{ 1, 0.5, 0, 0 },
         };
 
-        //set the uniform buffer for the material data
-        const material_constants: VmaGpuBuffer = try .create(vma_allocator, @sizeOf(GltfMetallicRoughness.MaterialConstants), .{ .uniform_buffer_bit = true }, .cpu_to_gpu);
-
-        //write the buffer
-        const scene_uniform_data = try material_constants.map(vma_allocator, GltfMetallicRoughness.MaterialConstants);
-        defer material_constants.unMap(vma_allocator);
-        scene_uniform_data[0].color_factors = @splat(1);
-        scene_uniform_data[0].metal_rough_factors = .{ 1, 0.5, 0, 0 };
-
-        try main_deletion_queue.append(gpa, .{ .allocated_buffer = material_constants });
-
-        material_resources.data_buffer = material_constants.buffer;
-        material_resources.data_buffer_offset = 0;
-
-        const default_data = try metal_rough_material.writeMaterial(gpa, scratch, device_proxy, .main_color, &material_resources, &global_descriptor_allocator);
+        const default_data = try metal_rough_material.writeMaterial(
+            gpa,
+            device_proxy,
+            .main_color,
+            &material_resources,
+            &bindless_descriptors,
+            &materials_buffer,
+        );
 
         //}
 
@@ -1781,6 +1747,8 @@ pub const Engine = struct {
             device_ctx,
             imm,
             structure_path,
+            &bindless_descriptors,
+            &materials_buffer,
         );
 
         var loaded_scenes: std.StringHashMapUnmanaged(*scene.Node) = .empty;
@@ -1791,43 +1759,6 @@ pub const Engine = struct {
         };
 
         try loaded_scenes.put(gpa, "structure", loaded_scene_node);
-
-        const debug_callback = struct {
-            fn debugCallback(
-                message_severity: vk.DebugUtilsMessageSeverityFlagsEXT,
-                message_types: vk.DebugUtilsMessageTypeFlagsEXT,
-                p_callback_data: ?*const vk.DebugUtilsMessengerCallbackDataEXT,
-                p_user_data: ?*anyopaque,
-            ) callconv(vk.vulkan_call_conv) vk.Bool32 {
-                _ = message_types;
-                _ = p_user_data;
-
-                const callback_data = p_callback_data orelse @panic("");
-                const message_ptr = callback_data.p_message orelse "no message";
-
-                const message = std.mem.span(message_ptr);
-
-                if (message_severity.error_bit_ext) {
-                    std.log.err("Validation: {s}", .{message});
-                } else if (message_severity.warning_bit_ext) {
-                    std.log.warn("Validation: {s}", .{message});
-                } else {
-                    std.log.info("Validation: {s}", .{message});
-                }
-
-                std.debug.dumpCurrentStackTrace(.{});
-
-                return .false;
-            }
-        };
-
-        const debug_messenger_info: vk.DebugUtilsMessengerCreateInfoEXT = .{
-            .message_severity = .{ .verbose_bit_ext = true, .warning_bit_ext = true, .error_bit_ext = true },
-            .message_type = .{ .general_bit_ext = true, .validation_bit_ext = true, .performance_bit_ext = true },
-            .pfn_user_callback = debug_callback.debugCallback,
-        };
-
-        const debug_messenger = try instance_proxy.createDebugUtilsMessengerEXT(&debug_messenger_info, null);
 
         return .{
             .vk_ctx = .{
@@ -1867,7 +1798,6 @@ pub const Engine = struct {
                 .sunlightDirection = @splat(0), // w for sun power
                 .sunlightColor = @splat(0),
             },
-            .gpu_scene_data_descriptor_layout = gpu_scene_data_descriptor_layout,
 
             .global_descriptor_allocator = global_descriptor_allocator,
 
@@ -1876,11 +1806,8 @@ pub const Engine = struct {
 
             .imm = imm,
 
-            .triangle_pipeline_layout = triangle_pipeline_layout,
-            .triangle_pipeline = triangle_pipeline,
-
-            .mesh_pipeline_layout = mesh_pipeline_layout,
-            .mesh_pipeline = mesh_pipeline,
+            .bindless_descriptors = bindless_descriptors,
+            .bindless_pipeline_layout = bindless_pipeline_layout,
 
             .white_image = white_image,
             .grey_image = grey_image,
@@ -1944,11 +1871,16 @@ pub const Engine = struct {
 
     pub fn createAndUploadImage(device_ctx: DeviceContext, imm: ImmSubmit, data: *const anyopaque, size: vk.Extent3D, format: vk.Format, usage: vk.ImageUsageFlags, mipmapped: bool) !AllocatedImage {
         const data_size: usize = size.depth * size.width * size.height * 4;
-        const upload_buffer: VmaGpuBuffer = try .create(device_ctx.vma_allocator, data_size, .{ .transfer_src_bit = true }, .cpu_to_gpu);
+        const upload_buffer: VmaGpuBuffer = try .create(
+            device_ctx.vma_allocator,
+            data_size,
+            .{ .transfer_src_bit = true },
+            .cpu_to_gpu,
+            .sequential_write,
+        );
 
-        const map = try upload_buffer.map(device_ctx.vma_allocator, u8);
+        const map = upload_buffer.getMappedSlice(u8);
         @memcpy(map, @as([*]const u8, @ptrCast(data)));
-        upload_buffer.unMap(device_ctx.vma_allocator);
 
         var new_usage = usage;
         new_usage.transfer_dst_bit = true;
@@ -2034,8 +1966,6 @@ pub const Engine = struct {
                 .device = device,
                 .vma_allocator = self.device_ctx.vma_allocator,
             });
-
-            self.frames[i].frame_descriptors.deinit(gpa, device);
         }
 
         var it = self.loaded_scenes.valueIterator();
@@ -2044,7 +1974,7 @@ pub const Engine = struct {
         }
         self.loaded_scenes.deinit(gpa);
 
-        self.metal_rough_material.deinit(gpa, device);
+        self.metal_rough_material.deinit(device);
 
         self.main_deletion_queue.deinit(gpa, .{
             .device = device,
@@ -2144,81 +2074,94 @@ pub const Engine = struct {
         const device = self.device_ctx.device;
 
         device.cmdBeginRendering(cmd, &render_info);
-
         {
             //allocate a new uniform buffer for the scene data
-            const gpu_scene_data_buffer: VmaGpuBuffer = try .create(self.device_ctx.vma_allocator, @sizeOf(GPUSceneData), .{ .uniform_buffer_bit = true }, .cpu_to_gpu);
+            const gpu_scene_data_buffer: VmaGpuBuffer = try .create(
+                self.device_ctx.vma_allocator,
+                @sizeOf(GPUSceneData),
+                .{ .storage_buffer_bit = true },
+                .cpu_to_gpu,
+                .sequential_write,
+            );
 
             //add it to the deletion queue of this frame so it gets deleted once its been used
             try self.currentFrame().deletion_queue.append(gpa, .{ .allocated_buffer = gpu_scene_data_buffer });
 
-            const buffer = try gpu_scene_data_buffer.map(self.device_ctx.vma_allocator, GPUSceneData);
+            const buffer = gpu_scene_data_buffer.getMappedSlice(GPUSceneData);
             buffer[0] = self.scene_data;
-            gpu_scene_data_buffer.unMap(self.device_ctx.vma_allocator);
 
-            //create a descriptor set that binds that buffer and update it
-            const global_descriptor: vk.DescriptorSet = try self.currentFrame().frame_descriptors.allocate(gpa, scratch, device, self.gpu_scene_data_descriptor_layout, null);
+            self.bindless_descriptors.registerBuffer(
+                device,
+                2, // binding 2 = scene data
+                gpu_scene_data_buffer.buffer,
+                @sizeOf(GPUSceneData),
+            );
 
-            var writer: descriptors.DescriptorWriter = .{};
-            try writer.writeBuffer(scratch.allocator(), 0, gpu_scene_data_buffer.buffer, @sizeOf(GPUSceneData), 0, .uniform_buffer);
-            writer.updateSet(device, global_descriptor);
+            device.cmdBindDescriptorSets(
+                cmd,
+                .graphics,
+                self.bindless_pipeline_layout,
+                0,
+                (&self.bindless_descriptors.set)[0..1],
+                null,
+            );
+
+            device.cmdSetViewport(cmd, 0, (&vk.Viewport{
+                .x = 0,
+                .y = 0,
+                .width = @floatFromInt(self.draw_extent.width),
+                .height = @floatFromInt(self.draw_extent.height),
+                .min_depth = 0,
+                .max_depth = 1,
+            })[0..1]);
+
+            device.cmdSetScissor(cmd, 0, (&vk.Rect2D{
+                .offset = .{ .x = 0, .y = 0 },
+                .extent = self.draw_extent,
+            })[0..1]);
 
             var draw_calls: usize = 0;
             var triangle_count: usize = 0;
 
-            var last_pipeline: MaterialPipeline = undefined;
-            var last_material: ?*MaterialInstance = undefined;
+            // const frame_index = self.currentFrameIndex();
+
+            var last_pipeline: vk.Pipeline = .null_handle;
             var last_index_buffer: vk.Buffer = .null_handle;
 
             for ([_][]scene.RenderObject{
                 self.main_draw_context.opaque_surfaces.items,
                 self.main_draw_context.transparent_surfaces.items,
-            }) |sufaces| {
-                for (sufaces) |r| {
-                    if (r.material != last_material) {
-                        last_material = r.material;
-
-                        if (!std.meta.eql(r.material.?.pipeline, last_pipeline)) {
-                            last_pipeline = r.material.?.pipeline;
-
-                            device.cmdBindPipeline(cmd, .graphics, r.material.?.pipeline.pipeline);
-                            device.cmdBindDescriptorSets(cmd, .graphics, r.material.?.pipeline.layout, 0, &.{global_descriptor}, null);
-
-                            const viewport: vk.Viewport = .{
-                                .x = 0,
-                                .y = 0,
-                                .width = @floatFromInt(self.draw_extent.width),
-                                .height = @floatFromInt(self.draw_extent.height),
-                                .min_depth = 0,
-                                .max_depth = 1,
-                            };
-                            device.cmdSetViewport(cmd, 0, &.{viewport});
-
-                            const scissor: vk.Rect2D = .{
-                                .offset = .{ .x = 0, .y = 0 },
-                                .extent = .{ .width = self.draw_extent.width, .height = self.draw_extent.height },
-                            };
-                            device.cmdSetScissor(cmd, 0, &.{scissor});
-                        }
-
-                        device.cmdBindDescriptorSets(cmd, .graphics, r.material.?.pipeline.layout, 1, &.{r.material.?.material_set}, null);
+            }) |surfaces| {
+                for (surfaces) |surface| {
+                    if (surface.material.?.pipeline.pipeline != last_pipeline) {
+                        last_pipeline = surface.material.?.pipeline.pipeline;
+                        device.cmdBindPipeline(cmd, .graphics, last_pipeline);
                     }
 
-                    if (r.index_buffer != last_index_buffer) {
-                        last_index_buffer = r.index_buffer;
-                        device.cmdBindIndexBuffer(cmd, r.index_buffer, 0, .uint32);
+                    if (surface.index_buffer != last_index_buffer) {
+                        last_index_buffer = surface.index_buffer;
+                        device.cmdBindIndexBuffer(cmd, surface.index_buffer, 0, .uint32);
                     }
 
-                    var push_constants: GPUDrawPushConstants = .{
-                        .worldMatrix = r.transform,
-                        .vertexBuffer = r.vertex_buffer_address,
+                    const push_constants: GPUDrawPushConstants = .{
+                        .world_matrix = surface.transform,
+                        .vertex_buffer = surface.vertex_buffer_address,
+                        .material_index = surface.material.?.bindless_index,
+                        .scene_data_index = 0,
                     };
-                    device.cmdPushConstants(cmd, r.material.?.pipeline.layout, .{ .vertex_bit = true }, 0, @sizeOf(GPUDrawPushConstants), &push_constants);
+                    device.cmdPushConstants(
+                        cmd,
+                        self.bindless_pipeline_layout,
+                        .{ .vertex_bit = true, .fragment_bit = true },
+                        0,
+                        @sizeOf(GPUDrawPushConstants),
+                        std.mem.asBytes(&push_constants),
+                    );
 
-                    device.cmdDrawIndexed(cmd, r.index_count, 1, r.first_index, 0, 0);
+                    device.cmdDrawIndexed(cmd, surface.index_count, 1, surface.first_index, 0, 0);
 
                     draw_calls += 1;
-                    triangle_count += r.index_count / 3;
+                    triangle_count += surface.index_count / 3;
                 }
             }
 
@@ -2247,6 +2190,7 @@ pub const Engine = struct {
             vertexBufferSize,
             .{ .storage_buffer_bit = true, .transfer_dst_bit = true, .shader_device_address_bit = true },
             .gpu_only,
+            .none,
         );
 
         //find the adress of the vertex buffer
@@ -2259,6 +2203,7 @@ pub const Engine = struct {
             indexBufferSize,
             .{ .storage_buffer_bit = true, .transfer_dst_bit = true, .index_buffer_bit = true },
             .gpu_only,
+            .none,
         );
         const newSurface: GPUMeshBuffers = .{
             .vertex_buffer = vertexBuffer,
@@ -2271,16 +2216,14 @@ pub const Engine = struct {
             vertexBufferSize + indexBufferSize,
             .{ .transfer_src_bit = true },
             .cpu_only,
+            .sequential_write,
         );
         defer staging.destroy(vma_allocator);
 
-        {
-            var data = try staging.map(vma_allocator, u8);
-            defer staging.unMap(vma_allocator);
+        var staging_map = staging.getMappedSlice(u8);
 
-            @memcpy(@as([*]Vertex, @ptrCast(@alignCast(data.ptr))), vertices); // copy vertex buffer
-            @memcpy(@as([*]u32, @ptrCast(@alignCast(data[vertexBufferSize..]))), indices); // copy index buffer
-        }
+        @memcpy(@as([*]Vertex, @ptrCast(@alignCast(staging_map.ptr))), vertices); // copy vertex buffer
+        @memcpy(@as([*]u32, @ptrCast(@alignCast(staging_map[vertexBufferSize..]))), indices); // copy index buffer
 
         {
             try immediateModeBegin(device, imm.fence, imm.cmd);
@@ -2303,6 +2246,152 @@ pub const Engine = struct {
         }
 
         return newSurface;
+    }
+};
+
+pub const BindlessDescriptors = struct {
+    pool: vk.DescriptorPool,
+    layout: vk.DescriptorSetLayout,
+    set: vk.DescriptorSet,
+
+    free_texture_indices: std.ArrayList(u32),
+    next_texture_index: u32,
+
+    pub fn init(device: vk.DeviceProxy) !BindlessDescriptors {
+        const max_textures = 16384;
+
+        const pool_sizes = [_]vk.DescriptorPoolSize{
+            .{ .type = .combined_image_sampler, .descriptor_count = max_textures },
+            .{ .type = .storage_buffer, .descriptor_count = 2 },
+        };
+
+        const pool = try device.createDescriptorPool(&.{
+            .flags = .{ .update_after_bind_bit = true },
+            .max_sets = 1,
+            .pool_size_count = pool_sizes.len,
+            .p_pool_sizes = &pool_sizes,
+        }, null);
+
+        const bindings = [_]vk.DescriptorSetLayoutBinding{
+            .{
+                .binding = 0,
+                .descriptor_type = .combined_image_sampler,
+                .descriptor_count = max_textures,
+                .stage_flags = .{ .fragment_bit = true },
+                .p_immutable_samplers = null,
+            },
+            .{
+                .binding = 1,
+                .descriptor_type = .storage_buffer,
+                .descriptor_count = 1,
+                .stage_flags = .{ .vertex_bit = true, .fragment_bit = true },
+                .p_immutable_samplers = null,
+            },
+            .{
+                .binding = 2,
+                .descriptor_type = .storage_buffer,
+                .descriptor_count = 1,
+                .stage_flags = .{ .vertex_bit = true, .fragment_bit = true },
+                .p_immutable_samplers = null,
+            },
+        };
+
+        const binding_flags = [_]vk.DescriptorBindingFlags{
+            .{ .partially_bound_bit = true, .update_after_bind_bit = true },
+            .{ .update_after_bind_bit = true },
+            .{ .update_after_bind_bit = true },
+        };
+        const flags_info: vk.DescriptorSetLayoutBindingFlagsCreateInfo = .{
+            .binding_count = binding_flags.len,
+            .p_binding_flags = &binding_flags,
+        };
+
+        const layout = try device.createDescriptorSetLayout(&.{
+            .p_next = &flags_info,
+            .flags = .{ .update_after_bind_pool_bit = true },
+            .binding_count = bindings.len,
+            .p_bindings = &bindings,
+        }, null);
+
+        const alloc_info: vk.DescriptorSetAllocateInfo = .{
+            .descriptor_pool = pool,
+            .descriptor_set_count = 1,
+            .p_set_layouts = &.{layout},
+        };
+
+        var set: vk.DescriptorSet = undefined;
+        try device.allocateDescriptorSets(&alloc_info, (&set)[0..1]);
+
+        return .{
+            .pool = pool,
+            .layout = layout,
+            .set = set,
+            .free_texture_indices = .empty,
+            .next_texture_index = 0,
+        };
+    }
+
+    pub fn deinit(self: *BindlessDescriptors, gpa: Allocator, device: vk.DeviceProxy) void {
+        device.destroyDescriptorPool(self.pool, null);
+        device.destroyDescriptorSetLayout(self.layout, null);
+        self.free_texture_indices.deinit(gpa);
+    }
+
+    pub fn registerTexture(
+        self: *BindlessDescriptors,
+        gpa: Allocator,
+        device: vk.DeviceProxy,
+        view: vk.ImageView,
+        sampler: vk.Sampler,
+    ) !u32 {
+        const index = try self.allocTextureIndex(gpa);
+        device.updateDescriptorSets(&.{.{
+            .dst_set = self.set,
+            .dst_binding = 0,
+            .dst_array_element = index,
+            .descriptor_count = 1,
+            .descriptor_type = .combined_image_sampler,
+            .p_image_info = &.{.{
+                .sampler = sampler,
+                .image_view = view,
+                .image_layout = .shader_read_only_optimal,
+            }},
+            .p_buffer_info = undefined,
+            .p_texel_buffer_view = undefined,
+        }}, null);
+        return index;
+    }
+
+    pub fn allocTextureIndex(self: *BindlessDescriptors, gpa: Allocator) !u32 {
+        if (self.free_texture_indices.pop()) |idx| {
+            return idx;
+        } else {
+            const result = self.next_texture_index;
+            self.next_texture_index += 1;
+            try self.free_texture_indices.ensureTotalCapacity(gpa, self.next_texture_index);
+            return result;
+        }
+    }
+
+    pub fn releaseTexture(self: *BindlessDescriptors, idx: u32) void {
+        self.free_texture_indices.appendAssumeCapacity(idx);
+    }
+
+    pub fn registerBuffer(self: *BindlessDescriptors, device: vk.DeviceProxy, binding: u32, buffer: vk.Buffer, size: usize) void {
+        device.updateDescriptorSets(&.{.{
+            .dst_set = self.set,
+            .dst_binding = binding,
+            .dst_array_element = 0,
+            .descriptor_count = 1,
+            .descriptor_type = .storage_buffer,
+            .p_image_info = undefined,
+            .p_buffer_info = &.{.{
+                .buffer = buffer,
+                .offset = 0,
+                .range = size,
+            }},
+            .p_texel_buffer_view = undefined,
+        }}, null);
     }
 };
 
@@ -2998,18 +3087,30 @@ const vk_init = struct {
             });
         }
 
-        var device_features_vk13: vk.PhysicalDeviceVulkan13Features = .{ .dynamic_rendering = .true, .synchronization_2 = .true };
+        var device_features_vk13: vk.PhysicalDeviceVulkan13Features = .{
+            .dynamic_rendering = .true,
+            .synchronization_2 = .true,
+        };
+        const device_features_vk12: vk.PhysicalDeviceVulkan12Features = .{
+            .p_next = &device_features_vk13,
+            .runtime_descriptor_array = .true,
+            .shader_sampled_image_array_non_uniform_indexing = .true,
+            .descriptor_binding_partially_bound = .true,
+            .descriptor_binding_sampled_image_update_after_bind = .true,
+            .descriptor_binding_storage_buffer_update_after_bind = .true,
+            .buffer_device_address = .true,
+            .descriptor_indexing = .true,
+        };
         return try instance_dispatch.createDevice(physical_device, &.{
-            .p_next = (&vk.PhysicalDeviceVulkan12Features{
-                .p_next = (&device_features_vk13)[0..1],
-                .buffer_device_address = .true,
-                .descriptor_indexing = .true,
-            })[0..1],
+            .p_next = &device_features_vk12,
             .p_queue_create_infos = queue_create_infos.items.ptr,
             .queue_create_info_count = @intCast(queue_create_infos.items.len),
             .pp_enabled_extension_names = &required_device_extensions,
             .enabled_extension_count = required_device_extensions.len,
-            .p_enabled_features = &.{ .sampler_anisotropy = .true },
+            .p_enabled_features = &.{
+                .shader_int_64 = .true,
+                .sampler_anisotropy = .true,
+            },
         }, null);
     }
 };

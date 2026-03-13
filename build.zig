@@ -48,9 +48,6 @@ pub fn build(b: *std.Build) !void {
         for ([_][]const u8{
             "circle.slang",
             "color.slang",
-            "colored_triangle_frag.slang",
-            "colored_triangle_mesh_vert.slang",
-            "colored_triangle_vert.slang",
             "imgui_frag.slang",
             "mesh_frag.slang",
             "mesh_vert.slang",

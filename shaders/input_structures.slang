@@ -3,23 +3,38 @@ struct SceneData {
     float4x4 proj;
     float4x4 viewproj;
     float4 ambient_color;
-    float4 sunlight_direction; // w for sun power
+    float4 sunlight_direction;
     float4 sunlight_color;
 };
 
 struct GLTFMaterialData {
     float4 color_factors;
     float4 metal_rough_factors;
+    uint color_texture;
+    uint metal_rough_texture;
+    uint2 _padding;
 };
 
 [[vk::binding(0, 0)]]
-ConstantBuffer<SceneData> scene_data;
+Sampler2D textures[];
 
-[[vk::binding(0, 1)]]
-ConstantBuffer<GLTFMaterialData> material_data;
+[[vk::binding(1, 0)]]
+StructuredBuffer<GLTFMaterialData> materials;
 
-[[vk::binding(1, 1)]]
-Sampler2D color_tex;
+[[vk::binding(2, 0)]]
+StructuredBuffer<SceneData> scenes;
 
-[[vk::binding(2, 1)]]
-Sampler2D metal_rough_tex;
+struct Vertex {
+    float3 position;
+    float uv_x;
+    float3 normal;
+    float uv_y;
+    float4 color;
+};
+
+struct Constants {
+    float4x4 render_matrix;
+    Vertex *vertices;
+    uint material_index;
+    uint scene_data_index;
+};
