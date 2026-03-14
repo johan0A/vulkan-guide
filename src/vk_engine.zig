@@ -1759,8 +1759,8 @@ pub const Engine = struct {
         var w: i32 = undefined;
         var h: i32 = undefined;
         _ = c.SDL_GetWindowSize(self.window, &w, &h);
-        self.swapchain.extent.width = @intCast(w);
-        self.swapchain.extent.height = @intCast(h);
+        const new_width: u32 = @intCast(w);
+        const new_height: u32 = @intCast(h);
 
         self.swapchain = try .init(
             gpa,
@@ -1768,9 +1768,30 @@ pub const Engine = struct {
             self.vk_ctx.chosen_gpu,
             device,
             self.vk_ctx.window_surface,
-            self.swapchain.extent.width,
-            self.swapchain.extent.height,
+            new_width,
+            new_height,
             self.vk_ctx.instance.wrapper.*,
+        );
+
+        self.destroyImage(&self.draw_image);
+        self.destroyImage(&self.depth_image);
+
+        const new_extent: vk.Extent3D = .{ .width = new_width, .height = new_height, .depth = 1 };
+
+        self.draw_image = try createImage(
+            self.device_ctx,
+            new_extent,
+            .r16g16b16a16_sfloat,
+            .{ .transfer_src_bit = true, .transfer_dst_bit = true, .storage_bit = true, .color_attachment_bit = true },
+            false,
+        );
+
+        self.depth_image = try createImage(
+            self.device_ctx,
+            new_extent,
+            .d32_sfloat,
+            .{ .depth_stencil_attachment_bit = true },
+            false,
         );
 
         self.resize_requested = false;
