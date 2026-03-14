@@ -81,8 +81,6 @@ pub const scene = struct {
 
         samplers: std.ArrayListUnmanaged(vk.Sampler),
 
-        descriptor_pool: descriptors.DescriptorAllocatorGrowable,
-
         material_data_buffer: VmaGpuBuffer,
     };
 
@@ -138,7 +136,6 @@ pub const scene = struct {
             self.children.deinit(gpa);
 
             if (self.gltf) |gltf| {
-                gltf.descriptor_pool.deinit(gpa, device);
                 gltf.material_data_buffer.destroy(engine.device_ctx.vma_allocator);
 
                 var mesh_it = gltf.meshes.valueIterator();
@@ -900,7 +897,7 @@ const SwapChain = struct {
 };
 
 const FrameData = struct {
-    const FRAME_OVERLAP = 2;
+    const frame_overlap = 2;
 
     swapchain_semaphore: vk.Semaphore,
     render_fence: vk.Fence,
@@ -945,7 +942,7 @@ pub const Engine = struct {
     resize_requested: bool,
 
     frame_number: u64,
-    frames: [FrameData.FRAME_OVERLAP]FrameData,
+    frames: [FrameData.frame_overlap]FrameData,
 
     main_deletion_queue: DeletionQueue,
 
@@ -954,15 +951,8 @@ pub const Engine = struct {
     draw_extent: vk.Extent2D,
 
     draw_image: AllocatedImage,
-    draw_image_descriptors: vk.DescriptorSet,
-    draw_image_descriptor_set_layout: vk.DescriptorSetLayout,
 
     scene_data: GPUSceneData,
-
-    global_descriptor_allocator: descriptors.DescriptorAllocatorGrowable,
-
-    background_effects: []ComputeEffect,
-    active_background_effect: u32,
 
     imm: ImmSubmit,
 
@@ -977,8 +967,6 @@ pub const Engine = struct {
 
     default_sampler_linear: vk.Sampler,
     default_sampler_nearest: vk.Sampler,
-
-    single_image_descriptor_layout: vk.DescriptorSetLayout,
 
     // default material
     default_data: MaterialInstance,
@@ -995,46 +983,14 @@ pub const Engine = struct {
 
         try self.updateScene(gpa);
 
-        const local = struct {
-            fn drawBackground(engine: *Engine, cmd: vk.CommandBuffer) void {
-                // bind the gradient drawing compute pipeline
-                const device = engine.device_ctx.device;
-                device.cmdBindPipeline(cmd, .compute, engine.background_effects[engine.active_background_effect].pipeline);
-
-                // bind the descriptor set containing the draw image for the compute pipeline
-                device.cmdBindDescriptorSets(
-                    cmd,
-                    .compute,
-                    engine.background_effects[engine.active_background_effect].layout,
-                    0,
-                    &.{engine.draw_image_descriptors},
-                    null,
-                );
-
-                device.cmdPushConstants(
-                    cmd,
-                    engine.background_effects[engine.active_background_effect].layout,
-                    .{ .compute_bit = true },
-                    0,
-                    @intCast(engine.background_effects[engine.active_background_effect].data.size()),
-                    @ptrCast(engine.background_effects[engine.active_background_effect].data.payloadPtr()),
-                );
-
-                // execute the compute pipeline dispatch. We are using 16x16 workgroup size so we need to divide by it
-                device.cmdDispatch(
-                    cmd,
-                    std.math.divCeil(u32, engine.draw_extent.width, 16) catch unreachable,
-                    std.math.divCeil(u32, engine.draw_extent.height, 16) catch unreachable,
-                    1,
-                );
-            }
-        };
         const checkpoint = scratch.checkpoint();
         defer scratch.restoreCheckpoint(checkpoint);
 
         const device = self.device_ctx.device;
 
+        const wait_fence = tracy.zoneEx(@src(), .{ .name = "wait_fence" });
         _ = try device.waitForFences(&.{self.currentFrame().render_fence}, .true, 1e9);
+        wait_fence.end();
 
         self.currentFrame().deletion_queue.flush(.{ .device = device, .vma_allocator = self.device_ctx.vma_allocator });
 
@@ -1064,34 +1020,23 @@ pub const Engine = struct {
         // reset the command buffer to begin recording again.
         try device.resetCommandBuffer(cmd, .{});
 
-        // begin the command buffer recording. We will use this command buffer exactly once, so we want to let vulkan know that
+        // we will use this command buffer exactly once, so we want to let vulkan know that
         try device.beginCommandBuffer(cmd, &.{ .flags = .{ .one_time_submit_bit = true } });
         {
-            // transition our main draw image into general layout so we can write into it
-            // we will overwrite it all so we dont care about what was the older layout
-            vk_image.transitionImage(device, cmd, self.draw_image.image, .undefined, .general);
+            // device.cmdClearAttachments(cmd, p_attachments: []const ClearAttachment, p_rects: []const ClearRect)
 
-            local.drawBackground(self, cmd);
-
-            vk_image.transitionImage(device, cmd, self.draw_image.image, .general, .color_attachment_optimal);
+            vk_image.transitionImage(device, cmd, self.draw_image.image, .undefined, .color_attachment_optimal);
             vk_image.transitionImage(device, cmd, self.depth_image.image, .undefined, .depth_attachment_optimal);
             try self.drawGeometry(gpa, scratch, cmd);
 
-            //transtion the draw image and the swapchain image into their correct transfer layouts
+            // copy draw image into the swapchain
             vk_image.transitionImage(device, cmd, self.draw_image.image, .color_attachment_optimal, .transfer_src_optimal);
-
             vk_image.transitionImage(device, cmd, current_swap_image.handle, .undefined, .transfer_dst_optimal);
-
-            // execute a copy from the draw image into the swapchain
             vk_image.copyImageToImage(device, cmd, self.draw_image.image, current_swap_image.handle, self.draw_extent, self.swapchain.extent);
 
-            // set swapchain image layout to Attachment Optimal so we can draw it
-            vk_image.transitionImage(device, cmd, current_swap_image.handle, .transfer_dst_optimal, .color_attachment_optimal);
-
             //draw imgui into the swapchain image
+            vk_image.transitionImage(device, cmd, current_swap_image.handle, .transfer_dst_optimal, .color_attachment_optimal);
             self.drawImgui(cmd, current_swap_image.view);
-
-            // set swapchain image layout to Present so we can show it on the screen
             vk_image.transitionImage(device, cmd, current_swap_image.handle, .color_attachment_optimal, .present_src_khr);
         }
         //finalize the command buffer (we can no longer add commands, but it can now be executed)
@@ -1150,7 +1095,7 @@ pub const Engine = struct {
     }
 
     pub inline fn currentFrameIndex(self: *const Engine) usize {
-        return self.frame_number % FrameData.FRAME_OVERLAP;
+        return self.frame_number % FrameData.frame_overlap;
     }
 
     pub inline fn currentFrame(self: *Engine) *FrameData {
@@ -1242,7 +1187,7 @@ pub const Engine = struct {
 
         const fence_create_info: vk.FenceCreateInfo = .{ .flags = .{ .signaled_bit = true } };
 
-        var frames: [FrameData.FRAME_OVERLAP]FrameData = undefined;
+        var frames: [FrameData.frame_overlap]FrameData = undefined;
         for (&frames) |*frame| {
             const command_pool = try device_proxy.createCommandPool(&command_pool_info, null);
 
@@ -1387,122 +1332,11 @@ pub const Engine = struct {
         //}
 
         //create a descriptor pool that will hold 10 sets with 1 image each
-        var sizes = [_]descriptors.DescriptorAllocatorGrowable.PoolSizeRatio{
-            .{ .type = .storage_image, .ratio = 1 },
-            .{ .type = .uniform_buffer, .ratio = 1 },
-            .{ .type = .combined_image_sampler, .ratio = 1 },
-        };
-        var global_descriptor_allocator: descriptors.DescriptorAllocatorGrowable = .empty;
-        try global_descriptor_allocator.init(gpa, scratch, device_proxy, 10, &sizes);
 
         //make the descriptor set layout for our compute draw
-        var image_bindings = [_]vk.DescriptorSetLayoutBinding{
-            descriptors.layout.createSetBinding(0, .storage_image),
-        };
-        const draw_image_descriptor_layout = try descriptors.layout.createSet(&image_bindings, device_proxy, .{ .compute_bit = true }, null, .{});
-
-        const draw_image_descriptors = try global_descriptor_allocator.allocate(gpa, scratch, device_proxy, draw_image_descriptor_layout, null);
-
-        // {
-        // const img_info: vk.DescriptorImageInfo = .{
-        //     .image_layout = .general,
-        //     .image_view = draw_allocated_image.image_view,
-
-        //     .sampler = .null_handle,
-        // };
-
-        // const draw_image_write: vk.WriteDescriptorSet = .{
-        //     .dst_binding = 0,
-        //     .dst_set = draw_image_descriptors,
-        //     .descriptor_count = 1,
-        //     .descriptor_type = .storage_image,
-        //     .p_image_info = (&img_info)[0..1],
-        //     .dst_array_element = 0,
-        //     // image descriptor, not a buffer or texel buffer: (TODO: is undefined correct here?)
-        //     .p_buffer_info = undefined,
-        //     .p_texel_buffer_view = undefined,
-        // };
-
-        // device_proxy.updateDescriptorSets(1, (&draw_image_write)[0..1], 0, null);
-        // TODO: above replaced with below, is abstraction good here?
-        var writer: descriptors.DescriptorWriter = .{};
-        defer writer.deinit(gpa);
-        try writer.writeImage(gpa, 0, draw_allocated_image.image_view, .null_handle, .general, .storage_image);
-
-        writer.updateSet(device_proxy, draw_image_descriptors);
-
-        try main_deletion_queue.append(gpa, .{ .descriptor_set_layout = draw_image_descriptor_layout });
         // try main_deletion_queue.append(allocator, .{ .descriptor_allocator_growable = global_descriptor_allocator }); TODO
 
-        // DescriptorLayoutBuilder builder;
-        // builder.add_binding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-        // _singleImageDescriptorLayout = builder.build(_device, VK_SHADER_STAGE_FRAGMENT_BIT);
-
-        var single_image_descriptor_bindings = [_]vk.DescriptorSetLayoutBinding{
-            descriptors.layout.createSetBinding(0, .combined_image_sampler),
-        };
-
-        const single_image_descriptor_layout = try descriptors.layout.createSet(&single_image_descriptor_bindings, device_proxy, .{ .fragment_bit = true }, null, .{});
-        try main_deletion_queue.append(gpa, .{ .descriptor_set_layout = single_image_descriptor_layout });
-
         // }
-
-        // backround effects init ------------
-        const effect_infos = [_]struct { path: []const u8, default_data: ComputeEffect.ComputeData, name: [:0]const u8 }{
-            .{ .path = shaders.color, .default_data = .{ .color = .{ 1, 0, 0, 1 } }, .name = "color" },
-            .{ .path = shaders.circle, .default_data = .{ .circle_effect = .{} }, .name = "circle" },
-        };
-
-        const background_effects = try init_alloc.alloc(ComputeEffect, effect_infos.len);
-
-        for (effect_infos, background_effects) |effect_info, *background_effect| {
-            const pushConstant: vk.PushConstantRange = .{
-                .offset = 0,
-                .size = @intCast(effect_info.default_data.size()),
-                .stage_flags = .{ .compute_bit = true },
-            };
-
-            const computeLayout: vk.PipelineLayoutCreateInfo = .{
-                .p_set_layouts = (&draw_image_descriptor_layout)[0..1],
-                .set_layout_count = 1,
-                .p_push_constant_ranges = (&pushConstant)[0..1],
-                .push_constant_range_count = 1,
-            };
-
-            const gradient_pipeline_layout = try device_proxy.createPipelineLayout(&computeLayout, null);
-
-            const shader_data = try loadShader(scratch.allocator(), io, effect_info.path);
-            const computeDrawShader: vk.ShaderModule = try vk_init.loadShaderModule(shader_data, device_proxy);
-            defer device_proxy.destroyShaderModule(computeDrawShader, null);
-
-            const stageinfo: vk.PipelineShaderStageCreateInfo = .{
-                .stage = .{ .compute_bit = true },
-                .module = computeDrawShader,
-                .p_name = "main",
-            };
-
-            const computePipelineCreateInfo: vk.ComputePipelineCreateInfo = .{
-                .layout = gradient_pipeline_layout,
-                .stage = stageinfo,
-
-                .base_pipeline_index = 0,
-            };
-
-            var gradient_pipeline: vk.Pipeline = undefined;
-            _ = try device_proxy.createComputePipelines(.null_handle, &.{computePipelineCreateInfo}, null, (&gradient_pipeline)[0..1]);
-
-            try main_deletion_queue.append(gpa, .{ .pipeline_layout = gradient_pipeline_layout });
-            try main_deletion_queue.append(gpa, .{ .pipeline = gradient_pipeline });
-
-            background_effect.* = ComputeEffect{
-                .name = effect_info.name,
-
-                .pipeline = gradient_pipeline,
-                .layout = gradient_pipeline_layout,
-
-                .data = effect_info.default_data,
-            };
-        }
 
         const graphics_queue = device_proxy.getDeviceQueue(queue_family_indices.graphics_family.?, 0);
         const swapchain: SwapChain = try .init(
@@ -1787,9 +1621,6 @@ pub const Engine = struct {
             .depth_image = depth_allocated_image,
             .draw_extent = .{ .width = 0, .height = 0 },
 
-            .draw_image_descriptors = draw_image_descriptors,
-            .draw_image_descriptor_set_layout = draw_image_descriptor_layout,
-
             .scene_data = .{
                 .view = .identity,
                 .proj = .identity,
@@ -1798,11 +1629,6 @@ pub const Engine = struct {
                 .sunlightDirection = @splat(0), // w for sun power
                 .sunlightColor = @splat(0),
             },
-
-            .global_descriptor_allocator = global_descriptor_allocator,
-
-            .background_effects = background_effects,
-            .active_background_effect = 0,
 
             .imm = imm,
 
@@ -1816,8 +1642,6 @@ pub const Engine = struct {
 
             .default_sampler_nearest = default_sampler_nearest,
             .default_sampler_linear = default_sampler_linear,
-
-            .single_image_descriptor_layout = single_image_descriptor_layout,
 
             .metal_rough_material = metal_rough_material,
             .default_data = default_data,
@@ -1981,7 +1805,6 @@ pub const Engine = struct {
             .vma_allocator = self.device_ctx.vma_allocator,
         });
 
-        self.global_descriptor_allocator.deinit(gpa, device);
         self.main_draw_context.opaque_surfaces.deinit(gpa);
 
         self.swapchain.deinit(gpa, device);
@@ -1998,6 +1821,9 @@ pub const Engine = struct {
     }
 
     fn drawImgui(self: *Engine, cmd: vk.CommandBuffer, target_image_view: vk.ImageView) void {
+        const zone = tracy.zone(@src());
+        defer zone.end();
+
         const device = self.device_ctx.device;
         const color_attachment = vk_init.attachmentInfo(target_image_view, null, .attachment_optimal);
         const render_info = vk_init.renderingInfo(self.swapchain.extent, &color_attachment, null);
@@ -2009,18 +1835,7 @@ pub const Engine = struct {
         c.ImGui_NewFrame();
 
         c.ImGui_SetNextWindowSize(.{ .x = 300, .y = 200 }, c.ImGuiCond_Once);
-        if (c.ImGui_Begin("out", null, 0)) {
-            if (self.background_effects.len > 1) {
-                if (c.ImGui_BeginCombo("Select an option", self.background_effects[self.active_background_effect].name, 0)) {
-                    for (self.background_effects, 0..) |effect, i| {
-                        if (c.ImGui_Selectable(effect.name)) self.active_background_effect = @intCast(i);
-                        if (self.active_background_effect == i) c.ImGui_SetItemDefaultFocus();
-                    }
-                    c.ImGui_EndCombo();
-                }
-            }
-            self.background_effects[self.active_background_effect].data.imGuiMenu();
-        }
+        if (c.ImGui_Begin("out", null, 0)) {}
         c.ImGui_End();
 
         c.ImGui_Render();
@@ -2067,7 +1882,7 @@ pub const Engine = struct {
         defer zone.end();
 
         //begin a render pass connected to our draw image
-        const color_attachment: vk.RenderingAttachmentInfo = vk_init.attachmentInfo(self.draw_image.image_view, null, .attachment_optimal);
+        const color_attachment: vk.RenderingAttachmentInfo = vk_init.attachmentInfo(self.draw_image.image_view, .{ .color = .{ .float_32 = .{ 0.0, 0.0, 0.0, 1.0 } } }, .attachment_optimal);
         const depthAttachment: vk.RenderingAttachmentInfo = vk_init.depthAttachmentInfo(self.depth_image.image_view, .depth_attachment_optimal);
 
         const render_info = vk_init.renderingInfo(self.draw_extent, &color_attachment, &depthAttachment);
@@ -2395,240 +2210,6 @@ pub const BindlessDescriptors = struct {
     }
 };
 
-pub const descriptors = struct {
-    pub const DescriptorAllocatorGrowable = struct {
-        // TODO: the design of this is pretty bad
-        // better design: at the start set the ratio to all same
-        // once a pool is full check which type has filled how much as a ratio to the one that filled completely and set the ratio for the next pools accordingly
-
-        pub const PoolSizeRatio = struct {
-            type: vk.DescriptorType,
-            ratio: f32,
-        };
-
-        ratios: std.ArrayListUnmanaged(PoolSizeRatio),
-        fullPools: std.ArrayListUnmanaged(vk.DescriptorPool),
-        readyPools: std.ArrayListUnmanaged(vk.DescriptorPool),
-        setsPerPool: u32,
-
-        pub const empty: DescriptorAllocatorGrowable = .{
-            .ratios = .empty,
-            .fullPools = .empty,
-            .readyPools = .empty,
-            .setsPerPool = 0,
-        };
-
-        pub fn init(
-            self: *DescriptorAllocatorGrowable,
-            gpa: Allocator,
-            scratch: *Scratch,
-            device: vk.DeviceProxy,
-            max_sets: u32,
-            pool_ratios: []const PoolSizeRatio,
-        ) !void {
-            self.ratios.clearRetainingCapacity();
-            try self.ratios.appendSlice(gpa, pool_ratios);
-
-            self.setsPerPool = @intFromFloat(@as(f64, @floatFromInt(max_sets)) * 1.5); //grow it next allocation
-
-            const new_pool = try createPool(scratch, device, max_sets, pool_ratios);
-            try self.readyPools.append(gpa, new_pool);
-        }
-
-        pub fn deinit(
-            self: *DescriptorAllocatorGrowable,
-            gpa: Allocator,
-            device: vk.DeviceProxy,
-        ) void {
-            self.destroyPools(device);
-            self.ratios.deinit(gpa);
-            self.fullPools.deinit(gpa);
-            self.readyPools.deinit(gpa);
-        }
-
-        pub fn clearPools(self: *DescriptorAllocatorGrowable, gpa: Allocator, device: vk.DeviceProxy) !void {
-            for (self.readyPools.items) |pool| {
-                try device.resetDescriptorPool(pool, .{});
-            }
-
-            for (self.fullPools.items) |pool| {
-                try device.resetDescriptorPool(pool, .{});
-                try self.readyPools.append(gpa, pool);
-            }
-            self.fullPools.clearRetainingCapacity();
-        }
-
-        pub fn destroyPools(self: *DescriptorAllocatorGrowable, device: vk.DeviceProxy) void {
-            for (self.readyPools.items) |pool| {
-                device.destroyDescriptorPool(pool, null);
-            }
-            self.readyPools.clearRetainingCapacity();
-
-            for (self.fullPools.items) |pool| {
-                device.destroyDescriptorPool(pool, null);
-            }
-            self.fullPools.clearRetainingCapacity();
-        }
-
-        pub fn allocate(
-            self: *DescriptorAllocatorGrowable,
-            gpa: Allocator,
-            scratch: *Scratch,
-            device: vk.DeviceProxy,
-            layout_: vk.DescriptorSetLayout,
-            pNext: ?*anyopaque,
-        ) !vk.DescriptorSet {
-            //get or create a pool to allocate from
-            var poolToUse = try self.getPool(scratch, device);
-
-            var allocInfo: vk.DescriptorSetAllocateInfo = .{
-                .p_next = pNext,
-                .descriptor_pool = poolToUse,
-                .descriptor_set_count = 1,
-                .p_set_layouts = (&layout_)[0..1],
-            };
-
-            var result: vk.DescriptorSet = undefined;
-            device.allocateDescriptorSets(&allocInfo, (&result)[0..1]) catch |err| switch (err) {
-                error.OutOfPoolMemory, error.FragmentedPool => { //allocation failed. Try again
-                    try self.fullPools.append(gpa, poolToUse);
-
-                    poolToUse = try self.getPool(scratch, device);
-                    allocInfo.descriptor_pool = poolToUse;
-
-                    try device.allocateDescriptorSets(&allocInfo, (&result)[0..1]);
-                },
-                error.OutOfHostMemory, error.OutOfDeviceMemory, error.Unknown, error.ValidationFailed => |e| return e,
-            };
-
-            try self.readyPools.append(gpa, poolToUse);
-            return result;
-        }
-
-        pub fn getPool(self: *DescriptorAllocatorGrowable, scratch: *Scratch, device: vk.DeviceProxy) !vk.DescriptorPool {
-            if (self.readyPools.items.len != 0) {
-                return self.readyPools.pop().?;
-            } else {
-                self.setsPerPool = @intFromFloat(@as(f64, @floatFromInt(self.setsPerPool)) * 1.5);
-                if (self.setsPerPool > 4092) {
-                    self.setsPerPool = 4092;
-                }
-
-                return try createPool(scratch, device, self.setsPerPool, self.ratios.items);
-            }
-        }
-
-        pub fn createPool(scratch: *Scratch, device: vk.DeviceProxy, setCount: u32, poolRatios: []const PoolSizeRatio) !vk.DescriptorPool {
-            const checkpoint = scratch.checkpoint();
-            defer scratch.restoreCheckpoint(checkpoint);
-
-            var poolSizes: std.ArrayListUnmanaged(vk.DescriptorPoolSize) = .empty;
-            for (poolRatios) |ratio| {
-                try poolSizes.append(scratch.allocator(), .{ .type = ratio.type, .descriptor_count = @as(u32, @intFromFloat(ratio.ratio)) * setCount });
-            }
-
-            return try device.createDescriptorPool(&.{
-                .flags = .{},
-                .max_sets = setCount,
-                .pool_size_count = @intCast(poolSizes.items.len),
-                .p_pool_sizes = poolSizes.items.ptr,
-            }, null);
-        }
-    };
-
-    const layout = struct {
-        pub fn createSetBinding(
-            binding: u32,
-            descriptor_type: vk.DescriptorType,
-        ) vk.DescriptorSetLayoutBinding {
-            return .{
-                .binding = binding,
-                .descriptor_count = 1,
-                .descriptor_type = descriptor_type,
-
-                .stage_flags = .{},
-            };
-        }
-
-        pub fn createSet(
-            bindings: []vk.DescriptorSetLayoutBinding,
-            device: vk.DeviceProxy,
-            shader_stages: vk.ShaderStageFlags,
-            p_next: ?*anyopaque,
-            flags: vk.DescriptorSetLayoutCreateFlags,
-        ) !vk.DescriptorSetLayout {
-            for (bindings) |*binding| {
-                @as(*u32, @ptrCast(&binding.stage_flags)).* |= @bitCast(shader_stages);
-            }
-
-            return try device.createDescriptorSetLayout(&.{
-                .p_next = p_next,
-
-                .p_bindings = bindings.ptr,
-                .binding_count = @intCast(bindings.len),
-                .flags = flags,
-            }, null);
-        }
-    };
-
-    const DescriptorWriter = struct {
-        imageInfos: SegmentedList(vk.DescriptorImageInfo) = .empty,
-        bufferInfos: SegmentedList(vk.DescriptorBufferInfo) = .empty,
-        writes: std.ArrayListUnmanaged(vk.WriteDescriptorSet) = .empty,
-
-        pub fn writeImage(self: *DescriptorWriter, gpa: Allocator, binding: u32, image: vk.ImageView, sampler: vk.Sampler, layout_: vk.ImageLayout, @"type": vk.DescriptorType) !void {
-            const info: *vk.DescriptorImageInfo = try self.imageInfos.addOne(gpa);
-            info.* = .{ .sampler = sampler, .image_view = image, .image_layout = layout_ };
-
-            try self.writes.append(gpa, .{
-                .dst_binding = binding,
-                .dst_set = .null_handle, // left empty for now until we need to write it
-                .descriptor_count = 1,
-                .descriptor_type = @"type",
-                .p_image_info = info[0..1],
-
-                .dst_array_element = 0,
-                .p_buffer_info = undefined,
-                .p_texel_buffer_view = undefined,
-            });
-        }
-
-        pub fn writeBuffer(self: *DescriptorWriter, gpa: Allocator, binding: u32, buffer: vk.Buffer, size: usize, offset: usize, @"type": vk.DescriptorType) !void {
-            const info: *vk.DescriptorBufferInfo = try self.bufferInfos.addOne(gpa);
-            info.* = .{ .buffer = buffer, .offset = offset, .range = size };
-
-            try self.writes.append(gpa, .{
-                .dst_binding = binding,
-                .dst_set = .null_handle, // left empty for now until we need to write it
-                .descriptor_count = 1,
-                .descriptor_type = @"type",
-                .p_buffer_info = info[0..1],
-
-                .dst_array_element = 0,
-                .p_image_info = undefined,
-                .p_texel_buffer_view = undefined,
-            });
-        }
-
-        pub fn clear(self: *DescriptorWriter) void {
-            self.imageInfos.clearRetainingCapacity();
-            self.writes.clearRetainingCapacity();
-            self.bufferInfos.clearRetainingCapacity();
-        }
-
-        pub fn deinit(self: *DescriptorWriter, gpa: Allocator) void {
-            self.imageInfos.deinit(gpa);
-            self.writes.deinit(gpa);
-            self.bufferInfos.deinit(gpa);
-        }
-
-        pub fn updateSet(self: *DescriptorWriter, device: vk.DeviceProxy, set: vk.DescriptorSet) void {
-            for (self.writes.items) |*write| write.dst_set = set;
-            device.updateDescriptorSets(self.writes.items, null);
-        }
-    };
-};
-
 const vk_image = struct {
     fn transitionImage(
         device: vk.DeviceProxy,
@@ -2665,27 +2246,18 @@ const vk_image = struct {
         src_size: vk.Extent2D,
         dst_size: vk.Extent2D,
     ) void {
+        const subresource: vk.ImageSubresourceLayers = .{
+            .aspect_mask = .{ .color_bit = true },
+            .base_array_layer = 0,
+            .layer_count = 1,
+            .mip_level = 0,
+        };
+        const offset_base: vk.Offset3D = .{ .x = 0, .y = 0, .z = 0 };
         const blitRegion: vk.ImageBlit2 = .{
-            .src_offsets = .{
-                .{ .x = 0, .y = 0, .z = 0 },
-                .{ .x = @intCast(src_size.width), .y = @intCast(src_size.height), .z = 1 },
-            },
-            .dst_offsets = .{
-                .{ .x = 0, .y = 0, .z = 0 },
-                .{ .x = @intCast(dst_size.width), .y = @intCast(dst_size.height), .z = 1 },
-            },
-            .src_subresource = .{
-                .aspect_mask = .{ .color_bit = true },
-                .base_array_layer = 0,
-                .layer_count = 1,
-                .mip_level = 0,
-            },
-            .dst_subresource = .{
-                .aspect_mask = .{ .color_bit = true },
-                .base_array_layer = 0,
-                .layer_count = 1,
-                .mip_level = 0,
-            },
+            .src_offsets = .{ offset_base, .{ .x = @intCast(src_size.width), .y = @intCast(src_size.height), .z = 1 } },
+            .dst_offsets = .{ offset_base, .{ .x = @intCast(dst_size.width), .y = @intCast(dst_size.height), .z = 1 } },
+            .src_subresource = subresource,
+            .dst_subresource = subresource,
         };
 
         device.cmdBlitImage2(cmd, &.{
@@ -2706,7 +2278,6 @@ const vk_image = struct {
         image_size: vk.Extent2D,
     ) void {
         const mip_levels: u32 = std.math.log2_int(u32, @max(image_size.width, image_size.height)) + 1;
-
         var previous_image_size = image_size;
         for (0..mip_levels) |mip| {
             const half_size: vk.Extent2D = .{
@@ -2745,19 +2316,11 @@ const vk_image = struct {
                 const blit_region: vk.ImageBlit2 = .{
                     .src_offsets = .{
                         .{ .x = 0, .y = 0, .z = 0 },
-                        .{
-                            .x = @intCast(previous_image_size.width),
-                            .y = @intCast(previous_image_size.height),
-                            .z = 1,
-                        },
+                        .{ .x = @intCast(previous_image_size.width), .y = @intCast(previous_image_size.height), .z = 1 },
                     },
                     .dst_offsets = .{
                         .{ .x = 0, .y = 0, .z = 0 },
-                        .{
-                            .x = @intCast(half_size.width),
-                            .y = @intCast(half_size.height),
-                            .z = 1,
-                        },
+                        .{ .x = @intCast(half_size.width), .y = @intCast(half_size.height), .z = 1 },
                     },
                     .src_subresource = .{
                         .aspect_mask = .{ .color_bit = true },
@@ -2772,7 +2335,6 @@ const vk_image = struct {
                         .mip_level = @intCast(mip + 1),
                     },
                 };
-
                 const blit_info: vk.BlitImageInfo2 = .{
                     .dst_image = image,
                     .dst_image_layout = .transfer_dst_optimal,
@@ -2782,13 +2344,11 @@ const vk_image = struct {
                     .region_count = 1,
                     .p_regions = &.{blit_region},
                 };
-
                 device.cmdBlitImage2(cmd, &blit_info);
 
                 previous_image_size = half_size;
             }
         }
-        // transition all mip levels into the final read_only layout
         vk_image.transitionImage(device, cmd, image, .transfer_src_optimal, .read_only_optimal);
     }
 };
@@ -2806,19 +2366,17 @@ const vk_init = struct {
             .p_color_attachments = color_attachment[0..1],
             .p_depth_attachment = depth_attachment,
             .p_stencil_attachment = null,
-
             .view_mask = 0,
         };
     }
 
-    fn attachmentInfo(view: vk.ImageView, clear: ?*vk.ClearValue, layout: vk.ImageLayout) vk.RenderingAttachmentInfo {
+    fn attachmentInfo(view: vk.ImageView, clear: ?vk.ClearValue, layout: vk.ImageLayout) vk.RenderingAttachmentInfo {
         return .{
             .image_view = view,
             .image_layout = layout,
             .load_op = if (clear) |_| .clear else .load,
             .store_op = .store,
-            .clear_value = if (clear) |item| item.* else std.mem.zeroes(vk.ClearValue),
-
+            .clear_value = if (clear) |item| item else std.mem.zeroes(vk.ClearValue),
             .resolve_mode = .{},
             .resolve_image_layout = .undefined,
         };
@@ -2968,19 +2526,11 @@ const vk_init = struct {
     pub fn checkValidationLayerSupport(scratch: *Scratch, base_dispatch: vk.BaseWrapper) !void {
         const checkpoint = scratch.checkpoint();
         defer scratch.restoreCheckpoint(checkpoint);
-
         const available_layers = try base_dispatch.enumerateInstanceLayerPropertiesAlloc(scratch.allocator());
-
         for (validation_layers) |validation_layer| {
             for (available_layers) |available_layer| {
-                if (std.mem.eql(
-                    u8,
-                    std.mem.span(@as([*:0]const u8, @ptrCast(&available_layer.layer_name))),
-                    validation_layer,
-                )) break;
-            } else {
-                return error.NotAllValidationLayersSupported;
-            }
+                if (std.mem.eql(u8, std.mem.sliceTo(&available_layer.layer_name, 0), validation_layer)) break;
+            } else return error.NotAllValidationLayersSupported;
         }
     }
 
@@ -3120,47 +2670,6 @@ fn loadShader(gpa: Allocator, io: std.Io, file_path: []const u8) !ShaderData {
     const data = try std.Io.Dir.cwd().readFileAllocOptions(io, file_path, gpa, .unlimited, .of(u32), null);
     return .{ .ptr = @ptrCast(data.ptr), .size = data.len };
 }
-
-const ComputeEffect = struct {
-    name: [:0]const u8,
-
-    pipeline: vk.Pipeline,
-    layout: vk.PipelineLayout,
-
-    data: ComputeData,
-
-    const ComputeData = union(enum) {
-        color: @Vector(4, f32),
-        circle_effect: extern struct {
-            background_color: @Vector(4, f32) = .{ 0, 0, 0, 1 },
-            time: f32 = 2,
-        },
-
-        fn size(self: ComputeData) usize {
-            return switch (self) {
-                inline else => |data| @sizeOf(@TypeOf(data)),
-            };
-        }
-
-        fn payloadPtr(self: *ComputeData) *anyopaque {
-            return switch (self.*) {
-                inline else => |_, tag| return &@field(self.*, @tagName(tag)),
-            };
-        }
-
-        fn imGuiMenu(self: *ComputeData) void {
-            switch (self.*) {
-                .color => |*color| {
-                    _ = c.ImGui_ColorPicker4("color", @ptrCast(color), 0, @as([*]const f32, &.{ 1, 0, 0, 1 }));
-                },
-                .circle_effect => |*circle_effect| {
-                    _ = c.ImGui_ColorPicker4("background_color", @ptrCast(&circle_effect.background_color), 0, @as([*]const f32, &.{ 0, 0, 0, 1 }));
-                    _ = c.ImGui_DragFloatEx("time", &circle_effect.time, 0.01, 2, std.math.floatMax(f32), null, 0);
-                },
-            }
-        }
-    };
-};
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

@@ -37,7 +37,6 @@ pub fn loadGltf(
     const scene = try gpa.create(LoadedGltf);
     scene.* = .{
         .images = .empty,
-        .descriptor_pool = .empty,
         .samplers = .empty,
         .materials = .empty,
         .meshes = .empty,
@@ -54,22 +53,6 @@ pub fn loadGltf(
     defer gltf.deinit();
     try gltf.parse(try file_reader.interface.allocRemainingAlignedSentinel(scratch.allocator(), .unlimited, .@"4", null));
 
-    // const gltf_options = ::DontRequireValidAssetMember | ::AllowDouble | ::LoadGLBBuffers | ::LoadExternalBuffers;
-    // ::LoadExternalImages;
-
-    // std::filesystem::path path = filePath;
-
-    const sizes = [_]vk_engine.descriptors.DescriptorAllocatorGrowable.PoolSizeRatio{
-        .{ .type = .combined_image_sampler, .ratio = 3 },
-        .{ .type = .uniform_buffer, .ratio = 3 },
-        .{ .type = .storage_buffer, .ratio = 1 },
-    };
-
-    scene.descriptor_pool = .empty;
-    try scene.descriptor_pool.init(gpa, scratch, device_ctx.device, 10, &sizes);
-    errdefer scene.descriptor_pool.deinit(gpa, device_ctx.device);
-
-    // load samplers
     for (gltf.data.samplers) |sampler| {
         const sampl: vk.SamplerCreateInfo = .{
             .max_lod = vk.LOD_CLAMP_NONE,
