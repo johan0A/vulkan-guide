@@ -30,6 +30,9 @@ pub fn loadGltf(
     bindless_descriptors: *vk_engine.BindlessDescriptors,
     materials_buffer: *vk_engine.GltfMetallicRoughness.MaterialsBuffer,
 ) !*LoadedGltf {
+    const zone = tracy.zone(@src());
+    defer zone.end();
+
     std.log.info("Loading GLTF: {s}", .{filePath});
     const checkpoint = scratch.checkpoint();
     defer scratch.restoreCheckpoint(checkpoint);
@@ -329,6 +332,9 @@ fn loadImage(
     device_ctx: vk_engine.Engine.DeviceContext,
     imm: vk_engine.Engine.ImmSubmit,
 ) !vk_engine.AllocatedImage {
+    const zone = tracy.zone(@src());
+    defer zone.end();
+
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
 
@@ -370,6 +376,7 @@ fn loadImage(
     );
 }
 
+const tracy = @import("tracy");
 const img = @import("zigimg");
 const std = @import("std");
 const zla = @import("zla");

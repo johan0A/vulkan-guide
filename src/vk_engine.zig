@@ -875,6 +875,9 @@ pub const Engine = struct {
     bindless_descriptors: BindlessDescriptors,
     bindless_pipeline_layout: vk.PipelineLayout,
 
+    materials_buffer: GltfMetallicRoughness.MaterialsBuffer,
+    scene_data_buffer: VmaGpuBuffer,
+
     // default images
     white_image: AllocatedImage,
     black_image: AllocatedImage,
@@ -940,7 +943,7 @@ pub const Engine = struct {
 
             vk_image.transitionImage(device, cmd, self.draw_image.image, .undefined, .color_attachment_optimal);
             vk_image.transitionImage(device, cmd, self.depth_image.image, .undefined, .depth_attachment_optimal);
-            try self.drawGeometry(gpa, scratch, cmd);
+            try self.drawGeometry(scratch, cmd);
 
             // copy draw image into the swapchain
             vk_image.transitionImage(device, cmd, self.draw_image.image, .color_attachment_optimal, .transfer_src_optimal);
@@ -1432,12 +1435,16 @@ pub const Engine = struct {
         try main_deletion_queue.append(gpa, .{ .sampler = default_sampler_linear });
 
         var materials_buffer: GltfMetallicRoughness.MaterialsBuffer = try .init(1024, vma_allocator);
-        bindless_descriptors.registerBuffer(
-            device_proxy,
-            1,
-            materials_buffer.gpu_buffer.buffer,
-            materials_buffer.capacity * @sizeOf(GltfMetallicRoughness.GPUMaterialData),
+        bindless_descriptors.registerBuffer(device_proxy, 1, materials_buffer.gpu_buffer.buffer, materials_buffer.gpu_buffer.size);
+
+        const scene_data_buffer: VmaGpuBuffer = try .create(
+            vma_allocator,
+            FrameData.frame_overlap * @sizeOf(GPUSceneData),
+            .{ .storage_buffer_bit = true },
+            .auto,
+            .sequential_write,
         );
+        bindless_descriptors.registerBuffer(device_proxy, 2, scene_data_buffer.buffer, scene_data_buffer.size);
 
         var material_resources: GltfMetallicRoughness.MaterialResources = .{
             .color_image = white_image,
@@ -1523,6 +1530,9 @@ pub const Engine = struct {
 
             .bindless_descriptors = bindless_descriptors,
             .bindless_pipeline_layout = bindless_pipeline_layout,
+
+            .materials_buffer = materials_buffer,
+            .scene_data_buffer = scene_data_buffer,
 
             .white_image = white_image,
             .grey_image = grey_image,
@@ -1791,7 +1801,7 @@ pub const Engine = struct {
         self.scene_data.sunlightDirection = .{ 0, 1, 0.5, 1 };
     }
 
-    pub fn drawGeometry(self: *Engine, gpa: Allocator, scratch: *Scratch, cmd: vk.CommandBuffer) !void {
+    pub fn drawGeometry(self: *Engine, scratch: *Scratch, cmd: vk.CommandBuffer) !void {
         const checkpoint = scratch.checkpoint();
         defer scratch.restoreCheckpoint(checkpoint);
         const zone = tracy.zone(@src());
@@ -1806,27 +1816,9 @@ pub const Engine = struct {
 
         device.cmdBeginRendering(cmd, &render_info);
         {
-            //allocate a new uniform buffer for the scene data
-            const gpu_scene_data_buffer: VmaGpuBuffer = try .create(
-                self.device_ctx.vma_allocator,
-                @sizeOf(GPUSceneData),
-                .{ .storage_buffer_bit = true },
-                .cpu_to_gpu,
-                .sequential_write,
-            );
+            const frame_index = self.currentFrameIndex();
 
-            //add it to the deletion queue of this frame so it gets deleted once its been used
-            try self.currentFrame().deletion_queue.append(gpa, .{ .allocated_buffer = gpu_scene_data_buffer });
-
-            const buffer = gpu_scene_data_buffer.getMappedSlice(GPUSceneData);
-            buffer[0] = self.scene_data;
-
-            self.bindless_descriptors.registerBuffer(
-                device,
-                2, // binding 2 = scene data
-                gpu_scene_data_buffer.buffer,
-                @sizeOf(GPUSceneData),
-            );
+            self.scene_data_buffer.getMappedSlice(GPUSceneData)[frame_index] = self.scene_data;
 
             device.cmdBindDescriptorSets(
                 cmd,
@@ -1876,7 +1868,7 @@ pub const Engine = struct {
                         .world_matrix = surface.transform,
                         .vertex_buffer = surface.vertex_buffer_address,
                         .material_index = surface.material.?.bindless_index,
-                        .scene_data_index = 0,
+                        .scene_data_index = @intCast(frame_index),
                     };
                     device.cmdPushConstants(
                         cmd,
