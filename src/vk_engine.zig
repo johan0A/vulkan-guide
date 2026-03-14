@@ -412,15 +412,6 @@ pub const VmaGpuBuffer = struct {
 
     /// Returns the persistently mapped memory as a typed slice.
     pub fn getMappedSlice(self: VmaGpuBuffer, comptime T: type) []T {
-        comptime assertMappableType(T);
-        std.debug.assert(self.size % @sizeOf(T) == 0);
-
-        const ptr: [*]T = @ptrCast(@alignCast(self.mapped orelse std.debug.panic("getMappedSlice called on unmappable buffer", .{})));
-
-        return ptr[0 .. self.size / @sizeOf(T)];
-    }
-
-    fn assertMappableType(comptime T: type) void {
         switch (@typeInfo(T)) {
             inline .@"struct", .@"union" => |info| switch (info.layout) {
                 .@"extern", .@"packed" => {},
@@ -433,6 +424,9 @@ pub const VmaGpuBuffer = struct {
             },
             else => @compileError("unsupported type for buffer mapping"),
         }
+        std.debug.assert(self.size % @sizeOf(T) == 0);
+        const ptr: [*]T = @ptrCast(@alignCast(self.mapped orelse std.debug.panic("getMappedSlice called on unmappable buffer", .{})));
+        return ptr[0 .. self.size / @sizeOf(T)];
     }
 };
 
@@ -477,8 +471,8 @@ pub const AllocatedImage = struct {
 };
 
 pub const QueueFamilyIndices = struct {
-    graphics_family: ?u32,
-    present_family: ?u32,
+    graphics_family: u32,
+    present_family: u32,
 };
 
 const PipelineConfig = struct {
@@ -500,17 +494,10 @@ fn createPipeline(device: vk.DeviceProxy, layout: vk.PipelineLayout, cfg: Pipeli
     };
 
     const color_blend_attachment: vk.PipelineColorBlendAttachmentState = switch (cfg.blending) {
-        .none => .{
+        .none => std.mem.zeroInit(vk.PipelineColorBlendAttachmentState, .{
             .color_write_mask = .{ .r_bit = true, .g_bit = true, .b_bit = true, .a_bit = true },
             .blend_enable = .false,
-
-            .src_color_blend_factor = .zero,
-            .dst_color_blend_factor = .zero,
-            .color_blend_op = .add,
-            .src_alpha_blend_factor = .zero,
-            .dst_alpha_blend_factor = .zero,
-            .alpha_blend_op = .add,
-        },
+        }),
         .additive => .{
             .color_write_mask = .{ .r_bit = true, .g_bit = true, .b_bit = true, .a_bit = true },
             .blend_enable = .true,
@@ -533,7 +520,6 @@ fn createPipeline(device: vk.DeviceProxy, layout: vk.PipelineLayout, cfg: Pipeli
         },
     };
 
-    var color_format = cfg.color_format;
     const dynamic_states = [_]vk.DynamicState{ .viewport, .scissor };
 
     var new_pipeline: vk.Pipeline = undefined;
@@ -542,7 +528,7 @@ fn createPipeline(device: vk.DeviceProxy, layout: vk.PipelineLayout, cfg: Pipeli
         &.{.{
             .p_next = &vk.PipelineRenderingCreateInfo{
                 .color_attachment_count = 1,
-                .p_color_attachment_formats = (&color_format)[0..1],
+                .p_color_attachment_formats = &.{cfg.color_format},
                 .depth_attachment_format = cfg.depth_format,
                 .view_mask = 0,
                 .stencil_attachment_format = .undefined,
@@ -557,7 +543,6 @@ fn createPipeline(device: vk.DeviceProxy, layout: vk.PipelineLayout, cfg: Pipeli
                 .line_width = 1,
                 .cull_mode = cfg.cull_mode,
                 .front_face = cfg.front_face,
-
                 .depth_clamp_enable = .false,
                 .rasterizer_discard_enable = .false,
                 .depth_bias_enable = .false,
@@ -575,7 +560,7 @@ fn createPipeline(device: vk.DeviceProxy, layout: vk.PipelineLayout, cfg: Pipeli
             .p_color_blend_state = &.{
                 .logic_op = .copy,
                 .attachment_count = 1,
-                .p_attachments = (&color_blend_attachment)[0..1],
+                .p_attachments = &.{color_blend_attachment},
                 .logic_op_enable = .false,
                 .blend_constants = @splat(0),
             },
@@ -1067,11 +1052,8 @@ pub const Engine = struct {
             ) callconv(vk.vulkan_call_conv) vk.Bool32 {
                 _ = message_types;
                 _ = p_user_data;
-
                 const callback_data = p_callback_data orelse @panic("");
-                const message_ptr = callback_data.p_message orelse "no message";
-
-                const message = std.mem.span(message_ptr);
+                const message = std.mem.span(callback_data.p_message orelse "no message");
 
                 if (message_severity.error_bit_ext) {
                     std.log.err("Validation: {s}", .{message});
@@ -1082,7 +1064,6 @@ pub const Engine = struct {
                 }
 
                 std.debug.dumpCurrentStackTrace(.{});
-
                 return .false;
             }
         };
@@ -1092,14 +1073,13 @@ pub const Engine = struct {
             .message_type = .{ .general_bit_ext = true, .validation_bit_ext = true, .performance_bit_ext = true },
             .pfn_user_callback = debug_callback.debugCallback,
         };
-
         const debug_messenger = try instance_proxy.createDebugUtilsMessengerEXT(&debug_messenger_info, null);
 
         var sdl_window_surface: vk.SurfaceKHR = undefined;
         if (!c.SDL_Vulkan_CreateSurface(window, @ptrFromInt(@intFromEnum(instance)), null, @ptrCast(&sdl_window_surface))) return error.engine_init_failure;
 
         const physical_device = try vk_init.pickPhysicalDevice(scratch, instance_proxy, sdl_window_surface);
-        const queue_family_indices = try vk_init.findQueueFamilies(scratch, physical_device, instance_dispatch.*, sdl_window_surface);
+        const queue_family_indices = (try vk_init.findQueueFamilies(scratch, physical_device, instance_dispatch.*, sdl_window_surface)).?;
 
         const device = try vk_init.createLogicalDevice(physical_device, instance_dispatch.*, queue_family_indices);
         const device_dispatch = try init_alloc.create(vk.DeviceWrapper);
@@ -1110,7 +1090,7 @@ pub const Engine = struct {
         // init_sync_structures() {
         const command_pool_info: vk.CommandPoolCreateInfo = .{
             .flags = .{ .reset_command_buffer_bit = true },
-            .queue_family_index = queue_family_indices.graphics_family.?,
+            .queue_family_index = queue_family_indices.graphics_family,
         };
 
         const fence_create_info: vk.FenceCreateInfo = .{ .flags = .{ .signaled_bit = true } };
@@ -1259,14 +1239,7 @@ pub const Engine = struct {
         try main_deletion_queue.append(gpa, .{ .vma_allocated_image = depth_allocated_image });
         //}
 
-        //create a descriptor pool that will hold 10 sets with 1 image each
-
-        //make the descriptor set layout for our compute draw
-        // try main_deletion_queue.append(allocator, .{ .descriptor_allocator_growable = global_descriptor_allocator }); TODO
-
-        // }
-
-        const graphics_queue = device_proxy.getDeviceQueue(queue_family_indices.graphics_family.?, 0);
+        const graphics_queue = device_proxy.getDeviceQueue(queue_family_indices.graphics_family, 0);
         const swapchain: SwapChain = try .init(
             gpa,
             scratch,
@@ -1279,7 +1252,6 @@ pub const Engine = struct {
         );
 
         {
-            // 1: create descriptor pool for IMGUI
             // the size of the pool is very oversized, but it's copied from imgui demo itself.
             const pool_sizes = [_]vk.DescriptorPoolSize{
                 .{ .type = .sampler, .descriptor_count = 1000 },
@@ -1326,8 +1298,8 @@ pub const Engine = struct {
             // 2: initialize imgui library
             _ = c.ImGui_CreateContext(null);
             const imgui_io: *c.ImGuiIO = c.ImGui_GetIO();
-            imgui_io.ConfigFlags |= c.ImGuiConfigFlags_NavEnableKeyboard; // Enable Keyboard Controls
-            imgui_io.ConfigFlags |= c.ImGuiConfigFlags_NavEnableGamepad; // Enable Gamepad Controls
+            imgui_io.ConfigFlags |= c.ImGuiConfigFlags_NavEnableKeyboard;
+            imgui_io.ConfigFlags |= c.ImGuiConfigFlags_NavEnableGamepad;
 
             _ = c.cImGui_ImplSDL3_InitForVulkan(window);
 
@@ -1392,7 +1364,7 @@ pub const Engine = struct {
         const device_ctx: DeviceContext = .{
             .device = device_proxy,
             .graphics_queue = graphics_queue,
-            .graphics_queue_family = queue_family_indices.graphics_family.?,
+            .graphics_queue_family = queue_family_indices.graphics_family,
             .vma_allocator = vma_allocator,
         };
         const imm: ImmSubmit = .{
@@ -1458,16 +1430,6 @@ pub const Engine = struct {
         sampler_create_info.min_filter = .linear;
         const default_sampler_linear = try device_ctx.device.createSampler(&sampler_create_info, null);
         try main_deletion_queue.append(gpa, .{ .sampler = default_sampler_linear });
-
-        // _mainDeletionQueue.push_function([&](){
-        // vkDestroySampler(_device,_defaultSamplerNearest,nullptr);
-        // vkDestroySampler(_device,_defaultSamplerLinear,nullptr);
-
-        // destroy_image(_whiteImage);
-        // destroy_image(_greyImage);
-        // destroy_image(_blackImage);
-        // destroy_image(_errorCheckerboardImage);
-        // });
 
         var materials_buffer: GltfMetallicRoughness.MaterialsBuffer = try .init(1024, vma_allocator);
         bindless_descriptors.registerBuffer(
@@ -1758,6 +1720,8 @@ pub const Engine = struct {
         });
 
         self.main_draw_context.opaque_surfaces.deinit(gpa);
+
+        self.bindless_descriptors.deinit(gpa, device);
 
         self.swapchain.deinit(gpa, device);
 
@@ -2496,8 +2460,8 @@ const vk_init = struct {
             const is_suitable = blk: {
                 const formats = try instance.getPhysicalDeviceSurfaceFormatsAllocKHR(physical_device, surface, scratch.allocator());
                 const present_modes = try instance.getPhysicalDeviceSurfacePresentModesAllocKHR(physical_device, surface, scratch.allocator());
-                const graphics_family = (try findQueueFamilies(scratch, physical_device, instance.wrapper.*, surface)).graphics_family;
-                break :blk graphics_family != null and
+                const has_families = (try findQueueFamilies(scratch, physical_device, instance.wrapper.*, surface)) != null;
+                break :blk has_families and
                     try checkDeviceExtensionSupport(physical_device, instance.wrapper.*, scratch) and
                     formats.len > 0 and
                     present_modes.len > 0;
@@ -2514,29 +2478,30 @@ const vk_init = struct {
         physical_device: vk.PhysicalDevice,
         instance_dispatch: vk.InstanceWrapper,
         surface: vk.SurfaceKHR,
-    ) !QueueFamilyIndices {
+    ) !?QueueFamilyIndices {
         const checkpoint = scratch.checkpoint();
         defer scratch.restoreCheckpoint(checkpoint);
 
-        var indices: QueueFamilyIndices = .{ .graphics_family = null, .present_family = null };
         const queue_families = try instance_dispatch.getPhysicalDeviceQueueFamilyPropertiesAlloc(physical_device, scratch.allocator());
 
+        var graphics_family: u32 = undefined;
         // TODO: prefer queue that supports both graphics and KHR
         for (queue_families, 0..) |queue_familie, i| {
             if (queue_familie.queue_flags.graphics_bit) {
-                indices.graphics_family = @intCast(i);
+                graphics_family = @intCast(i);
                 break;
             }
-        }
+        } else return null;
 
+        var present_family: u32 = undefined;
         for (queue_families, 0..) |_, i| {
             if (try instance_dispatch.getPhysicalDeviceSurfaceSupportKHR(physical_device, @intCast(i), surface) == .true) {
-                indices.present_family = @intCast(i);
+                present_family = @intCast(i);
                 break;
             }
-        }
+        } else return null;
 
-        return indices;
+        return .{ .graphics_family = graphics_family, .present_family = present_family };
     }
 
     pub fn checkDeviceExtensionSupport(
@@ -2570,8 +2535,8 @@ const vk_init = struct {
         queue_family_indices: QueueFamilyIndices,
     ) !vk.Device {
         const indices = [_]u32{
-            queue_family_indices.graphics_family.?,
-            queue_family_indices.present_family.?,
+            queue_family_indices.graphics_family,
+            queue_family_indices.present_family,
         };
 
         const queue_priorities: [1]f32 = .{1};
