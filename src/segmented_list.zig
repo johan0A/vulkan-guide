@@ -29,9 +29,10 @@ pub fn SegmentedList(comptime T: type) type {
             return self.uncheckedAt(self.len).*;
         }
 
-        pub fn at(self: *Self, i: usize) *T {
-            std.debug.assert(i < self.len);
-            return self.uncheckedAt(i);
+        pub fn at(self: *Self, index: usize) *T {
+            std.debug.assert(index < self.len);
+            const si = shelfIndex(index);
+            return &self.shelves[si][boxIndex(index, si)];
         }
 
         pub fn addOne(self: *Self, gpa: std.mem.Allocator) !*T {
@@ -49,11 +50,6 @@ pub fn SegmentedList(comptime T: type) type {
 
         pub fn clearRetainingCapacity(self: *Self) void {
             self.len = 0;
-        }
-
-        fn uncheckedAt(self: *Self, index: usize) *T {
-            const si = shelfIndex(index);
-            return &self.shelves[si][boxIndex(index, si)];
         }
 
         fn shelfCount(count: usize) ShelfIndex {

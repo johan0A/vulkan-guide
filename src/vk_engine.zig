@@ -188,19 +188,15 @@ pub const MaterialPass = enum(u8) {
     transparent,
 };
 
-const MaterialPipeline = struct {
-    pipeline: vk.Pipeline,
-};
-
 pub const MaterialInstance = struct {
-    pipeline: MaterialPipeline,
+    pipeline: vk.Pipeline,
     bindless_index: u32,
     pass_type: MaterialPass,
 };
 
 pub const GltfMetallicRoughness = struct {
-    opaque_pipeline: MaterialPipeline,
-    transparent_pipeline: MaterialPipeline,
+    opaque_pipeline: vk.Pipeline,
+    transparent_pipeline: vk.Pipeline,
 
     /// Packed material data that lives in the global materials SSBO.
     /// Shader reads this by materialIndex.
@@ -258,40 +254,32 @@ pub const GltfMetallicRoughness = struct {
         bindless_pipeline_layout: vk.PipelineLayout,
         draw_image: AllocatedImage,
         depth_image: AllocatedImage,
-        device_proxy: vk.DeviceProxy,
+        device: vk.DeviceProxy,
     ) !GltfMetallicRoughness {
         const checkpoint = scratch.checkpoint();
         defer scratch.restoreCheckpoint(checkpoint);
 
         const mesh_frag_shader_data = try loadShader(scratch.allocator(), io, shaders.mesh_frag);
-        const mesh_frag_shader = try vk_init.loadShaderModule(mesh_frag_shader_data, device_proxy);
-        defer device_proxy.destroyShaderModule(mesh_frag_shader, null);
+        const mesh_frag_shader = try vk_init.loadShaderModule(mesh_frag_shader_data, device);
+        defer device.destroyShaderModule(mesh_frag_shader, null);
 
         const mesh_vertex_shader_data = try loadShader(scratch.allocator(), io, shaders.mesh_vert);
-        const mesh_vertex_shader = try vk_init.loadShaderModule(mesh_vertex_shader_data, device_proxy);
-        defer device_proxy.destroyShaderModule(mesh_vertex_shader, null);
+        const mesh_vertex_shader = try vk_init.loadShaderModule(mesh_vertex_shader_data, device);
+        defer device.destroyShaderModule(mesh_vertex_shader, null);
 
-        var pipeline_builder: PipelineBuilder = .{};
-        try pipeline_builder.setShaders(scratch.allocator(), mesh_vertex_shader, mesh_frag_shader);
-        pipeline_builder.setInputTopology(.triangle_list);
-        pipeline_builder.setPolygonMode(.fill);
-        pipeline_builder.setCullMode(.{}, .clockwise);
-        pipeline_builder.setMultisamplingNone();
-        pipeline_builder.disableBlending();
-        pipeline_builder.enableDepthtest(true, .greater_or_equal);
-        pipeline_builder.setColorAttachmentFormat(draw_image.image_format);
-        pipeline_builder.setDepthFormat(depth_image.image_format);
-
-        const opaque_pipeline: MaterialPipeline = .{
-            .pipeline = try pipeline_builder.buildPipeline(device_proxy, bindless_pipeline_layout),
+        var pipeline_config: PipelineConfig = .{
+            .shaders = .{ mesh_vertex_shader, mesh_frag_shader },
+            .depth_test = .{ .write = true, .compare = .greater_or_equal },
+            .color_format = draw_image.image_format,
+            .depth_format = depth_image.image_format,
         };
 
-        pipeline_builder.enableBlendingAdditive();
-        pipeline_builder.enableDepthtest(false, .greater_or_equal);
+        const opaque_pipeline = try createPipeline(device, bindless_pipeline_layout, pipeline_config);
 
-        const transparent_pipeline: MaterialPipeline = .{
-            .pipeline = try pipeline_builder.buildPipeline(device_proxy, bindless_pipeline_layout),
-        };
+        pipeline_config.blending = .additive;
+        pipeline_config.depth_test = .{ .write = false, .compare = .greater_or_equal };
+
+        const transparent_pipeline = try createPipeline(device, bindless_pipeline_layout, pipeline_config);
 
         return .{
             .opaque_pipeline = opaque_pipeline,
@@ -300,8 +288,8 @@ pub const GltfMetallicRoughness = struct {
     }
 
     pub fn deinit(self: *GltfMetallicRoughness, device: vk.DeviceProxy) void {
-        device.destroyPipeline(self.transparent_pipeline.pipeline, null);
-        device.destroyPipeline(self.opaque_pipeline.pipeline, null);
+        device.destroyPipeline(self.transparent_pipeline, null);
+        device.destroyPipeline(self.opaque_pipeline, null);
     }
 
     pub fn writeMaterial(
@@ -493,162 +481,37 @@ pub const QueueFamilyIndices = struct {
     present_family: ?u32,
 };
 
-pub const PipelineBuilder = struct {
-    shader_stages: std.ArrayListUnmanaged(vk.PipelineShaderStageCreateInfo) = .empty,
+const PipelineConfig = struct {
+    shaders: struct { vk.ShaderModule, vk.ShaderModule },
+    topology: vk.PrimitiveTopology = .triangle_list,
+    polygon_mode: vk.PolygonMode = .fill,
+    cull_mode: vk.CullModeFlags = .{},
+    front_face: vk.FrontFace = .clockwise,
+    depth_test: ?struct { write: bool = true, compare: vk.CompareOp = .greater_or_equal } = null,
+    color_format: vk.Format,
+    depth_format: vk.Format,
+    blending: enum { none, additive, alpha } = .none,
+};
 
-    input_assembly: vk.PipelineInputAssemblyStateCreateInfo = std.mem.zeroInit(vk.PipelineInputAssemblyStateCreateInfo, .{}),
-    rasterizer: vk.PipelineRasterizationStateCreateInfo = std.mem.zeroInit(vk.PipelineRasterizationStateCreateInfo, .{}),
-    color_blend_attachment: vk.PipelineColorBlendAttachmentState = std.mem.zeroInit(vk.PipelineColorBlendAttachmentState, .{}),
-    multisampling: vk.PipelineMultisampleStateCreateInfo = std.mem.zeroInit(vk.PipelineMultisampleStateCreateInfo, .{}),
-    depth_stencil: vk.PipelineDepthStencilStateCreateInfo = std.mem.zeroInit(vk.PipelineDepthStencilStateCreateInfo, .{}),
-    render_info: vk.PipelineRenderingCreateInfo = std.mem.zeroInit(vk.PipelineRenderingCreateInfo, .{}),
-    color_attachmentformat: vk.Format = .undefined,
+fn createPipeline(device: vk.DeviceProxy, layout: vk.PipelineLayout, cfg: PipelineConfig) !vk.Pipeline {
+    const stages = [_]vk.PipelineShaderStageCreateInfo{
+        .{ .stage = .{ .vertex_bit = true }, .module = cfg.shaders[0], .p_name = "main" },
+        .{ .stage = .{ .fragment_bit = true }, .module = cfg.shaders[1], .p_name = "main" },
+    };
 
-    pub fn buildPipeline(self: PipelineBuilder, device: vk.DeviceProxy, layout: vk.PipelineLayout) !vk.Pipeline {
-        // make viewport state from our stored viewport and scissor.
-        // at the moment we wont support multiple viewports or scissors
-        const viewport_state: vk.PipelineViewportStateCreateInfo = .{
-            .viewport_count = 1,
-            .scissor_count = 1,
-        };
+    const color_blend_attachment: vk.PipelineColorBlendAttachmentState = switch (cfg.blending) {
+        .none => .{
+            .color_write_mask = .{ .r_bit = true, .g_bit = true, .b_bit = true, .a_bit = true },
+            .blend_enable = .false,
 
-        // setup dummy color blending. We arent using transparent objects yet
-        // the blending is just "no blend", but we do write to the color attachment
-        const color_blending: vk.PipelineColorBlendStateCreateInfo = .{
-            .logic_op_enable = .false,
-            .logic_op = .copy,
-            .attachment_count = 1,
-            .p_attachments = (&self.color_blend_attachment)[0..1],
-
-            .blend_constants = .{ 0, 0, 0, 0 },
-        };
-
-        // completely clear VertexInputStateCreateInfo, as we have no need for it
-        const vertex_input_info = vk.PipelineVertexInputStateCreateInfo{};
-
-        const states = [_]vk.DynamicState{ .viewport, .scissor };
-        const dynamic_info: vk.PipelineDynamicStateCreateInfo = .{
-            .p_dynamic_states = &states,
-            .dynamic_state_count = @intCast(states.len),
-        };
-
-        // build the actual pipeline
-        // we now use all of the info structs we have been writing into into this one
-        // to create the pipeline
-        const pipeline_info: vk.GraphicsPipelineCreateInfo = .{
-            // connect the renderInfo to the pNext extension mechanism
-            .p_next = &self.render_info,
-
-            .stage_count = @intCast(self.shader_stages.items.len),
-            .p_stages = self.shader_stages.items.ptr,
-            .p_vertex_input_state = &vertex_input_info,
-            .p_input_assembly_state = &self.input_assembly,
-            .p_viewport_state = &viewport_state,
-            .p_rasterization_state = &self.rasterizer,
-            .p_multisample_state = &self.multisampling,
-            .p_color_blend_state = &color_blending,
-            .p_depth_stencil_state = &self.depth_stencil,
-            .layout = layout,
-
-            .p_dynamic_state = &dynamic_info,
-
-            .subpass = 0,
-            .base_pipeline_index = 0,
-        };
-
-        // TODO: handle error ???
-        // // its easy to error out on create graphics pipeline, so we handle it a bit
-        // // better than the common VK_CHECK case
-        var new_pipeline: vk.Pipeline = undefined;
-        _ = try device.createGraphicsPipelines(.null_handle, &.{pipeline_info}, null, (&new_pipeline)[0..1]);
-        return new_pipeline;
-    }
-
-    pub fn setShaders(
-        self: *PipelineBuilder,
-        gpa: Allocator,
-        vertex_shader: vk.ShaderModule,
-        fragment_shader: vk.ShaderModule,
-    ) !void {
-        self.shader_stages.clearRetainingCapacity();
-
-        try self.shader_stages.append(gpa, vk_init.pipelineShaderStageCreateInfo(.{ .vertex_bit = true }, vertex_shader));
-        try self.shader_stages.append(gpa, vk_init.pipelineShaderStageCreateInfo(.{ .fragment_bit = true }, fragment_shader));
-    }
-
-    pub fn setInputTopology(self: *PipelineBuilder, topology: vk.PrimitiveTopology) void {
-        self.input_assembly.topology = topology;
-        // we are not going to use primitive restart on the entire tutorial so leave
-        // it on false
-        self.input_assembly.primitive_restart_enable = .false;
-    }
-
-    pub fn setPolygonMode(self: *PipelineBuilder, mode: vk.PolygonMode) void {
-        self.rasterizer.polygon_mode = mode;
-        self.rasterizer.line_width = 1;
-    }
-
-    pub fn setCullMode(self: *PipelineBuilder, cull_mode: vk.CullModeFlags, front_face: vk.FrontFace) void {
-        self.rasterizer.cull_mode = cull_mode;
-        self.rasterizer.front_face = front_face;
-    }
-
-    pub fn setMultisamplingNone(self: *PipelineBuilder) void {
-        self.multisampling.sample_shading_enable = .false;
-        // multisampling defaulted to no multisampling (1 sample per pixel)
-        self.multisampling.rasterization_samples = .{ .@"1_bit" = true };
-        self.multisampling.min_sample_shading = 1;
-        self.multisampling.p_sample_mask = null;
-        // no alpha to coverage either
-        self.multisampling.alpha_to_coverage_enable = .false;
-        self.multisampling.alpha_to_one_enable = .false;
-    }
-
-    pub fn disableBlending(self: *PipelineBuilder) void {
-        // default write mask
-        self.color_blend_attachment.color_write_mask = .{ .r_bit = true, .g_bit = true, .b_bit = true, .a_bit = true };
-        // no blending
-        self.color_blend_attachment.blend_enable = .false;
-    }
-
-    pub fn setColorAttachmentFormat(self: *PipelineBuilder, format: vk.Format) void {
-        self.color_attachmentformat = format;
-        // connect the format to the renderInfo  structure
-        self.render_info.color_attachment_count = 1;
-        self.render_info.p_color_attachment_formats = (&self.color_attachmentformat)[0..1];
-    }
-
-    pub fn setDepthFormat(self: *PipelineBuilder, format: vk.Format) void {
-        self.render_info.depth_attachment_format = format;
-    }
-
-    pub fn disableDepthtest(self: *PipelineBuilder) void {
-        self.depth_stencil.depth_test_enable = .false;
-        self.depth_stencil.depth_write_enable = .false;
-        self.depth_stencil.depth_compare_op = .never;
-        self.depth_stencil.depth_bounds_test_enable = .false;
-        self.depth_stencil.stencil_test_enable = .false;
-        // self.depthStencil.front = .{};
-        // self.depthStencil.back = .{};
-        self.depth_stencil.min_depth_bounds = 0;
-        self.depth_stencil.max_depth_bounds = 1;
-    }
-
-    pub fn enableDepthtest(self: *PipelineBuilder, depth_write_enable: bool, op: vk.CompareOp) void {
-        self.depth_stencil.depth_test_enable = .true;
-        self.depth_stencil.depth_write_enable = if (depth_write_enable) .true else .false;
-        self.depth_stencil.depth_compare_op = op;
-        self.depth_stencil.depth_bounds_test_enable = .false;
-        self.depth_stencil.stencil_test_enable = .false;
-        // self.depth_stencil.front = {};
-        // self.depth_stencil.back = {};
-        self.depth_stencil.min_depth_bounds = 0;
-        self.depth_stencil.max_depth_bounds = 1;
-    }
-
-    pub fn enableBlendingAdditive(self: *PipelineBuilder) void {
-        // TODO: maybe use the same pattern of init all at once for other builder methods?
-        self.color_blend_attachment = .{
+            .src_color_blend_factor = .zero,
+            .dst_color_blend_factor = .zero,
+            .color_blend_op = .add,
+            .src_alpha_blend_factor = .zero,
+            .dst_alpha_blend_factor = .zero,
+            .alpha_blend_op = .add,
+        },
+        .additive => .{
             .color_write_mask = .{ .r_bit = true, .g_bit = true, .b_bit = true, .a_bit = true },
             .blend_enable = .true,
             .src_color_blend_factor = .src_alpha,
@@ -657,11 +520,8 @@ pub const PipelineBuilder = struct {
             .src_alpha_blend_factor = .one,
             .dst_alpha_blend_factor = .zero,
             .alpha_blend_op = .add,
-        };
-    }
-
-    pub fn enableBlendingAlphablend(self: *PipelineBuilder) void {
-        self.color_blend_attachment = .{
+        },
+        .alpha => .{
             .color_write_mask = .{ .r_bit = true, .g_bit = true, .b_bit = true, .a_bit = true },
             .blend_enable = .true,
             .src_color_blend_factor = .src_alpha,
@@ -670,13 +530,86 @@ pub const PipelineBuilder = struct {
             .src_alpha_blend_factor = .one,
             .dst_alpha_blend_factor = .zero,
             .alpha_blend_op = .add,
-        };
-    }
+        },
+    };
 
-    fn deinit(self: *PipelineBuilder, gpa: Allocator) void {
-        self.shader_stages.deinit(gpa);
-    }
-};
+    var color_format = cfg.color_format;
+    const dynamic_states = [_]vk.DynamicState{ .viewport, .scissor };
+
+    var new_pipeline: vk.Pipeline = undefined;
+    _ = try device.createGraphicsPipelines(
+        .null_handle,
+        &.{.{
+            .p_next = &vk.PipelineRenderingCreateInfo{
+                .color_attachment_count = 1,
+                .p_color_attachment_formats = (&color_format)[0..1],
+                .depth_attachment_format = cfg.depth_format,
+                .view_mask = 0,
+                .stencil_attachment_format = .undefined,
+            },
+            .stage_count = stages.len,
+            .p_stages = &stages,
+            .p_vertex_input_state = &.{},
+            .p_input_assembly_state = &.{ .topology = cfg.topology, .primitive_restart_enable = .false },
+            .p_viewport_state = &.{ .viewport_count = 1, .scissor_count = 1 },
+            .p_rasterization_state = &.{
+                .polygon_mode = cfg.polygon_mode,
+                .line_width = 1,
+                .cull_mode = cfg.cull_mode,
+                .front_face = cfg.front_face,
+
+                .depth_clamp_enable = .false,
+                .rasterizer_discard_enable = .false,
+                .depth_bias_enable = .false,
+                .depth_bias_constant_factor = 0,
+                .depth_bias_clamp = 0,
+                .depth_bias_slope_factor = 0,
+            },
+            .p_multisample_state = &.{
+                .rasterization_samples = .{ .@"1_bit" = true },
+                .min_sample_shading = 1,
+                .sample_shading_enable = .false,
+                .alpha_to_coverage_enable = .false,
+                .alpha_to_one_enable = .false,
+            },
+            .p_color_blend_state = &.{
+                .logic_op = .copy,
+                .attachment_count = 1,
+                .p_attachments = (&color_blend_attachment)[0..1],
+                .logic_op_enable = .false,
+                .blend_constants = @splat(0),
+            },
+            .p_depth_stencil_state = if (cfg.depth_test) |dt| &.{
+                .depth_test_enable = .true,
+                .depth_write_enable = if (dt.write) .true else .false,
+                .depth_compare_op = dt.compare,
+                .max_depth_bounds = 1,
+                .depth_bounds_test_enable = .false,
+                .stencil_test_enable = .false,
+                .front = std.mem.zeroes(vk.StencilOpState),
+                .back = std.mem.zeroes(vk.StencilOpState),
+                .min_depth_bounds = 0,
+            } else &.{
+                .depth_compare_op = .never,
+                .max_depth_bounds = 1,
+                .depth_test_enable = .false,
+                .depth_write_enable = .false,
+                .depth_bounds_test_enable = .false,
+                .stencil_test_enable = .false,
+                .front = std.mem.zeroes(vk.StencilOpState),
+                .back = std.mem.zeroes(vk.StencilOpState),
+                .min_depth_bounds = 0,
+            },
+            .layout = layout,
+            .p_dynamic_state = &.{ .p_dynamic_states = &dynamic_states, .dynamic_state_count = dynamic_states.len },
+            .subpass = 0,
+            .base_pipeline_index = 0,
+        }},
+        null,
+        (&new_pipeline)[0..1],
+    );
+    return new_pipeline;
+}
 
 const DeletionQueue = struct {
     const DeinitContext = struct {
@@ -948,8 +881,6 @@ pub const Engine = struct {
 
     //draw resources
     depth_image: AllocatedImage,
-    draw_extent: vk.Extent2D,
-
     draw_image: AllocatedImage,
 
     scene_data: GPUSceneData,
@@ -1013,9 +944,6 @@ pub const Engine = struct {
 
         const cmd: vk.CommandBuffer = self.currentFrame().main_command_buffer;
 
-        self.draw_extent.width = self.draw_image.image_extent.width; // TODO: I dont like this, its duplication of state for no good reasons
-        self.draw_extent.height = self.draw_image.image_extent.height;
-
         // now that we are sure that the commands finished executing, we can safely
         // reset the command buffer to begin recording again.
         try device.resetCommandBuffer(cmd, .{});
@@ -1032,7 +960,7 @@ pub const Engine = struct {
             // copy draw image into the swapchain
             vk_image.transitionImage(device, cmd, self.draw_image.image, .color_attachment_optimal, .transfer_src_optimal);
             vk_image.transitionImage(device, cmd, current_swap_image.handle, .undefined, .transfer_dst_optimal);
-            vk_image.copyImageToImage(device, cmd, self.draw_image.image, current_swap_image.handle, self.draw_extent, self.swapchain.extent);
+            vk_image.copyImageToImage(device, cmd, self.draw_image.image, current_swap_image.handle, self.drawExtent(), self.swapchain.extent);
 
             //draw imgui into the swapchain image
             vk_image.transitionImage(device, cmd, current_swap_image.handle, .transfer_dst_optimal, .color_attachment_optimal);
@@ -1619,7 +1547,6 @@ pub const Engine = struct {
 
             .draw_image = draw_allocated_image,
             .depth_image = depth_allocated_image,
-            .draw_extent = .{ .width = 0, .height = 0 },
 
             .scene_data = .{
                 .view = .identity,
@@ -1656,6 +1583,10 @@ pub const Engine = struct {
             },
             .loaded_scenes = loaded_scenes,
         };
+    }
+
+    fn drawExtent(self: *const Engine) vk.Extent2D {
+        return .{ .width = self.draw_image.image_extent.width, .height = self.draw_image.image_extent.height };
     }
 
     pub fn createImage(device_ctx: DeviceContext, size: vk.Extent3D, format: vk.Format, usage: vk.ImageUsageFlags, mipmapped: bool) !AllocatedImage {
@@ -1906,7 +1837,7 @@ pub const Engine = struct {
         const color_attachment: vk.RenderingAttachmentInfo = vk_init.attachmentInfo(self.draw_image.image_view, .{ .color = .{ .float_32 = .{ 0.0, 0.0, 0.0, 1.0 } } }, .attachment_optimal);
         const depthAttachment: vk.RenderingAttachmentInfo = vk_init.depthAttachmentInfo(self.depth_image.image_view, .depth_attachment_optimal);
 
-        const render_info = vk_init.renderingInfo(self.draw_extent, &color_attachment, &depthAttachment);
+        const render_info = vk_init.renderingInfo(self.drawExtent(), &color_attachment, &depthAttachment);
         const device = self.device_ctx.device;
 
         device.cmdBeginRendering(cmd, &render_info);
@@ -1945,21 +1876,19 @@ pub const Engine = struct {
             device.cmdSetViewport(cmd, 0, (&vk.Viewport{
                 .x = 0,
                 .y = 0,
-                .width = @floatFromInt(self.draw_extent.width),
-                .height = @floatFromInt(self.draw_extent.height),
+                .width = @floatFromInt(self.drawExtent().width),
+                .height = @floatFromInt(self.drawExtent().height),
                 .min_depth = 0,
                 .max_depth = 1,
             })[0..1]);
 
             device.cmdSetScissor(cmd, 0, (&vk.Rect2D{
                 .offset = .{ .x = 0, .y = 0 },
-                .extent = self.draw_extent,
+                .extent = self.drawExtent(),
             })[0..1]);
 
             var draw_calls: usize = 0;
             var triangle_count: usize = 0;
-
-            // const frame_index = self.currentFrameIndex();
 
             var last_pipeline: vk.Pipeline = .null_handle;
             var last_index_buffer: vk.Buffer = .null_handle;
@@ -1969,8 +1898,8 @@ pub const Engine = struct {
                 self.main_draw_context.transparent_surfaces.items,
             }) |surfaces| {
                 for (surfaces) |surface| {
-                    if (surface.material.?.pipeline.pipeline != last_pipeline) {
-                        last_pipeline = surface.material.?.pipeline.pipeline;
+                    if (surface.material.?.pipeline != last_pipeline) {
+                        last_pipeline = surface.material.?.pipeline;
                         device.cmdBindPipeline(cmd, .graphics, last_pipeline);
                     }
 
