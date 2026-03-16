@@ -11,9 +11,8 @@ pub const GeoSurface = struct {
 
 pub const MeshAsset = struct {
     name: []const u8,
-
     surfaces: std.ArrayListUnmanaged(GeoSurface),
-    mesh_buffers: vk_engine.GPUMeshBuffers,
+    mesh: vk_engine.MeshBuffers.MeshEntry,
 };
 
 pub fn loadGltf(
@@ -29,6 +28,7 @@ pub fn loadGltf(
     filePath: []const u8,
     bindless_descriptors: *vk_engine.BindlessDescriptors,
     materials_buffer: *vk_engine.GltfMetallicRoughness.MaterialsBuffer,
+    mesh_buffers: *vk_engine.MeshBuffers,
 ) !*LoadedGltf {
     const zone = tracy.zone(@src());
     defer zone.end();
@@ -170,7 +170,7 @@ pub fn loadGltf(
         new_mesh.* = .{
             .name = "",
             .surfaces = .empty,
-            .mesh_buffers = undefined,
+            .mesh = undefined,
         };
         try meshes.append(gpa, new_mesh);
 
@@ -253,7 +253,7 @@ pub fn loadGltf(
             try new_mesh.surfaces.append(gpa, new_surface);
         }
 
-        new_mesh.mesh_buffers = try vk_engine.Engine.uploadMesh(device_ctx, imm, indices.items, vertices.items);
+        new_mesh.mesh = mesh_buffers.upload(vertices.items, indices.items);
     }
 
     // load all nodes and their meshes
