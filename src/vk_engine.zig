@@ -69,10 +69,7 @@ pub const MeshBuffers = struct {
         const vertex_buffer: VmaGpuBuffer = try .create(
             allocator,
             len * @sizeOf(Vertex),
-            .{
-                .storage_buffer_bit = true,
-                .shader_device_address_bit = true,
-            },
+            .{ .storage_buffer_bit = true },
             .auto,
             .sequential_write,
         );
@@ -1183,7 +1180,7 @@ pub const Engine = struct {
             .physicalDevice = @ptrFromInt(@intFromEnum(physical_device)),
             .device = @ptrFromInt(@intFromEnum(device)),
             .instance = @ptrFromInt(@intFromEnum(instance)),
-            .flags = c.VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
+            .flags = 0,
             .pVulkanFunctions = &c.VmaVulkanFunctions{
                 .vkGetDeviceProcAddr = @ptrCast(instance_dispatch.dispatch.vkGetDeviceProcAddr),
                 .vkGetInstanceProcAddr = @ptrCast(base_dispatch.dispatch.vkGetInstanceProcAddr),
@@ -1846,7 +1843,8 @@ pub const Engine = struct {
         const zone = tracy.zone(@src());
         defer zone.end();
 
-        const color_attachment: vk.RenderingAttachmentInfo = vk_init.attachmentInfo(self.draw_image.image_view, .{ .color = .{ .float_32 = .{ 0.0, 0.0, 0.0, 1.0 } } }, .attachment_optimal);
+        const clear_color: vk.ClearValue = .{ .color = .{ .float_32 = .{ 0.0, 0.0, 0.0, 1.0 } } };
+        const color_attachment: vk.RenderingAttachmentInfo = vk_init.attachmentInfo(self.draw_image.image_view, clear_color, .attachment_optimal);
         const depthAttachment: vk.RenderingAttachmentInfo = vk_init.depthAttachmentInfo(self.depth_image.image_view, .depth_attachment_optimal);
 
         const render_info = vk_init.renderingInfo(self.drawExtent(), &color_attachment, &depthAttachment);
@@ -2523,12 +2521,9 @@ const vk_init = struct {
         const device_features_vk12: vk.PhysicalDeviceVulkan12Features = .{
             .p_next = &device_features_vk13,
             .runtime_descriptor_array = .true,
-            .shader_sampled_image_array_non_uniform_indexing = .true,
             .descriptor_binding_partially_bound = .true,
             .descriptor_binding_sampled_image_update_after_bind = .true,
             .descriptor_binding_storage_buffer_update_after_bind = .true,
-            .buffer_device_address = .true,
-            .descriptor_indexing = .true,
         };
         return try instance_dispatch.createDevice(physical_device, &.{
             .p_next = &device_features_vk12,
@@ -2536,16 +2531,13 @@ const vk_init = struct {
             .queue_create_info_count = @intCast(queue_create_infos.items.len),
             .pp_enabled_extension_names = &required_device_extensions,
             .enabled_extension_count = required_device_extensions.len,
-            .p_enabled_features = &.{
-                .shader_int_64 = .true,
-                .sampler_anisotropy = .true,
-            },
+            .p_enabled_features = &.{ .shader_int_64 = .true, .sampler_anisotropy = .true },
         }, null);
     }
 };
 
 fn loadShader(gpa: Allocator, io: std.Io, file_path: []const u8) !ShaderData {
-    std.log.info("loading {s} shader", .{std.fs.path.basename(file_path)});
+    std.log.info("loading {s} shader", .{file_path});
     const data = try std.Io.Dir.cwd().readFileAllocOptions(io, file_path, gpa, .unlimited, .of(u32), null);
     return .{ .ptr = @ptrCast(data.ptr), .size = data.len };
 }
