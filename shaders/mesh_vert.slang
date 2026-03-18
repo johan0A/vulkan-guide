@@ -12,7 +12,7 @@ VSOutput main(
     uniform Constants push_constants,
     uint vertex_id: SV_VulkanVertexID,
 ) {
-    Vertex v = push_constants.vertices[vertex_id];
+    Vertex v = vertices[vertex_id];
     SceneData scene = scenes[push_constants.scene_data_index];
     GLTFMaterialData mat = materials[push_constants.material_index];
 

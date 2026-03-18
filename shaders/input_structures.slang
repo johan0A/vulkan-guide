@@ -15,6 +15,14 @@ struct GLTFMaterialData {
     uint2 _padding;
 };
 
+struct Vertex {
+    float3 position;
+    float uv_x;
+    float3 normal;
+    float uv_y;
+    float4 color;
+};
+
 [[vk::binding(0, 0)]]
 Sampler2D textures[];
 
@@ -24,17 +32,11 @@ StructuredBuffer<GLTFMaterialData> materials;
 [[vk::binding(2, 0)]]
 StructuredBuffer<SceneData> scenes;
 
-struct Vertex {
-    float3 position;
-    float uv_x;
-    float3 normal;
-    float uv_y;
-    float4 color;
-};
+[[vk::binding(3, 0)]]
+StructuredBuffer<Vertex> vertices;
 
 struct Constants {
     float4x4 render_matrix;
-    Vertex *vertices;
     uint material_index;
     uint scene_data_index;
 };

@@ -59,15 +59,13 @@ pub const MeshBuffers = struct {
     next_vertex: u32,
     next_index: u32,
 
-    vertex_buffer_address: vk.DeviceAddress,
-
     pub const MeshEntry = struct {
         index_count: u32,
         index_offset: u32,
         vertex_offset: u32,
     };
 
-    pub fn init(allocator: c.VmaAllocator, device: vk.DeviceProxy, len: usize) !MeshBuffers {
+    pub fn init(allocator: c.VmaAllocator, len: usize) !MeshBuffers {
         const vertex_buffer: VmaGpuBuffer = try .create(
             allocator,
             len * @sizeOf(Vertex),
@@ -78,10 +76,6 @@ pub const MeshBuffers = struct {
             .auto,
             .sequential_write,
         );
-
-        const vertex_buffer_address = device.getBufferDeviceAddress(&.{
-            .buffer = vertex_buffer.buffer,
-        });
 
         return .{
             .vertex_buffer = vertex_buffer,
@@ -94,7 +88,6 @@ pub const MeshBuffers = struct {
             ),
             .next_vertex = 0,
             .next_index = 0,
-            .vertex_buffer_address = vertex_buffer_address,
         };
     }
 
@@ -504,7 +497,6 @@ pub const GPUSceneData = extern struct {
 // push constants for our mesh object draws
 pub const GPUDrawPushConstants = extern struct {
     world_matrix: Mat4,
-    vertex_buffer: vk.DeviceAddress,
     material_index: u32,
     scene_data_index: u32,
 };
@@ -1503,7 +1495,8 @@ pub const Engine = struct {
 
         //}
 
-        var mesh_buffers: MeshBuffers = try .init(vma_allocator, device_proxy, 64 * 1024 * 1024);
+        var mesh_buffers: MeshBuffers = try .init(vma_allocator, 64 * 1024 * 1024);
+        bindless_descriptors.registerBuffer(device_proxy, 3, mesh_buffers.vertex_buffer.buffer, mesh_buffers.vertex_buffer.size);
 
         const structure_path = options.assets_path ++ "/structure.glb";
         const structure_file = try loader.loadGltf(
@@ -1907,7 +1900,6 @@ pub const Engine = struct {
 
                     const push_constants: GPUDrawPushConstants = .{
                         .world_matrix = surface.transform,
-                        .vertex_buffer = self.mesh_buffers.vertex_buffer_address,
                         .material_index = surface.material.?.bindless_index,
                         .scene_data_index = @intCast(frame_index),
                     };
@@ -1955,7 +1947,7 @@ pub const BindlessDescriptors = struct {
 
         const pool_sizes = [_]vk.DescriptorPoolSize{
             .{ .type = .combined_image_sampler, .descriptor_count = max_textures },
-            .{ .type = .storage_buffer, .descriptor_count = 2 },
+            .{ .type = .storage_buffer, .descriptor_count = 3 },
         };
 
         const pool = try device.createDescriptorPool(&.{
@@ -1987,10 +1979,18 @@ pub const BindlessDescriptors = struct {
                 .stage_flags = .{ .vertex_bit = true, .fragment_bit = true },
                 .p_immutable_samplers = null,
             },
+            .{
+                .binding = 3,
+                .descriptor_type = .storage_buffer,
+                .descriptor_count = 1,
+                .stage_flags = .{ .vertex_bit = true, .fragment_bit = true },
+                .p_immutable_samplers = null,
+            },
         };
 
         const binding_flags = [_]vk.DescriptorBindingFlags{
             .{ .partially_bound_bit = true, .update_after_bind_bit = true },
+            .{ .update_after_bind_bit = true },
             .{ .update_after_bind_bit = true },
             .{ .update_after_bind_bit = true },
         };
