@@ -509,9 +509,42 @@ pub const AllocatedImage = struct {
     image_format: vk.Format,
 };
 
-pub const QueueFamilyIndices = struct {
-    graphics_family: u32,
-    present_family: u32,
+pub const Queues = struct {
+    families: Families,
+
+    graphics: vk.Queue,
+    present: vk.Queue,
+    compute: vk.Queue,
+    transfer: vk.Queue,
+
+    pub const Families = struct {
+        graphics: u32,
+        present: u32,
+        compute: u32,
+        transfer: u32,
+
+        pub fn unique(self: Families) struct { families: [4]u32, len: u32 } {
+            var result: [4]u32 = undefined;
+            var len: u32 = 0;
+            const all = [_]u32{ self.graphics, self.present, self.compute, self.transfer };
+            outer: for (all) |family| {
+                for (result[0..len]) |existing| if (existing == family) continue :outer;
+                result[len] = family;
+                len += 1;
+            }
+            return .{ .families = result, .len = len };
+        }
+    };
+
+    pub fn init(families: Families, device: vk.DeviceProxy) Queues {
+        return .{
+            .families = families,
+            .graphics = device.getDeviceQueue(families.graphics, 0),
+            .present = device.getDeviceQueue(families.present, 0),
+            .compute = device.getDeviceQueue(families.compute, 0),
+            .transfer = device.getDeviceQueue(families.transfer, 0),
+        };
+    }
 };
 
 const PipelineConfig = struct {
@@ -765,6 +798,7 @@ const SwapChain = struct {
         window_width: u32,
         window_height: u32,
         instance_dispatch: vk.InstanceWrapper,
+        queues: Queues,
     ) !SwapChain {
         const checkpoint = scratch.checkpoint();
         defer scratch.restoreCheckpoint(checkpoint);
@@ -783,6 +817,8 @@ const SwapChain = struct {
 
         const swapchain_extent: vk.Extent2D = .{ .width = window_width, .height = window_height };
 
+        const concurrent = queues.families.graphics != queues.families.present;
+        const family_indices = [_]u32{ queues.families.graphics, queues.families.present };
         const swapchain_create_info = vk.SwapchainCreateInfoKHR{
             .surface = window_surface,
             .min_image_count = min_image_count,
@@ -791,9 +827,9 @@ const SwapChain = struct {
             .image_extent = swapchain_extent,
             .image_array_layers = 1,
             .image_usage = .{ .transfer_src_bit = true, .color_attachment_bit = true, .transfer_dst_bit = true },
-            .image_sharing_mode = .exclusive,
-            .queue_family_index_count = 0,
-            .p_queue_family_indices = null,
+            .image_sharing_mode = if (concurrent) .concurrent else .exclusive,
+            .queue_family_index_count = if (concurrent) 2 else 0,
+            .p_queue_family_indices = if (concurrent) &family_indices else null,
             .pre_transform = .{ .identity_bit_khr = true },
             .composite_alpha = .{ .opaque_bit_khr = true },
             .present_mode = .immediate_khr,
@@ -880,8 +916,7 @@ pub const Engine = struct {
 
     pub const DeviceContext = struct {
         device: vk.DeviceProxy,
-        graphics_queue: vk.Queue,
-        graphics_queue_family: u32,
+        queues: Queues,
         vma_allocator: c.VmaAllocator,
     };
 
@@ -1016,7 +1051,7 @@ pub const Engine = struct {
 
             //submit command buffer to the queue and execute it.
             // _render_fence will now block until the graphic commands finish execution
-            try device.queueSubmit2(self.device_ctx.graphics_queue, &.{submit_info}, self.currentFrame().render_fence);
+            try device.queueSubmit2(self.device_ctx.queues.graphics, &.{submit_info}, self.currentFrame().render_fence);
         }
 
         const present_info: vk.PresentInfoKHR = .{
@@ -1026,7 +1061,7 @@ pub const Engine = struct {
             .wait_semaphore_count = 1,
             .p_image_indices = (&swapchain_image_index)[0..1],
         };
-        _ = device.queuePresentKHR(self.device_ctx.graphics_queue, &present_info) catch |err| switch (err) {
+        _ = device.queuePresentKHR(self.device_ctx.queues.present, &present_info) catch |err| switch (err) {
             error.OutOfDateKHR => {
                 self.resize_requested = true;
             },
@@ -1044,7 +1079,7 @@ pub const Engine = struct {
         try device.beginCommandBuffer(imm_command_buffer, &.{ .flags = .{ .one_time_submit_bit = true } });
     }
 
-    fn immediateModeEnd(device: vk.DeviceProxy, imm_fence: vk.Fence, imm_command_buffer: vk.CommandBuffer, graphics_queue: vk.Queue) !void {
+    fn immediateModeEnd(device: vk.DeviceProxy, imm_fence: vk.Fence, imm_command_buffer: vk.CommandBuffer, queue: vk.Queue) !void {
         try device.endCommandBuffer(imm_command_buffer);
 
         const cmdinfo: vk.CommandBufferSubmitInfo = vk_init.commandBufferSubmitInfo(imm_command_buffer);
@@ -1052,7 +1087,7 @@ pub const Engine = struct {
 
         // submit command buffer to the queue and execute it.
         //  _renderFence will now block until the graphic commands finish execution
-        try device.queueSubmit2(graphics_queue, &.{submit}, imm_fence);
+        try device.queueSubmit2(queue, &.{submit}, imm_fence);
         _ = try device.waitForFences(&.{imm_fence}, .true, 9999999999);
     }
 
@@ -1128,18 +1163,20 @@ pub const Engine = struct {
         if (!c.SDL_Vulkan_CreateSurface(window, @ptrFromInt(@intFromEnum(instance)), null, @ptrCast(&sdl_window_surface))) return error.engine_init_failure;
 
         const physical_device = try vk_init.pickPhysicalDevice(scratch, instance_proxy, sdl_window_surface);
-        const queue_family_indices = (try vk_init.findQueueFamilies(scratch, physical_device, instance_dispatch.*, sdl_window_surface)).?;
+        const families = (try vk_init.findQueueFamilies(scratch, physical_device, instance_dispatch.*, sdl_window_surface)).?;
 
-        const device = try vk_init.createLogicalDevice(physical_device, instance_dispatch.*, queue_family_indices);
+        const device = try vk_init.createLogicalDevice(physical_device, instance_dispatch.*, families);
         const device_dispatch = try init_alloc.create(vk.DeviceWrapper);
         device_dispatch.* = vk.DeviceWrapper.load(device, instance_dispatch.dispatch.vkGetDeviceProcAddr.?);
         const device_proxy: vk.DeviceProxy = .init(device, device_dispatch);
+
+        const queues: Queues = .init(families, device_proxy);
 
         // init_commands() {
         // init_sync_structures() {
         const command_pool_info: vk.CommandPoolCreateInfo = .{
             .flags = .{ .reset_command_buffer_bit = true },
-            .queue_family_index = queue_family_indices.graphics_family,
+            .queue_family_index = queues.families.graphics,
         };
 
         const fence_create_info: vk.FenceCreateInfo = .{ .flags = .{ .signaled_bit = true } };
@@ -1290,7 +1327,6 @@ pub const Engine = struct {
         };
         //}
 
-        const graphics_queue = device_proxy.getDeviceQueue(queue_family_indices.graphics_family, 0);
         const swapchain: SwapChain = try .init(
             gpa,
             scratch,
@@ -1300,6 +1336,7 @@ pub const Engine = struct {
             window_width,
             window_height,
             instance_dispatch.*,
+            queues,
         );
 
         {
@@ -1360,7 +1397,7 @@ pub const Engine = struct {
                 .Instance = @ptrFromInt(@intFromEnum(instance)),
                 .PhysicalDevice = @ptrFromInt(@intFromEnum(physical_device)),
                 .Device = @ptrFromInt(@intFromEnum(device)),
-                .Queue = @ptrFromInt(@intFromEnum(graphics_queue)),
+                .Queue = @ptrFromInt(@intFromEnum(queues.graphics)),
                 .DescriptorPool = @ptrFromInt(@intFromEnum(imgui_pool)),
                 .MinImageCount = 3,
                 .ImageCount = 3,
@@ -1407,8 +1444,7 @@ pub const Engine = struct {
         // init_default_data {
         const device_ctx: DeviceContext = .{
             .device = device_proxy,
-            .graphics_queue = graphics_queue,
-            .graphics_queue_family = queue_family_indices.graphics_family,
+            .queues = queues,
             .vma_allocator = vma_allocator,
         };
         const imm: ImmSubmit = .{
@@ -1692,7 +1728,7 @@ pub const Engine = struct {
                 vk_image.transitionImage(device_ctx.device, imm.cmd, new_image.image, .transfer_dst_optimal, .read_only_optimal);
             }
 
-            try immediateModeEnd(device_ctx.device, imm.fence, imm.cmd, device_ctx.graphics_queue);
+            try immediateModeEnd(device_ctx.device, imm.fence, imm.cmd, device_ctx.queues.graphics);
         }
 
         upload_buffer.destroy(device_ctx.vma_allocator);
@@ -1725,6 +1761,7 @@ pub const Engine = struct {
             new_width,
             new_height,
             self.vk_ctx.instance.wrapper.*,
+            self.device_ctx.queues,
         );
 
         self.destroyImage(&self.draw_image);
@@ -2155,8 +2192,8 @@ const vk_image = struct {
                 if (new_layout == .depth_attachment_optimal) .{ .depth_bit = true } else .{ .color_bit = true },
             ),
             .image = image,
-            .src_queue_family_index = 0,
-            .dst_queue_family_index = 0,
+            .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+            .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
         };
         device.cmdPipelineBarrier2(cmd, &.{
             .image_memory_barrier_count = 1,
@@ -2204,11 +2241,11 @@ const vk_image = struct {
         image_size: vk.Extent2D,
     ) void {
         const mip_levels: u32 = std.math.log2_int(u32, @max(image_size.width, image_size.height)) + 1;
-        var previous_image_size = image_size;
+        var previous_size = image_size;
         for (0..mip_levels) |mip| {
             const half_size: vk.Extent2D = .{
-                .width = @max(previous_image_size.width / 2, 1),
-                .height = @max(previous_image_size.height / 2, 1),
+                .width = @max(previous_size.width / 2, 1),
+                .height = @max(previous_size.height / 2, 1),
             };
 
             const aspect_mask: vk.ImageAspectFlags = .{ .color_bit = true };
@@ -2242,7 +2279,7 @@ const vk_image = struct {
                 const blit_region: vk.ImageBlit2 = .{
                     .src_offsets = .{
                         .{ .x = 0, .y = 0, .z = 0 },
-                        .{ .x = @intCast(previous_image_size.width), .y = @intCast(previous_image_size.height), .z = 1 },
+                        .{ .x = @intCast(previous_size.width), .y = @intCast(previous_size.height), .z = 1 },
                     },
                     .dst_offsets = .{
                         .{ .x = 0, .y = 0, .z = 0 },
@@ -2272,7 +2309,7 @@ const vk_image = struct {
                 };
                 device.cmdBlitImage2(cmd, &blit_info);
 
-                previous_image_size = half_size;
+                previous_size = half_size;
             }
         }
         vk_image.transitionImage(device, cmd, image, .transfer_src_optimal, .read_only_optimal);
@@ -2286,7 +2323,7 @@ const vk_init = struct {
 
     fn renderingInfo(render_extent: vk.Extent2D, color_attachment: *const vk.RenderingAttachmentInfo, depth_attachment: ?*const vk.RenderingAttachmentInfo) vk.RenderingInfo {
         return .{
-            .render_area = vk.Rect2D{ .offset = vk.Offset2D{ .x = 0, .y = 0 }, .extent = render_extent },
+            .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = render_extent },
             .layer_count = 1,
             .color_attachment_count = 1,
             .p_color_attachments = color_attachment[0..1],
@@ -2362,8 +2399,7 @@ const vk_init = struct {
                 .layer_count = 1,
                 .aspect_mask = aspect_flags,
             },
-
-            .components = std.mem.zeroInit(vk.ComponentMapping, .{}),
+            .components = std.mem.zeroes(vk.ComponentMapping),
         };
     }
 
@@ -2490,30 +2526,48 @@ const vk_init = struct {
         physical_device: vk.PhysicalDevice,
         instance_dispatch: vk.InstanceWrapper,
         surface: vk.SurfaceKHR,
-    ) !?QueueFamilyIndices {
+    ) !?Queues.Families {
         const checkpoint = scratch.checkpoint();
         defer scratch.restoreCheckpoint(checkpoint);
 
         const queue_families = try instance_dispatch.getPhysicalDeviceQueueFamilyPropertiesAlloc(physical_device, scratch.allocator());
 
-        var graphics_family: u32 = undefined;
-        // TODO: prefer queue that supports both graphics and KHR
-        for (queue_families, 0..) |queue_familie, i| {
-            if (queue_familie.queue_flags.graphics_bit) {
+        var graphics_family: ?u32 = null;
+        for (queue_families, 0..) |family, i| {
+            if (family.queue_flags.graphics_bit) {
                 graphics_family = @intCast(i);
                 break;
             }
-        } else return null;
+        }
+        const gfx = graphics_family orelse return null;
 
-        var present_family: u32 = undefined;
+        var present_family: ?u32 = null;
         for (queue_families, 0..) |_, i| {
-            if (try instance_dispatch.getPhysicalDeviceSurfaceSupportKHR(physical_device, @intCast(i), surface) == .true) {
-                present_family = @intCast(i);
+            const idx: u32 = @intCast(i);
+            if (try instance_dispatch.getPhysicalDeviceSurfaceSupportKHR(physical_device, idx, surface) == .true) {
+                present_family = idx;
+                if (idx == gfx) break;
+            }
+        }
+        const present = present_family orelse return null;
+
+        var compute: u32 = gfx;
+        for (queue_families, 0..) |family, i| {
+            if (family.queue_flags.compute_bit and !family.queue_flags.graphics_bit) {
+                compute = @intCast(i);
                 break;
             }
-        } else return null;
+        }
 
-        return .{ .graphics_family = graphics_family, .present_family = present_family };
+        var transfer: u32 = gfx;
+        for (queue_families, 0..) |family, i| {
+            if (family.queue_flags.transfer_bit and !family.queue_flags.graphics_bit and !family.queue_flags.compute_bit) {
+                transfer = @intCast(i);
+                break;
+            }
+        }
+
+        return .{ .graphics = gfx, .present = present, .compute = compute, .transfer = transfer };
     }
 
     pub fn checkDeviceExtensionSupport(
@@ -2544,24 +2598,18 @@ const vk_init = struct {
     pub fn createLogicalDevice(
         physical_device: vk.PhysicalDevice,
         instance_dispatch: vk.InstanceWrapper,
-        queue_family_indices: QueueFamilyIndices,
+        families: Queues.Families,
     ) !vk.Device {
-        const indices = [_]u32{
-            queue_family_indices.graphics_family,
-            queue_family_indices.present_family,
-        };
-
+        const unique = families.unique();
         const queue_priorities: [1]f32 = .{1};
 
-        var queue_create_infos_buff: [indices.len]vk.DeviceQueueCreateInfo = undefined;
-        var queue_create_infos: std.ArrayListUnmanaged(vk.DeviceQueueCreateInfo) = .initBuffer(&queue_create_infos_buff);
-        outer: for (indices, 0..) |indice, i| {
-            for (indices[0..i]) |previous_indice| if (previous_indice == indice) continue :outer;
-            queue_create_infos.appendAssumeCapacity(.{
-                .queue_family_index = indice,
+        var queue_create_infos: [4]vk.DeviceQueueCreateInfo = undefined;
+        for (unique.families[0..unique.len], queue_create_infos[0..unique.len]) |family, *info| {
+            info.* = .{
+                .queue_family_index = family,
                 .queue_count = queue_priorities.len,
                 .p_queue_priorities = &queue_priorities,
-            });
+            };
         }
 
         var device_features_vk13: vk.PhysicalDeviceVulkan13Features = .{
@@ -2581,8 +2629,8 @@ const vk_init = struct {
         };
         return try instance_dispatch.createDevice(physical_device, &.{
             .p_next = &device_features_vk11,
-            .p_queue_create_infos = queue_create_infos.items.ptr,
-            .queue_create_info_count = @intCast(queue_create_infos.items.len),
+            .p_queue_create_infos = queue_create_infos[0..unique.len].ptr,
+            .queue_create_info_count = unique.len,
             .pp_enabled_extension_names = &required_device_extensions,
             .enabled_extension_count = required_device_extensions.len,
             .p_enabled_features = &.{
