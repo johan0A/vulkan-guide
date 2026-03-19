@@ -23,6 +23,12 @@ struct Vertex {
     float4 color;
 };
 
+struct DrawData {
+    float4x4 world_matrix;
+    uint material_index;
+    uint3 _padding;
+};
+
 [[vk::binding(0, 0)]]
 Sampler2D textures[];
 
@@ -35,8 +41,9 @@ StructuredBuffer<SceneData> scenes;
 [[vk::binding(3, 0)]]
 StructuredBuffer<Vertex> vertices;
 
+[[vk::binding(4, 0)]] 
+StructuredBuffer<DrawData> draw_data;
+
 struct Constants {
-    float4x4 render_matrix;
-    uint material_index;
     uint scene_data_index;
 };

@@ -249,7 +249,7 @@ pub const GltfMetallicRoughness = struct {
         metal_rough_factors: [4]f32,
         color_texture: u32, // index into bindless textures[]
         metal_rough_texture: u32, // index into bindless textures[]
-        _padding: [2]u32 = .{ 0, 0 },
+        pad: [2]u32 = @splat(0),
     };
 
     pub const MaterialsBuffer = struct {
@@ -491,11 +491,14 @@ pub const GPUSceneData = extern struct {
     sunlightColor: [4]f32,
 };
 
-// push constants for our mesh object draws
 pub const GPUDrawPushConstants = extern struct {
+    scene_data_index: u32,
+};
+
+pub const GPUDrawData = extern struct {
     world_matrix: Mat4,
     material_index: u32,
-    scene_data_index: u32,
+    pad: [3]u32 = @splat(0),
 };
 
 pub const AllocatedImage = struct {
@@ -793,7 +796,7 @@ const SwapChain = struct {
             .p_queue_family_indices = null,
             .pre_transform = .{ .identity_bit_khr = true },
             .composite_alpha = .{ .opaque_bit_khr = true },
-            .present_mode = .fifo_khr,
+            .present_mode = .immediate_khr,
             .clipped = .false,
             .old_swapchain = .null_handle,
         };
@@ -852,12 +855,15 @@ const SwapChain = struct {
 
 const FrameData = struct {
     const frame_overlap = 2;
+    const max_draws = 65536;
 
     swapchain_semaphore: vk.Semaphore,
     render_fence: vk.Fence,
 
     command_pool: vk.CommandPool,
     main_command_buffer: vk.CommandBuffer,
+
+    indirect_buffer: VmaGpuBuffer,
 
     deletion_queue: DeletionQueue,
 };
@@ -914,6 +920,7 @@ pub const Engine = struct {
     materials_buffer: GltfMetallicRoughness.MaterialsBuffer,
     scene_data_buffer: VmaGpuBuffer,
     mesh_buffers: MeshBuffers,
+    draw_data_buffer: VmaGpuBuffer,
 
     // default images
     white_image: AllocatedImage,
@@ -945,7 +952,8 @@ pub const Engine = struct {
         const device = self.device_ctx.device;
 
         const wait_fence = tracy.zoneEx(@src(), .{ .name = "wait_fence" });
-        _ = try device.waitForFences(&.{self.currentFrame().render_fence}, .true, 1e9);
+        const wait_result = try device.waitForFences(&.{self.currentFrame().render_fence}, .true, 1e9);
+        if (wait_result == .timeout) return error.FenceTimeout;
         wait_fence.end();
 
         self.currentFrame().deletion_queue.flush(.{ .device = device, .vma_allocator = self.device_ctx.vma_allocator });
@@ -1136,37 +1144,16 @@ pub const Engine = struct {
 
         const fence_create_info: vk.FenceCreateInfo = .{ .flags = .{ .signaled_bit = true } };
 
-        var frames: [FrameData.frame_overlap]FrameData = undefined;
-        for (&frames) |*frame| {
-            const command_pool = try device_proxy.createCommandPool(&command_pool_info, null);
-
-            var main_command_buffer: vk.CommandBuffer = undefined;
-            const cmd_alloc_info: vk.CommandBufferAllocateInfo = .{
-                .command_pool = command_pool,
-                .command_buffer_count = 1,
-                .level = .primary,
-            };
-            try device_proxy.allocateCommandBuffers(&cmd_alloc_info, (&main_command_buffer)[0..1]);
-
-            frame.* = .{
-                .command_pool = command_pool,
-                .render_fence = try device_proxy.createFence(&fence_create_info, null),
-                .swapchain_semaphore = try device_proxy.createSemaphore(&.{}, null),
-                .main_command_buffer = main_command_buffer,
-                .deletion_queue = .init,
-            };
-        }
-
         const imm_command_pool = try device_proxy.createCommandPool(&command_pool_info, null);
 
-        const cmd_alloc_info: vk.CommandBufferAllocateInfo = .{
+        const imm_cmd_alloc_info: vk.CommandBufferAllocateInfo = .{
             .command_pool = imm_command_pool,
             .command_buffer_count = 1,
             .level = .primary,
         };
 
         var imm_command_buffer: vk.CommandBuffer = undefined;
-        try device_proxy.allocateCommandBuffers(&cmd_alloc_info, (&imm_command_buffer)[0..1]);
+        try device_proxy.allocateCommandBuffers(&imm_cmd_alloc_info, (&imm_command_buffer)[0..1]);
 
         var main_deletion_queue: DeletionQueue = .init;
         try main_deletion_queue.append(gpa, .{ .command_pool = imm_command_pool });
@@ -1193,6 +1180,34 @@ pub const Engine = struct {
             .device = device_proxy,
             .vma_allocator = vma_allocator,
         }); // TODO: find a way to move this next to the main_deletion_queue's init
+
+        var frames: [FrameData.frame_overlap]FrameData = undefined;
+        for (&frames) |*frame| {
+            const command_pool = try device_proxy.createCommandPool(&command_pool_info, null);
+
+            var main_command_buffer: vk.CommandBuffer = undefined;
+            const cmd_alloc_info: vk.CommandBufferAllocateInfo = .{
+                .command_pool = command_pool,
+                .command_buffer_count = 1,
+                .level = .primary,
+            };
+            try device_proxy.allocateCommandBuffers(&cmd_alloc_info, (&main_command_buffer)[0..1]);
+
+            frame.* = .{
+                .command_pool = command_pool,
+                .render_fence = try device_proxy.createFence(&fence_create_info, null),
+                .swapchain_semaphore = try device_proxy.createSemaphore(&.{}, null),
+                .main_command_buffer = main_command_buffer,
+                .deletion_queue = .init,
+                .indirect_buffer = try .create(
+                    vma_allocator,
+                    FrameData.max_draws * @sizeOf(vk.DrawIndexedIndirectCommand),
+                    .{ .indirect_buffer_bit = true, .storage_buffer_bit = true },
+                    .cpu_to_gpu,
+                    .sequential_write,
+                ),
+            };
+        }
 
         //allocate images {
         const draw_image_format: vk.Format = .r16g16b16a16_sfloat;
@@ -1253,9 +1268,6 @@ pub const Engine = struct {
             .allocation = draw_image_allocation,
         };
 
-        //add to deletion queues
-        try main_deletion_queue.append(gpa, .{ .vma_allocated_image = draw_allocated_image });
-
         const depthImageUsages: vk.ImageUsageFlags = .{ .depth_stencil_attachment_bit = true };
 
         const depth_image_format: vk.Format = .d32_sfloat;
@@ -1276,8 +1288,6 @@ pub const Engine = struct {
             .image = depth_image,
             .allocation = depth_image_allocation,
         };
-
-        try main_deletion_queue.append(gpa, .{ .vma_allocated_image = depth_allocated_image });
         //}
 
         const graphics_queue = device_proxy.getDeviceQueue(queue_family_indices.graphics_family, 0);
@@ -1472,6 +1482,15 @@ pub const Engine = struct {
         );
         bindless_descriptors.registerBuffer(device_proxy, 2, scene_data_buffer.buffer, scene_data_buffer.size);
 
+        const draw_data_buffer: VmaGpuBuffer = try .create(
+            vma_allocator,
+            FrameData.max_draws * FrameData.frame_overlap * @sizeOf(GPUDrawData),
+            .{ .storage_buffer_bit = true },
+            .cpu_to_gpu,
+            .sequential_write,
+        );
+        bindless_descriptors.registerBuffer(device_proxy, 4, draw_data_buffer.buffer, draw_data_buffer.size);
+
         var material_resources: GltfMetallicRoughness.MaterialResources = .{
             .color_image = white_image,
             .color_sampler = default_sampler_linear,
@@ -1564,6 +1583,7 @@ pub const Engine = struct {
             .materials_buffer = materials_buffer,
             .scene_data_buffer = scene_data_buffer,
             .mesh_buffers = mesh_buffers,
+            .draw_data_buffer = draw_data_buffer,
 
             .white_image = white_image,
             .grey_image = grey_image,
@@ -1741,6 +1761,8 @@ pub const Engine = struct {
             device.destroyFence(self.frames[i].render_fence, null);
             device.destroySemaphore(self.frames[i].swapchain_semaphore, null);
 
+            self.frames[i].indirect_buffer.destroy(self.device_ctx.vma_allocator);
+
             self.frames[i].deletion_queue.deinit(gpa, .{
                 .device = device,
                 .vma_allocator = self.device_ctx.vma_allocator,
@@ -1759,6 +1781,10 @@ pub const Engine = struct {
         self.mesh_buffers.index_buffer.destroy(self.device_ctx.vma_allocator);
         self.materials_buffer.deinit(self.device_ctx.vma_allocator);
         self.scene_data_buffer.destroy(self.device_ctx.vma_allocator);
+        self.draw_data_buffer.destroy(self.device_ctx.vma_allocator);
+
+        self.destroyImage(&self.draw_image);
+        self.destroyImage(&self.depth_image);
 
         self.main_deletion_queue.deinit(gpa, .{
             .device = device,
@@ -1843,92 +1869,108 @@ pub const Engine = struct {
         const zone = tracy.zone(@src());
         defer zone.end();
 
-        const clear_color: vk.ClearValue = .{ .color = .{ .float_32 = .{ 0.0, 0.0, 0.0, 1.0 } } };
-        const color_attachment: vk.RenderingAttachmentInfo = vk_init.attachmentInfo(self.draw_image.image_view, clear_color, .attachment_optimal);
-        const depthAttachment: vk.RenderingAttachmentInfo = vk_init.depthAttachmentInfo(self.depth_image.image_view, .depth_attachment_optimal);
-
-        const render_info = vk_init.renderingInfo(self.drawExtent(), &color_attachment, &depthAttachment);
+        const clear_color: vk.ClearValue = .{ .color = .{ .float_32 = .{ 0, 0, 0, 1 } } };
+        const color_attachment = vk_init.attachmentInfo(self.draw_image.image_view, clear_color, .attachment_optimal);
+        const depth_attachment = vk_init.depthAttachmentInfo(self.depth_image.image_view, .depth_attachment_optimal);
+        const render_info = vk_init.renderingInfo(self.drawExtent(), &color_attachment, &depth_attachment);
         const device = self.device_ctx.device;
 
         device.cmdBeginRendering(cmd, &render_info);
-        {
-            const frame_index = self.currentFrameIndex();
+        defer device.cmdEndRendering(cmd);
 
-            self.scene_data_buffer.getMappedSlice(GPUSceneData)[frame_index] = self.scene_data;
+        const frame_index = self.currentFrameIndex();
+        const frame = &self.frames[frame_index];
 
-            device.cmdBindDescriptorSets(
-                cmd,
-                .graphics,
-                self.bindless_pipeline_layout,
-                0,
-                (&self.bindless_descriptors.set)[0..1],
-                null,
-            );
+        self.scene_data_buffer.getMappedSlice(GPUSceneData)[frame_index] = self.scene_data;
 
-            device.cmdSetViewport(cmd, 0, (&vk.Viewport{
-                .x = 0,
-                .y = 0,
-                .width = @floatFromInt(self.drawExtent().width),
-                .height = @floatFromInt(self.drawExtent().height),
-                .min_depth = 0,
-                .max_depth = 1,
-            })[0..1]);
+        const opaque_surfaces = self.main_draw_context.opaque_surfaces.items;
+        const transparent_surfaces = self.main_draw_context.transparent_surfaces.items;
+        const total_draws = opaque_surfaces.len + transparent_surfaces.len;
+        if (total_draws == 0) return;
 
-            device.cmdSetScissor(cmd, 0, (&vk.Rect2D{
-                .offset = .{ .x = 0, .y = 0 },
-                .extent = self.drawExtent(),
-            })[0..1]);
+        const all_surfaces = try scratch.allocator().alloc(scene.RenderObject, total_draws);
+        @memcpy(all_surfaces[0..opaque_surfaces.len], opaque_surfaces);
+        @memcpy(all_surfaces[opaque_surfaces.len..], transparent_surfaces);
 
-            device.cmdBindIndexBuffer(cmd, self.mesh_buffers.index_buffer.buffer, 0, .uint32);
-
-            var draw_calls: usize = 0;
-            var triangle_count: usize = 0;
-
-            var last_pipeline: vk.Pipeline = .null_handle;
-
-            for ([_][]scene.RenderObject{
-                self.main_draw_context.opaque_surfaces.items,
-                self.main_draw_context.transparent_surfaces.items,
-            }) |surfaces| {
-                for (surfaces) |surface| {
-                    if (surface.material.?.pipeline != last_pipeline) {
-                        last_pipeline = surface.material.?.pipeline;
-                        device.cmdBindPipeline(cmd, .graphics, last_pipeline);
-                    }
-
-                    const push_constants: GPUDrawPushConstants = .{
-                        .world_matrix = surface.transform,
-                        .material_index = surface.material.?.bindless_index,
-                        .scene_data_index = @intCast(frame_index),
-                    };
-                    device.cmdPushConstants(
-                        cmd,
-                        self.bindless_pipeline_layout,
-                        .{ .vertex_bit = true, .fragment_bit = true },
-                        0,
-                        @sizeOf(GPUDrawPushConstants),
-                        std.mem.asBytes(&push_constants),
-                    );
-
-                    device.cmdDrawIndexed(
-                        cmd,
-                        surface.mesh_entry.index_count,
-                        1,
-                        surface.mesh_entry.index_offset,
-                        @intCast(surface.mesh_entry.vertex_offset),
-                        0,
-                    );
-
-                    draw_calls += 1;
-                    triangle_count += surface.mesh_entry.index_count / 3;
-                }
+        std.sort.pdq(scene.RenderObject, all_surfaces, {}, struct {
+            fn lessThan(_: void, a: scene.RenderObject, b: scene.RenderObject) bool {
+                return @intFromEnum(a.material.?.pipeline) < @intFromEnum(b.material.?.pipeline);
             }
+        }.lessThan);
 
-            tracy.plot("draw calls", @floatFromInt(draw_calls));
-            tracy.plot("triangle count", @floatFromInt(triangle_count));
+        const commands = frame.indirect_buffer.getMappedSlice(vk.DrawIndexedIndirectCommand);
+
+        const base_offset = frame_index * FrameData.max_draws;
+        const draw_data = self.draw_data_buffer.getMappedSlice(GPUDrawData);
+
+        for (all_surfaces, 0..) |surface, i| {
+            commands[i] = .{
+                .index_count = surface.mesh_entry.index_count,
+                .instance_count = 1,
+                .first_index = surface.mesh_entry.index_offset,
+                .vertex_offset = @intCast(surface.mesh_entry.vertex_offset),
+                .first_instance = @intCast(base_offset + i),
+            };
+            draw_data[base_offset + i] = .{
+                .world_matrix = surface.transform,
+                .material_index = surface.material.?.bindless_index,
+            };
         }
 
-        device.cmdEndRendering(cmd);
+        const Batch = struct { pipeline: vk.Pipeline, offset: u32, count: u32 };
+        var batch_buff: [16]Batch = undefined;
+        var batches: std.ArrayList(Batch) = .initBuffer(&batch_buff);
+
+        var start: usize = 0;
+        while (start < total_draws) {
+            const pipeline = all_surfaces[start].material.?.pipeline;
+            var end = start + 1;
+            while (end < total_draws and all_surfaces[end].material.?.pipeline == pipeline) end += 1;
+            batches.appendAssumeCapacity(.{
+                .pipeline = pipeline,
+                .offset = @intCast(start),
+                .count = @intCast(end - start),
+            });
+            start = end;
+        }
+
+        device.cmdBindDescriptorSets(cmd, .graphics, self.bindless_pipeline_layout, 0, (&self.bindless_descriptors.set)[0..1], null);
+
+        device.cmdSetViewport(cmd, 0, (&vk.Viewport{
+            .x = 0,
+            .y = 0,
+            .width = @floatFromInt(self.drawExtent().width),
+            .height = @floatFromInt(self.drawExtent().height),
+            .min_depth = 0,
+            .max_depth = 1,
+        })[0..1]);
+
+        device.cmdSetScissor(cmd, 0, (&vk.Rect2D{
+            .offset = .{ .x = 0, .y = 0 },
+            .extent = self.drawExtent(),
+        })[0..1]);
+
+        device.cmdBindIndexBuffer(cmd, self.mesh_buffers.index_buffer.buffer, 0, .uint32);
+
+        device.cmdPushConstants(
+            cmd,
+            self.bindless_pipeline_layout,
+            .{ .vertex_bit = true, .fragment_bit = true },
+            0,
+            @sizeOf(GPUDrawPushConstants),
+            std.mem.asBytes(&GPUDrawPushConstants{ .scene_data_index = @intCast(frame_index) }),
+        );
+
+        for (batches.items) |batch| {
+            device.cmdBindPipeline(cmd, .graphics, batch.pipeline);
+            device.cmdDrawIndexedIndirect(
+                cmd,
+                frame.indirect_buffer.buffer,
+                batch.offset * @sizeOf(vk.DrawIndexedIndirectCommand),
+                batch.count,
+                @sizeOf(vk.DrawIndexedIndirectCommand),
+            );
+        }
     }
 };
 
@@ -1945,7 +1987,7 @@ pub const BindlessDescriptors = struct {
 
         const pool_sizes = [_]vk.DescriptorPoolSize{
             .{ .type = .combined_image_sampler, .descriptor_count = max_textures },
-            .{ .type = .storage_buffer, .descriptor_count = 3 },
+            .{ .type = .storage_buffer, .descriptor_count = 4 },
         };
 
         const pool = try device.createDescriptorPool(&.{
@@ -1984,10 +2026,18 @@ pub const BindlessDescriptors = struct {
                 .stage_flags = .{ .vertex_bit = true, .fragment_bit = true },
                 .p_immutable_samplers = null,
             },
+            .{
+                .binding = 4,
+                .descriptor_type = .storage_buffer,
+                .descriptor_count = 1,
+                .stage_flags = .{ .vertex_bit = true, .fragment_bit = true },
+                .p_immutable_samplers = null,
+            },
         };
 
         const binding_flags = [_]vk.DescriptorBindingFlags{
             .{ .partially_bound_bit = true, .update_after_bind_bit = true },
+            .{ .update_after_bind_bit = true },
             .{ .update_after_bind_bit = true },
             .{ .update_after_bind_bit = true },
             .{ .update_after_bind_bit = true },
@@ -2518,20 +2568,29 @@ const vk_init = struct {
             .dynamic_rendering = .true,
             .synchronization_2 = .true,
         };
-        const device_features_vk12: vk.PhysicalDeviceVulkan12Features = .{
+        var device_features_vk12: vk.PhysicalDeviceVulkan12Features = .{
             .p_next = &device_features_vk13,
             .runtime_descriptor_array = .true,
             .descriptor_binding_partially_bound = .true,
             .descriptor_binding_sampled_image_update_after_bind = .true,
             .descriptor_binding_storage_buffer_update_after_bind = .true,
         };
-        return try instance_dispatch.createDevice(physical_device, &.{
+        const device_features_vk11: vk.PhysicalDeviceVulkan11Features = .{
             .p_next = &device_features_vk12,
+            .shader_draw_parameters = .true,
+        };
+        return try instance_dispatch.createDevice(physical_device, &.{
+            .p_next = &device_features_vk11,
             .p_queue_create_infos = queue_create_infos.items.ptr,
             .queue_create_info_count = @intCast(queue_create_infos.items.len),
             .pp_enabled_extension_names = &required_device_extensions,
             .enabled_extension_count = required_device_extensions.len,
-            .p_enabled_features = &.{ .shader_int_64 = .true, .sampler_anisotropy = .true },
+            .p_enabled_features = &.{
+                .shader_int_64 = .true,
+                .sampler_anisotropy = .true,
+                .multi_draw_indirect = .true,
+                .robust_buffer_access = .true,
+            },
         }, null);
     }
 };

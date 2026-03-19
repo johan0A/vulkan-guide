@@ -3,12 +3,13 @@
 [shader("pixel")]
 float4 main(
     uniform Constants push_constants,
-    float3 normal: NORMAL,
-    float3 color: COLOR,
-    float2 uv: TEXCOORD,
+    float3 normal : NORMAL,
+    float3 color : COLOR,
+    float2 uv : TEXCOORD,
+    nointerpolation uint material_index : TEXCOORD1,
 ) {
     SceneData scene = scenes[push_constants.scene_data_index];
-    GLTFMaterialData mat = materials[push_constants.material_index];
+    GLTFMaterialData mat = materials[material_index];
 
     float light_value = max(dot(normal, scene.sunlight_direction.xyz), 0.1f);
 

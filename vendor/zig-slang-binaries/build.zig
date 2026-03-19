@@ -18,7 +18,7 @@ pub fn build(b: *std.Build) void {
         else => @panic("host cpu arch not supported by zig-slang-binaries"),
     };
 
-    const version = "2026.3.1";
+    const version = "2026.4.2";
 
     const download_url = b.fmt(
         "https://github.com/shader-slang/slang/releases/download/v{[version]s}/slang-{[version]s}-{[os]s}-{[arch]s}.tar.gz",

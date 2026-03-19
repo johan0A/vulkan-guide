@@ -56,6 +56,8 @@ pub fn build(b: *std.Build) !void {
             const command: *std.Build.Step.Run = .create(b, b.fmt("compile shader {s}", .{name}));
             command.addFileArg(slang_path);
             command.addFileArg(shaders_path.path(b, name));
+            command.addArg("-O3");
+            command.addArg("-fvk-use-c-layout");
             command.addArg("-o");
             const stem = std.fs.path.stem(name);
             const out_path = command.addOutputFileArg(b.fmt("{s}.spv", .{stem}));
