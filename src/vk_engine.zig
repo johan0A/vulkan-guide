@@ -1,7 +1,3 @@
-// TODO: make those not globals?
-const validation_layers = [_][:0]const u8{"VK_LAYER_KHRONOS_validation"};
-const required_device_extensions = [_][*:0]const u8{vk.extensions.khr_swapchain.name};
-
 const Camera = struct {
     velocity: @Vector(3, f32) = @splat(0),
     position: @Vector(3, f32) = @splat(0),
@@ -174,7 +170,7 @@ pub const scene = struct {
         }
 
         pub fn clearAll(self: *Node, gpa: Allocator, engine: *const Engine) void {
-            const device = engine.device_ctx.device;
+            const device = engine.graphics_ctx.device;
 
             for (self.children.items) |child| {
                 child.clearAll(gpa, engine);
@@ -182,7 +178,7 @@ pub const scene = struct {
             self.children.deinit(gpa);
 
             if (self.gltf) |gltf| {
-                gltf.material_data_buffer.destroy(engine.device_ctx.vma_allocator);
+                gltf.material_data_buffer.destroy(engine.graphics_ctx.vma_allocator);
 
                 var mesh_it = gltf.meshes.valueIterator();
                 while (mesh_it.next()) |mesh| {
@@ -509,44 +505,6 @@ pub const AllocatedImage = struct {
     image_format: vk.Format,
 };
 
-pub const Queues = struct {
-    families: Families,
-
-    graphics: vk.Queue,
-    present: vk.Queue,
-    compute: vk.Queue,
-    transfer: vk.Queue,
-
-    pub const Families = struct {
-        graphics: u32,
-        present: u32,
-        compute: u32,
-        transfer: u32,
-
-        pub fn unique(self: Families) struct { families: [4]u32, len: u32 } {
-            var result: [4]u32 = undefined;
-            var len: u32 = 0;
-            const all = [_]u32{ self.graphics, self.present, self.compute, self.transfer };
-            outer: for (all) |family| {
-                for (result[0..len]) |existing| if (existing == family) continue :outer;
-                result[len] = family;
-                len += 1;
-            }
-            return .{ .families = result, .len = len };
-        }
-    };
-
-    pub fn init(families: Families, device: vk.DeviceProxy) Queues {
-        return .{
-            .families = families,
-            .graphics = device.getDeviceQueue(families.graphics, 0),
-            .present = device.getDeviceQueue(families.present, 0),
-            .compute = device.getDeviceQueue(families.compute, 0),
-            .transfer = device.getDeviceQueue(families.transfer, 0),
-        };
-    }
-};
-
 const PipelineConfig = struct {
     shaders: struct { vk.ShaderModule, vk.ShaderModule },
     topology: vk.PrimitiveTopology = .triangle_list,
@@ -675,36 +633,30 @@ const DeletionQueue = struct {
     };
 
     const QueueItem = union(enum) {
-        vma_allocator: c.VmaAllocator,
         image_view: vk.ImageView,
         vma_allocated_image: AllocatedImage,
-        descriptor_allocator: DescriptorAllocator,
         descriptor_set_layout: vk.DescriptorSetLayout,
         pipeline_layout: vk.PipelineLayout,
         pipeline: vk.Pipeline,
         command_pool: vk.CommandPool,
         fence: vk.Fence,
         descriptor_pool: vk.DescriptorPool,
-        imgui_impl_vulkan: void,
         allocated_buffer: VmaGpuBuffer,
         sampler: vk.Sampler,
 
         fn deinit(self: QueueItem, context: DeinitContext) void {
             switch (self) {
-                .vma_allocator => |item| c.vmaDestroyAllocator(item),
                 .image_view => |item| context.device.destroyImageView(item, null),
                 .vma_allocated_image => |item| {
                     c.vmaDestroyImage(context.vma_allocator.?, @ptrFromInt(@intFromEnum(item.image)), item.allocation);
                     context.device.destroyImageView(item.image_view, null);
                 },
-                .descriptor_allocator => |item| item.destroyPool(context.device),
                 .descriptor_set_layout => |item| context.device.destroyDescriptorSetLayout(item, null),
                 .pipeline_layout => |item| context.device.destroyPipelineLayout(item, null),
                 .pipeline => |item| context.device.destroyPipeline(item, null),
                 .command_pool => |item| context.device.destroyCommandPool(item, null),
                 .fence => |item| context.device.destroyFence(item, null),
                 .descriptor_pool => |item| context.device.destroyDescriptorPool(item, null),
-                .imgui_impl_vulkan => c.cImGui_ImplVulkan_Shutdown(),
                 .allocated_buffer => |item| item.destroy(context.vma_allocator.?),
                 .sampler => |item| context.device.destroySampler(item, null),
             }
@@ -727,51 +679,6 @@ const DeletionQueue = struct {
 
     pub fn append(self: *DeletionQueue, gpa: Allocator, item: QueueItem) !void {
         try self.queue.append(gpa, item);
-    }
-};
-
-const DescriptorAllocator = struct {
-    const PoolSizeRatio = struct {
-        type: vk.DescriptorType,
-        ratio: f32,
-    };
-
-    pool: vk.DescriptorPool,
-
-    pub fn initPool(temp: Allocator, device: vk.DeviceProxy, max_sets: u32, pool_ratios: []const PoolSizeRatio) !DescriptorAllocator {
-        const pool_sizes = try temp.alloc(vk.DescriptorPoolSize, pool_ratios.len);
-        for (pool_sizes, pool_ratios) |*size, ratio| {
-            size.* = .{
-                .type = ratio.type,
-                .descriptor_count = @intFromFloat(ratio.ratio * @as(f32, @floatFromInt(max_sets))),
-            };
-        }
-
-        const pool_info: vk.DescriptorPoolCreateInfo = .{
-            .max_sets = max_sets,
-            .pool_size_count = @intCast(pool_sizes.len),
-            .p_pool_sizes = pool_sizes.ptr,
-        };
-        return .{ .pool = try device.createDescriptorPool(&pool_info, null) };
-    }
-
-    pub fn clearDescriptors(self: DescriptorAllocator, device: vk.DeviceProxy) void {
-        device.resetDescriptorPool(self.pool, .{});
-    }
-
-    pub fn destroyPool(self: DescriptorAllocator, device: vk.DeviceProxy) void {
-        device.destroyDescriptorPool(self.pool, null);
-    }
-
-    pub fn allocate(self: DescriptorAllocator, device: vk.DeviceProxy, layout: vk.DescriptorSetLayout) !vk.DescriptorSet {
-        const alloc_info: vk.DescriptorSetAllocateInfo = .{
-            .descriptor_pool = self.pool,
-            .descriptor_set_count = 1,
-            .p_set_layouts = (&layout)[0..1],
-        };
-        var ds: vk.DescriptorSet = undefined;
-        try device.allocateDescriptorSets(&alloc_info, (&ds)[0..1]);
-        return ds;
     }
 };
 
@@ -905,33 +812,9 @@ const FrameData = struct {
 };
 
 pub const Engine = struct {
-    pub const VkContext = struct {
-        base_dispatch: vk.BaseWrapper,
-        instance: vk.InstanceProxy,
-
-        chosen_gpu: vk.PhysicalDevice,
-        window_surface: vk.SurfaceKHR,
-        debug_messenger: vk.DebugUtilsMessengerEXT,
-    };
-
-    pub const DeviceContext = struct {
-        device: vk.DeviceProxy,
-        queues: Queues,
-        vma_allocator: c.VmaAllocator,
-    };
-
-    pub const ImmSubmit = struct {
-        fence: vk.Fence,
-        cmd: vk.CommandBuffer,
-        command_pool: vk.CommandPool,
-    };
-
-    init_arena: std.heap.ArenaAllocator,
+    graphics_ctx: GraphicsCtx,
 
     window: *c.SDL_Window,
-
-    vk_ctx: VkContext,
-    device_ctx: DeviceContext,
 
     swapchain: SwapChain,
     resize_requested: bool,
@@ -946,11 +829,6 @@ pub const Engine = struct {
     draw_image: AllocatedImage,
 
     scene_data: GPUSceneData,
-
-    imm: ImmSubmit,
-
-    bindless_descriptors: BindlessDescriptors,
-    bindless_pipeline_layout: vk.PipelineLayout,
 
     materials_buffer: GltfMetallicRoughness.MaterialsBuffer,
     scene_data_buffer: VmaGpuBuffer,
@@ -984,14 +862,14 @@ pub const Engine = struct {
         const checkpoint = scratch.checkpoint();
         defer scratch.restoreCheckpoint(checkpoint);
 
-        const device = self.device_ctx.device;
+        const device = self.graphics_ctx.device;
 
         const wait_fence = tracy.zoneEx(@src(), .{ .name = "wait_fence" });
         const wait_result = try device.waitForFences(&.{self.currentFrame().render_fence}, .true, 1e9);
         if (wait_result == .timeout) return error.FenceTimeout;
         wait_fence.end();
 
-        self.currentFrame().deletion_queue.flush(.{ .device = device, .vma_allocator = self.device_ctx.vma_allocator });
+        self.currentFrame().deletion_queue.flush(.{ .device = device, .vma_allocator = self.graphics_ctx.vma_allocator });
 
         const acquire_next_image_result = device.acquireNextImageKHR(
             self.swapchain.handle,
@@ -1051,7 +929,7 @@ pub const Engine = struct {
 
             //submit command buffer to the queue and execute it.
             // _render_fence will now block until the graphic commands finish execution
-            try device.queueSubmit2(self.device_ctx.queues.graphics, &.{submit_info}, self.currentFrame().render_fence);
+            try device.queueSubmit2(self.graphics_ctx.queues.graphics, &.{submit_info}, self.currentFrame().render_fence);
         }
 
         const present_info: vk.PresentInfoKHR = .{
@@ -1061,7 +939,7 @@ pub const Engine = struct {
             .wait_semaphore_count = 1,
             .p_image_indices = (&swapchain_image_index)[0..1],
         };
-        _ = device.queuePresentKHR(self.device_ctx.queues.present, &present_info) catch |err| switch (err) {
+        _ = device.queuePresentKHR(self.graphics_ctx.queues.present, &present_info) catch |err| switch (err) {
             error.OutOfDateKHR => {
                 self.resize_requested = true;
             },
@@ -1107,10 +985,6 @@ pub const Engine = struct {
         if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.engine_init_failure;
         tracy_SDL_Init.end();
 
-        var init_arena: std.heap.ArenaAllocator = .init(gpa);
-        errdefer init_arena.deinit();
-        const init_alloc = init_arena.allocator();
-
         const window_width = 1080;
         const window_height = 1080;
 
@@ -1122,55 +996,19 @@ pub const Engine = struct {
         const base_dispatch = vk.BaseWrapper.load(@as(vk.PfnGetInstanceProcAddr, @ptrCast(c.SDL_Vulkan_GetVkGetInstanceProcAddr())));
         tracy_load_base_dispatch.end();
 
-        const instance = try vk_init.createVkInstance(scratch, base_dispatch, options.enable_validation_layers);
-        const instance_dispatch = try init_alloc.create(vk.InstanceWrapper);
-        instance_dispatch.* = vk.InstanceWrapper.load(instance, base_dispatch.dispatch.vkGetInstanceProcAddr.?);
-        const instance_proxy: vk.InstanceProxy = .init(instance, instance_dispatch);
+        var graphics_ctx: GraphicsCtx = try .init(gpa, scratch, window);
 
-        const debug_callback = struct {
-            fn debugCallback(
-                message_severity: vk.DebugUtilsMessageSeverityFlagsEXT,
-                message_types: vk.DebugUtilsMessageTypeFlagsEXT,
-                p_callback_data: ?*const vk.DebugUtilsMessengerCallbackDataEXT,
-                p_user_data: ?*anyopaque,
-            ) callconv(vk.vulkan_call_conv) vk.Bool32 {
-                _ = message_types;
-                _ = p_user_data;
-                const callback_data = p_callback_data orelse @panic("");
-                const message = std.mem.span(callback_data.p_message orelse "no message");
+        const queues = graphics_ctx.queues;
+        const device_proxy = graphics_ctx.device;
+        const vma_allocator = graphics_ctx.vma_allocator;
+        const physical_device = graphics_ctx.physical_device;
+        const sdl_window_surface = graphics_ctx.window_surface;
 
-                if (message_severity.error_bit_ext) {
-                    std.log.err("Validation: {s}", .{message});
-                } else if (message_severity.warning_bit_ext) {
-                    std.log.warn("Validation: {s}", .{message});
-                } else {
-                    std.log.info("Validation: {s}", .{message});
-                }
-
-                std.debug.dumpCurrentStackTrace(.{});
-                return .false;
-            }
-        };
-
-        const debug_messenger_info: vk.DebugUtilsMessengerCreateInfoEXT = .{
-            .message_severity = .{ .verbose_bit_ext = true, .warning_bit_ext = true, .error_bit_ext = true },
-            .message_type = .{ .general_bit_ext = true, .validation_bit_ext = true, .performance_bit_ext = true },
-            .pfn_user_callback = debug_callback.debugCallback,
-        };
-        const debug_messenger = try instance_proxy.createDebugUtilsMessengerEXT(&debug_messenger_info, null);
-
-        var sdl_window_surface: vk.SurfaceKHR = undefined;
-        if (!c.SDL_Vulkan_CreateSurface(window, @ptrFromInt(@intFromEnum(instance)), null, @ptrCast(&sdl_window_surface))) return error.engine_init_failure;
-
-        const physical_device = try vk_init.pickPhysicalDevice(scratch, instance_proxy, sdl_window_surface);
-        const families = (try vk_init.findQueueFamilies(scratch, physical_device, instance_dispatch.*, sdl_window_surface)).?;
-
-        const device = try vk_init.createLogicalDevice(physical_device, instance_dispatch.*, families);
-        const device_dispatch = try init_alloc.create(vk.DeviceWrapper);
-        device_dispatch.* = vk.DeviceWrapper.load(device, instance_dispatch.dispatch.vkGetDeviceProcAddr.?);
-        const device_proxy: vk.DeviceProxy = .init(device, device_dispatch);
-
-        const queues: Queues = .init(families, device_proxy);
+        const instance_dispatch = graphics_ctx.instance.wrapper;
+        const instance = graphics_ctx.instance.handle;
+        const device = graphics_ctx.device.handle;
+        const bindless_descriptors = &graphics_ctx.bindless_descriptors;
+        const bindless_pipeline_layout = graphics_ctx.bindless_pipeline_layout;
 
         // init_commands() {
         // init_sync_structures() {
@@ -1180,43 +1018,8 @@ pub const Engine = struct {
         };
 
         const fence_create_info: vk.FenceCreateInfo = .{ .flags = .{ .signaled_bit = true } };
-
-        const imm_command_pool = try device_proxy.createCommandPool(&command_pool_info, null);
-
-        const imm_cmd_alloc_info: vk.CommandBufferAllocateInfo = .{
-            .command_pool = imm_command_pool,
-            .command_buffer_count = 1,
-            .level = .primary,
-        };
-
-        var imm_command_buffer: vk.CommandBuffer = undefined;
-        try device_proxy.allocateCommandBuffers(&imm_cmd_alloc_info, (&imm_command_buffer)[0..1]);
-
         var main_deletion_queue: DeletionQueue = .init;
-        try main_deletion_queue.append(gpa, .{ .command_pool = imm_command_pool });
-
-        const imm_fence = try device_proxy.createFence(&fence_create_info, null);
-        try main_deletion_queue.append(gpa, .{ .fence = imm_fence });
         // }}
-
-        var vma_allocator: c.VmaAllocator = undefined;
-        if (c.vmaCreateAllocator(&.{
-            .physicalDevice = @ptrFromInt(@intFromEnum(physical_device)),
-            .device = @ptrFromInt(@intFromEnum(device)),
-            .instance = @ptrFromInt(@intFromEnum(instance)),
-            .flags = 0,
-            .pVulkanFunctions = &c.VmaVulkanFunctions{
-                .vkGetDeviceProcAddr = @ptrCast(instance_dispatch.dispatch.vkGetDeviceProcAddr),
-                .vkGetInstanceProcAddr = @ptrCast(base_dispatch.dispatch.vkGetInstanceProcAddr),
-            },
-        }, &vma_allocator) != 0) return error.vma_allocator_init_failed;
-
-        try main_deletion_queue.append(gpa, .{ .vma_allocator = vma_allocator });
-
-        errdefer main_deletion_queue.deinit(gpa, .{
-            .device = device_proxy,
-            .vma_allocator = vma_allocator,
-        }); // TODO: find a way to move this next to the main_deletion_queue's init
 
         var frames: [FrameData.frame_overlap]FrameData = undefined;
         for (&frames) |*frame| {
@@ -1421,51 +1224,25 @@ pub const Engine = struct {
             _ = c.cImGui_ImplVulkan_Init(&init_info);
 
             try main_deletion_queue.append(gpa, .{ .descriptor_pool = imgui_pool });
-            try main_deletion_queue.append(gpa, .imgui_impl_vulkan);
         }
-
-        var bindless_descriptors: BindlessDescriptors = try .init(device_proxy);
-
-        const push_range: vk.PushConstantRange = .{
-            .offset = 0,
-            .size = @sizeOf(GPUDrawPushConstants),
-            .stage_flags = .{ .vertex_bit = true, .fragment_bit = true },
-        };
-
-        const bindless_pipeline_layout = try device_proxy.createPipelineLayout(&.{
-            .set_layout_count = 1,
-            .p_set_layouts = (&bindless_descriptors.layout)[0..1],
-            .push_constant_range_count = 1,
-            .p_push_constant_ranges = &.{push_range},
-        }, null);
 
         var metal_rough_material: GltfMetallicRoughness = try .init(scratch, io, bindless_pipeline_layout, draw_allocated_image, depth_allocated_image, device_proxy);
 
         // init_default_data {
-        const device_ctx: DeviceContext = .{
-            .device = device_proxy,
-            .queues = queues,
-            .vma_allocator = vma_allocator,
-        };
-        const imm: ImmSubmit = .{
-            .cmd = imm_command_buffer,
-            .command_pool = imm_command_pool,
-            .fence = imm_fence,
-        };
 
         //{ default images
         const Color = packed struct(u32) { r: u8, g: u8, b: u8, a: u8 };
 
         const white: Color = .{ .r = 255, .g = 255, .b = 255, .a = 255 };
-        const white_image = try createAndUploadImage(device_ctx, imm, @ptrCast(&white), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
+        const white_image = try createAndUploadImage(graphics_ctx, @ptrCast(&white), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
         try main_deletion_queue.append(gpa, .{ .vma_allocated_image = white_image });
 
         const grey: Color = .{ .r = 168, .g = 168, .b = 168, .a = 255 };
-        const grey_image = try createAndUploadImage(device_ctx, imm, @ptrCast(&grey), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
+        const grey_image = try createAndUploadImage(graphics_ctx, @ptrCast(&grey), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
         try main_deletion_queue.append(gpa, .{ .vma_allocated_image = grey_image });
 
         const black: Color = .{ .r = 0, .g = 0, .b = 0, .a = 255 };
-        const black_image = try createAndUploadImage(device_ctx, imm, @ptrCast(&black), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
+        const black_image = try createAndUploadImage(graphics_ctx, @ptrCast(&black), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
         try main_deletion_queue.append(gpa, .{ .vma_allocated_image = black_image });
 
         const error_checkerboard_image = blk: {
@@ -1476,7 +1253,7 @@ pub const Engine = struct {
                     pixels[x][y] = if ((x % 2) ^ (y % 2) != 0) magenta else black;
                 }
             }
-            break :blk try createAndUploadImage(device_ctx, imm, @ptrCast(&pixels), .{ .width = 16, .height = 16, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
+            break :blk try createAndUploadImage(graphics_ctx, @ptrCast(&pixels), .{ .width = 16, .height = 16, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
         };
         try main_deletion_queue.append(gpa, .{ .vma_allocated_image = error_checkerboard_image });
 
@@ -1498,12 +1275,12 @@ pub const Engine = struct {
             .unnormalized_coordinates = .false,
         };
 
-        const default_sampler_nearest = try device_ctx.device.createSampler(&sampler_create_info, null);
+        const default_sampler_nearest = try graphics_ctx.device.createSampler(&sampler_create_info, null);
         try main_deletion_queue.append(gpa, .{ .sampler = default_sampler_nearest });
 
         sampler_create_info.mag_filter = .linear;
         sampler_create_info.min_filter = .linear;
-        const default_sampler_linear = try device_ctx.device.createSampler(&sampler_create_info, null);
+        const default_sampler_linear = try graphics_ctx.device.createSampler(&sampler_create_info, null);
         try main_deletion_queue.append(gpa, .{ .sampler = default_sampler_linear });
 
         var materials_buffer: GltfMetallicRoughness.MaterialsBuffer = try .init(1024, vma_allocator);
@@ -1541,7 +1318,7 @@ pub const Engine = struct {
             device_proxy,
             .main_color,
             &material_resources,
-            &bindless_descriptors,
+            bindless_descriptors,
             &materials_buffer,
         );
 
@@ -1559,10 +1336,9 @@ pub const Engine = struct {
             default_sampler_linear,
             white_image,
             error_checkerboard_image,
-            device_ctx,
-            imm,
+            graphics_ctx,
             structure_path,
-            &bindless_descriptors,
+            bindless_descriptors,
             &materials_buffer,
             &mesh_buffers,
         );
@@ -1577,17 +1353,7 @@ pub const Engine = struct {
         try loaded_scenes.put(gpa, "structure", loaded_scene_node);
 
         return .{
-            .vk_ctx = .{
-                .base_dispatch = base_dispatch,
-                .instance = instance_proxy,
-                .window_surface = sdl_window_surface,
-                .chosen_gpu = physical_device,
-                .debug_messenger = debug_messenger,
-            },
-
-            .device_ctx = device_ctx,
-
-            .init_arena = init_arena,
+            .graphics_ctx = graphics_ctx,
 
             .window = window,
 
@@ -1610,11 +1376,6 @@ pub const Engine = struct {
                 .sunlightDirection = @splat(0), // w for sun power
                 .sunlightColor = @splat(0),
             },
-
-            .imm = imm,
-
-            .bindless_descriptors = bindless_descriptors,
-            .bindless_pipeline_layout = bindless_pipeline_layout,
 
             .materials_buffer = materials_buffer,
             .scene_data_buffer = scene_data_buffer,
@@ -1648,7 +1409,7 @@ pub const Engine = struct {
         return .{ .width = self.draw_image.image_extent.width, .height = self.draw_image.image_extent.height };
     }
 
-    pub fn createImage(device_ctx: DeviceContext, size: vk.Extent3D, format: vk.Format, usage: vk.ImageUsageFlags, mipmapped: bool) !AllocatedImage {
+    pub fn createImage(graphics_ctx: GraphicsCtx, size: vk.Extent3D, format: vk.Format, usage: vk.ImageUsageFlags, mipmapped: bool) !AllocatedImage {
         var img_info: vk.ImageCreateInfo = vk_init.imageCreateInfo(format, usage, size);
         if (mipmapped) {
             img_info.mip_levels = std.math.log2(@max(size.width, size.height)) + 1;
@@ -1662,7 +1423,7 @@ pub const Engine = struct {
 
         var image: vk.Image = undefined;
         var image_allocation: c.VmaAllocation = undefined;
-        _ = c.vmaCreateImage(device_ctx.vma_allocator, @ptrCast(&img_info), &alloc_info, @ptrCast(&image), &image_allocation, null);
+        _ = c.vmaCreateImage(graphics_ctx.vma_allocator, @ptrCast(&img_info), &alloc_info, @ptrCast(&image), &image_allocation, null);
 
         // if the format is a depth format, we will need to have it use the correct aspect flag
         const aspect_flag: vk.ImageAspectFlags = switch (format == .d32_sfloat) {
@@ -1678,15 +1439,15 @@ pub const Engine = struct {
             .image_format = format,
             .image_extent = size,
             .image = image,
-            .image_view = try device_ctx.device.createImageView(&view_info, null),
+            .image_view = try graphics_ctx.device.createImageView(&view_info, null),
             .allocation = image_allocation,
         };
     }
 
-    pub fn createAndUploadImage(device_ctx: DeviceContext, imm: ImmSubmit, data: *const anyopaque, size: vk.Extent3D, format: vk.Format, usage: vk.ImageUsageFlags, mipmapped: bool) !AllocatedImage {
+    pub fn createAndUploadImage(graphics_ctx: GraphicsCtx, data: *const anyopaque, size: vk.Extent3D, format: vk.Format, usage: vk.ImageUsageFlags, mipmapped: bool) !AllocatedImage {
         const data_size: usize = size.depth * size.width * size.height * 4;
         const upload_buffer: VmaGpuBuffer = try .create(
-            device_ctx.vma_allocator,
+            graphics_ctx.vma_allocator,
             data_size,
             .{ .transfer_src_bit = true },
             .cpu_to_gpu,
@@ -1699,12 +1460,12 @@ pub const Engine = struct {
         var new_usage = usage;
         new_usage.transfer_dst_bit = true;
         new_usage.transfer_src_bit = true;
-        const new_image = try createImage(device_ctx, size, format, new_usage, mipmapped);
+        const new_image = try createImage(graphics_ctx, size, format, new_usage, mipmapped);
 
         {
-            try immediateModeBegin(device_ctx.device, imm.fence, imm.cmd);
+            try immediateModeBegin(graphics_ctx.device, graphics_ctx.imm.fence, graphics_ctx.imm.cmd);
 
-            vk_image.transitionImage(device_ctx.device, imm.cmd, new_image.image, .undefined, .transfer_dst_optimal);
+            vk_image.transitionImage(graphics_ctx.device, graphics_ctx.imm.cmd, new_image.image, .undefined, .transfer_dst_optimal);
 
             const copy_region: vk.BufferImageCopy = .{
                 .buffer_offset = 0,
@@ -1720,28 +1481,28 @@ pub const Engine = struct {
                 .image_extent = size,
                 .image_offset = .{ .x = 0, .y = 0, .z = 0 },
             };
-            device_ctx.device.cmdCopyBufferToImage(imm.cmd, upload_buffer.buffer, new_image.image, .transfer_dst_optimal, &.{copy_region});
+            graphics_ctx.device.cmdCopyBufferToImage(graphics_ctx.imm.cmd, upload_buffer.buffer, new_image.image, .transfer_dst_optimal, &.{copy_region});
 
             if (mipmapped) {
-                vk_image.generateMipmaps(device_ctx.device, imm.cmd, new_image.image, .{ .width = new_image.image_extent.width, .height = new_image.image_extent.height });
+                vk_image.generateMipmaps(graphics_ctx.device, graphics_ctx.imm.cmd, new_image.image, .{ .width = new_image.image_extent.width, .height = new_image.image_extent.height });
             } else {
-                vk_image.transitionImage(device_ctx.device, imm.cmd, new_image.image, .transfer_dst_optimal, .read_only_optimal);
+                vk_image.transitionImage(graphics_ctx.device, graphics_ctx.imm.cmd, new_image.image, .transfer_dst_optimal, .read_only_optimal);
             }
 
-            try immediateModeEnd(device_ctx.device, imm.fence, imm.cmd, device_ctx.queues.graphics);
+            try immediateModeEnd(graphics_ctx.device, graphics_ctx.imm.fence, graphics_ctx.imm.cmd, graphics_ctx.queues.graphics);
         }
 
-        upload_buffer.destroy(device_ctx.vma_allocator);
+        upload_buffer.destroy(graphics_ctx.vma_allocator);
         return new_image;
     }
 
     pub fn destroyImage(self: Engine, img: *AllocatedImage) void {
-        self.device_ctx.device.destroyImageView(img.image_view, null);
-        c.vmaDestroyImage(self.device_ctx.vma_allocator, @ptrFromInt(@intFromEnum(img.image)), img.allocation);
+        self.graphics_ctx.device.destroyImageView(img.image_view, null);
+        c.vmaDestroyImage(self.graphics_ctx.vma_allocator, @ptrFromInt(@intFromEnum(img.image)), img.allocation);
     }
 
     pub fn resizeSwapchain(self: *Engine, gpa: Allocator, scratch: *Scratch) !void {
-        const device = self.device_ctx.device;
+        const device = self.graphics_ctx.device;
         try device.deviceWaitIdle();
 
         self.swapchain.deinit(gpa, device);
@@ -1755,13 +1516,13 @@ pub const Engine = struct {
         self.swapchain = try .init(
             gpa,
             scratch,
-            self.vk_ctx.chosen_gpu,
+            self.graphics_ctx.physical_device,
             device,
-            self.vk_ctx.window_surface,
+            self.graphics_ctx.window_surface,
             new_width,
             new_height,
-            self.vk_ctx.instance.wrapper.*,
-            self.device_ctx.queues,
+            self.graphics_ctx.instance.wrapper.*,
+            self.graphics_ctx.queues,
         );
 
         self.destroyImage(&self.draw_image);
@@ -1770,7 +1531,7 @@ pub const Engine = struct {
         const new_extent: vk.Extent3D = .{ .width = new_width, .height = new_height, .depth = 1 };
 
         self.draw_image = try createImage(
-            self.device_ctx,
+            self.graphics_ctx,
             new_extent,
             .r16g16b16a16_sfloat,
             .{ .transfer_src_bit = true, .transfer_dst_bit = true, .storage_bit = true, .color_attachment_bit = true },
@@ -1778,7 +1539,7 @@ pub const Engine = struct {
         );
 
         self.depth_image = try createImage(
-            self.device_ctx,
+            self.graphics_ctx,
             new_extent,
             .d32_sfloat,
             .{ .depth_stencil_attachment_bit = true },
@@ -1789,8 +1550,8 @@ pub const Engine = struct {
     }
 
     pub fn deinit(self: *Engine, gpa: Allocator) void {
-        const device = self.device_ctx.device;
-        device.deviceWaitIdle() catch @panic(""); // TODO
+        const device = self.graphics_ctx.device;
+        device.deviceWaitIdle() catch {};
 
         for (0..self.frames.len) |i| {
             device.destroyCommandPool(self.frames[i].command_pool, null);
@@ -1798,11 +1559,11 @@ pub const Engine = struct {
             device.destroyFence(self.frames[i].render_fence, null);
             device.destroySemaphore(self.frames[i].swapchain_semaphore, null);
 
-            self.frames[i].indirect_buffer.destroy(self.device_ctx.vma_allocator);
+            self.frames[i].indirect_buffer.destroy(self.graphics_ctx.vma_allocator);
 
             self.frames[i].deletion_queue.deinit(gpa, .{
                 .device = device,
-                .vma_allocator = self.device_ctx.vma_allocator,
+                .vma_allocator = self.graphics_ctx.vma_allocator,
             });
         }
 
@@ -1814,42 +1575,37 @@ pub const Engine = struct {
 
         self.metal_rough_material.deinit(device);
 
-        self.mesh_buffers.vertex_buffer.destroy(self.device_ctx.vma_allocator);
-        self.mesh_buffers.index_buffer.destroy(self.device_ctx.vma_allocator);
-        self.materials_buffer.deinit(self.device_ctx.vma_allocator);
-        self.scene_data_buffer.destroy(self.device_ctx.vma_allocator);
-        self.draw_data_buffer.destroy(self.device_ctx.vma_allocator);
+        self.mesh_buffers.vertex_buffer.destroy(self.graphics_ctx.vma_allocator);
+        self.mesh_buffers.index_buffer.destroy(self.graphics_ctx.vma_allocator);
+        self.materials_buffer.deinit(self.graphics_ctx.vma_allocator);
+        self.scene_data_buffer.destroy(self.graphics_ctx.vma_allocator);
+        self.draw_data_buffer.destroy(self.graphics_ctx.vma_allocator);
 
         self.destroyImage(&self.draw_image);
         self.destroyImage(&self.depth_image);
 
+        c.cImGui_ImplVulkan_Shutdown();
+
         self.main_deletion_queue.deinit(gpa, .{
             .device = device,
-            .vma_allocator = self.device_ctx.vma_allocator,
+            .vma_allocator = self.graphics_ctx.vma_allocator,
         });
 
         self.main_draw_context.opaque_surfaces.deinit(gpa);
-        self.bindless_descriptors.deinit(gpa, device);
-        device.destroyPipelineLayout(self.bindless_pipeline_layout, null);
 
         self.swapchain.deinit(gpa, device);
 
-        device.destroyDevice(null);
-        self.vk_ctx.instance.destroySurfaceKHR(self.vk_ctx.window_surface, null);
-        self.vk_ctx.instance.destroyDebugUtilsMessengerEXT(self.vk_ctx.debug_messenger, null);
-        self.vk_ctx.instance.destroyInstance(null);
+        self.graphics_ctx.deinit(gpa);
 
         c.SDL_DestroyWindow(self.window);
         c.SDL_Quit();
-
-        self.init_arena.deinit();
     }
 
     fn drawImgui(self: *Engine, cmd: vk.CommandBuffer, target_image_view: vk.ImageView) void {
         const zone = tracy.zone(@src());
         defer zone.end();
 
-        const device = self.device_ctx.device;
+        const device = self.graphics_ctx.device;
         const color_attachment = vk_init.attachmentInfo(target_image_view, null, .attachment_optimal);
         const render_info = vk_init.renderingInfo(self.swapchain.extent, &color_attachment, null);
 
@@ -1910,7 +1666,7 @@ pub const Engine = struct {
         const color_attachment = vk_init.attachmentInfo(self.draw_image.image_view, clear_color, .attachment_optimal);
         const depth_attachment = vk_init.depthAttachmentInfo(self.depth_image.image_view, .depth_attachment_optimal);
         const render_info = vk_init.renderingInfo(self.drawExtent(), &color_attachment, &depth_attachment);
-        const device = self.device_ctx.device;
+        const device = self.graphics_ctx.device;
 
         device.cmdBeginRendering(cmd, &render_info);
         defer device.cmdEndRendering(cmd);
@@ -1971,7 +1727,7 @@ pub const Engine = struct {
             start = end;
         }
 
-        device.cmdBindDescriptorSets(cmd, .graphics, self.bindless_pipeline_layout, 0, (&self.bindless_descriptors.set)[0..1], null);
+        device.cmdBindDescriptorSets(cmd, .graphics, self.graphics_ctx.bindless_pipeline_layout, 0, (&self.graphics_ctx.bindless_descriptors.set)[0..1], null);
 
         device.cmdSetViewport(cmd, 0, (&vk.Viewport{
             .x = 0,
@@ -1991,7 +1747,7 @@ pub const Engine = struct {
 
         device.cmdPushConstants(
             cmd,
-            self.bindless_pipeline_layout,
+            self.graphics_ctx.bindless_pipeline_layout,
             .{ .vertex_bit = true, .fragment_bit = true },
             0,
             @sizeOf(GPUDrawPushConstants),
@@ -2008,168 +1764,6 @@ pub const Engine = struct {
                 @sizeOf(vk.DrawIndexedIndirectCommand),
             );
         }
-    }
-};
-
-pub const BindlessDescriptors = struct {
-    pool: vk.DescriptorPool,
-    layout: vk.DescriptorSetLayout,
-    set: vk.DescriptorSet,
-
-    free_texture_indices: std.ArrayList(u32),
-    next_texture_index: u32,
-
-    pub fn init(device: vk.DeviceProxy) !BindlessDescriptors {
-        const max_textures = 16384;
-
-        const pool_sizes = [_]vk.DescriptorPoolSize{
-            .{ .type = .combined_image_sampler, .descriptor_count = max_textures },
-            .{ .type = .storage_buffer, .descriptor_count = 4 },
-        };
-
-        const pool = try device.createDescriptorPool(&.{
-            .flags = .{ .update_after_bind_bit = true },
-            .max_sets = 1,
-            .pool_size_count = pool_sizes.len,
-            .p_pool_sizes = &pool_sizes,
-        }, null);
-
-        const bindings = [_]vk.DescriptorSetLayoutBinding{
-            .{
-                .binding = 0,
-                .descriptor_type = .combined_image_sampler,
-                .descriptor_count = max_textures,
-                .stage_flags = .{ .fragment_bit = true },
-                .p_immutable_samplers = null,
-            },
-            .{
-                .binding = 1,
-                .descriptor_type = .storage_buffer,
-                .descriptor_count = 1,
-                .stage_flags = .{ .vertex_bit = true, .fragment_bit = true },
-                .p_immutable_samplers = null,
-            },
-            .{
-                .binding = 2,
-                .descriptor_type = .storage_buffer,
-                .descriptor_count = 1,
-                .stage_flags = .{ .vertex_bit = true, .fragment_bit = true },
-                .p_immutable_samplers = null,
-            },
-            .{
-                .binding = 3,
-                .descriptor_type = .storage_buffer,
-                .descriptor_count = 1,
-                .stage_flags = .{ .vertex_bit = true, .fragment_bit = true },
-                .p_immutable_samplers = null,
-            },
-            .{
-                .binding = 4,
-                .descriptor_type = .storage_buffer,
-                .descriptor_count = 1,
-                .stage_flags = .{ .vertex_bit = true, .fragment_bit = true },
-                .p_immutable_samplers = null,
-            },
-        };
-
-        const binding_flags = [_]vk.DescriptorBindingFlags{
-            .{ .partially_bound_bit = true, .update_after_bind_bit = true },
-            .{ .update_after_bind_bit = true },
-            .{ .update_after_bind_bit = true },
-            .{ .update_after_bind_bit = true },
-            .{ .update_after_bind_bit = true },
-        };
-        const flags_info: vk.DescriptorSetLayoutBindingFlagsCreateInfo = .{
-            .binding_count = binding_flags.len,
-            .p_binding_flags = &binding_flags,
-        };
-
-        const layout = try device.createDescriptorSetLayout(&.{
-            .p_next = &flags_info,
-            .flags = .{ .update_after_bind_pool_bit = true },
-            .binding_count = bindings.len,
-            .p_bindings = &bindings,
-        }, null);
-
-        const alloc_info: vk.DescriptorSetAllocateInfo = .{
-            .descriptor_pool = pool,
-            .descriptor_set_count = 1,
-            .p_set_layouts = &.{layout},
-        };
-
-        var set: vk.DescriptorSet = undefined;
-        try device.allocateDescriptorSets(&alloc_info, (&set)[0..1]);
-
-        return .{
-            .pool = pool,
-            .layout = layout,
-            .set = set,
-            .free_texture_indices = .empty,
-            .next_texture_index = 0,
-        };
-    }
-
-    pub fn deinit(self: *BindlessDescriptors, gpa: Allocator, device: vk.DeviceProxy) void {
-        device.destroyDescriptorPool(self.pool, null);
-        device.destroyDescriptorSetLayout(self.layout, null);
-        self.free_texture_indices.deinit(gpa);
-    }
-
-    pub fn registerTexture(
-        self: *BindlessDescriptors,
-        gpa: Allocator,
-        device: vk.DeviceProxy,
-        view: vk.ImageView,
-        sampler: vk.Sampler,
-    ) !u32 {
-        const index = try self.allocTextureIndex(gpa);
-        device.updateDescriptorSets(&.{.{
-            .dst_set = self.set,
-            .dst_binding = 0,
-            .dst_array_element = index,
-            .descriptor_count = 1,
-            .descriptor_type = .combined_image_sampler,
-            .p_image_info = &.{.{
-                .sampler = sampler,
-                .image_view = view,
-                .image_layout = .shader_read_only_optimal,
-            }},
-            .p_buffer_info = undefined,
-            .p_texel_buffer_view = undefined,
-        }}, null);
-        return index;
-    }
-
-    pub fn allocTextureIndex(self: *BindlessDescriptors, gpa: Allocator) !u32 {
-        if (self.free_texture_indices.pop()) |idx| {
-            return idx;
-        } else {
-            const result = self.next_texture_index;
-            self.next_texture_index += 1;
-            try self.free_texture_indices.ensureTotalCapacity(gpa, self.next_texture_index);
-            return result;
-        }
-    }
-
-    pub fn releaseTexture(self: *BindlessDescriptors, idx: u32) void {
-        self.free_texture_indices.appendAssumeCapacity(idx);
-    }
-
-    pub fn registerBuffer(self: *BindlessDescriptors, device: vk.DeviceProxy, binding: u32, buffer: vk.Buffer, size: usize) void {
-        device.updateDescriptorSets(&.{.{
-            .dst_set = self.set,
-            .dst_binding = binding,
-            .dst_array_element = 0,
-            .descriptor_count = 1,
-            .descriptor_type = .storage_buffer,
-            .p_image_info = undefined,
-            .p_buffer_info = &.{.{
-                .buffer = buffer,
-                .offset = 0,
-                .range = size,
-            }},
-            .p_texel_buffer_view = undefined,
-        }}, null);
     }
 };
 
@@ -2317,10 +1911,6 @@ const vk_image = struct {
 };
 
 const vk_init = struct {
-    pub fn pipelineShaderStageCreateInfo(stage: vk.ShaderStageFlags, shader_module: vk.ShaderModule) vk.PipelineShaderStageCreateInfo {
-        return .{ .stage = stage, .module = shader_module, .p_name = "main" };
-    }
-
     fn renderingInfo(render_extent: vk.Extent2D, color_attachment: *const vk.RenderingAttachmentInfo, depth_attachment: ?*const vk.RenderingAttachmentInfo) vk.RenderingInfo {
         return .{
             .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = render_extent },
@@ -2437,210 +2027,6 @@ const vk_init = struct {
             .layer_count = vk.REMAINING_ARRAY_LAYERS,
         };
     }
-
-    pub fn createVkInstance(scratch: *Scratch, base_dispatch: vk.BaseWrapper, enable_validation_layers: bool) !vk.Instance {
-        const checkpoint = scratch.checkpoint();
-        defer scratch.restoreCheckpoint(checkpoint);
-
-        const appinfo = vk.ApplicationInfo{
-            .p_application_name = "Vulkan Tutorial",
-            .application_version = @bitCast(vk.makeApiVersion(1, 0, 0, 0)),
-            .p_engine_name = "No Engine",
-            .engine_version = @bitCast(vk.makeApiVersion(1, 0, 0, 0)),
-            .api_version = @bitCast(vk.makeApiVersion(1, 3, 0, 0)),
-        };
-
-        const sdl_required_extensions = blk: {
-            var sdl_required_extensions_count: u32 = undefined;
-            const sdl_required_extensions_ptr = c.SDL_Vulkan_GetInstanceExtensions(&sdl_required_extensions_count) orelse
-                return error.SDL_Vulkan_GetInstanceExtensionsFailed;
-            break :blk sdl_required_extensions_ptr[0..sdl_required_extensions_count];
-        };
-
-        const available_extensions = try base_dispatch.enumerateInstanceExtensionPropertiesAlloc(null, scratch.allocator());
-        for (sdl_required_extensions) |required_ext| {
-            for (available_extensions) |available_ext| {
-                if (std.mem.eql(u8, std.mem.span(required_ext), std.mem.sliceTo(&available_ext.extension_name, 0))) break;
-            } else {
-                return error.extensionRequiredBySdlIsNotAvailable;
-            }
-        }
-
-        if (enable_validation_layers) try checkValidationLayerSupport(scratch, base_dispatch);
-
-        var extensions: std.ArrayList([*:0]const u8) = .empty;
-        try extensions.appendSlice(scratch.allocator(), @ptrCast(sdl_required_extensions));
-        try extensions.appendSlice(scratch.allocator(), &.{
-            vk.extensions.ext_debug_utils.name.ptr,
-        });
-
-        const create_info = vk.InstanceCreateInfo{
-            .p_application_info = &appinfo,
-            .enabled_extension_count = @intCast(extensions.items.len),
-            .pp_enabled_extension_names = @ptrCast(extensions.items),
-            .pp_enabled_layer_names = if (enable_validation_layers) @ptrCast(&validation_layers) else null,
-            .enabled_layer_count = if (enable_validation_layers) @intCast(validation_layers.len) else 0,
-        };
-
-        return try base_dispatch.createInstance(&create_info, null);
-    }
-
-    pub fn checkValidationLayerSupport(scratch: *Scratch, base_dispatch: vk.BaseWrapper) !void {
-        const checkpoint = scratch.checkpoint();
-        defer scratch.restoreCheckpoint(checkpoint);
-        const available_layers = try base_dispatch.enumerateInstanceLayerPropertiesAlloc(scratch.allocator());
-        for (validation_layers) |validation_layer| {
-            for (available_layers) |available_layer| {
-                if (std.mem.eql(u8, std.mem.sliceTo(&available_layer.layer_name, 0), validation_layer)) break;
-            } else return error.NotAllValidationLayersSupported;
-        }
-    }
-
-    pub fn pickPhysicalDevice(scratch: *Scratch, instance: vk.InstanceProxy, surface: vk.SurfaceKHR) !vk.PhysicalDevice {
-        const checkpoint = scratch.checkpoint();
-        defer scratch.restoreCheckpoint(checkpoint);
-
-        const physical_devices = try instance.enumeratePhysicalDevicesAlloc(scratch.allocator());
-
-        if (physical_devices.len == 0) return error.NoPhysicalDeviceFound;
-
-        for (physical_devices) |physical_device| {
-            const is_suitable = blk: {
-                const formats = try instance.getPhysicalDeviceSurfaceFormatsAllocKHR(physical_device, surface, scratch.allocator());
-                const present_modes = try instance.getPhysicalDeviceSurfacePresentModesAllocKHR(physical_device, surface, scratch.allocator());
-                const has_families = (try findQueueFamilies(scratch, physical_device, instance.wrapper.*, surface)) != null;
-                break :blk has_families and
-                    try checkDeviceExtensionSupport(physical_device, instance.wrapper.*, scratch) and
-                    formats.len > 0 and
-                    present_modes.len > 0;
-            };
-
-            if (is_suitable) return physical_device;
-        }
-
-        return error.NoSuitablePhysicalDeviceFound;
-    }
-
-    pub fn findQueueFamilies(
-        scratch: *Scratch,
-        physical_device: vk.PhysicalDevice,
-        instance_dispatch: vk.InstanceWrapper,
-        surface: vk.SurfaceKHR,
-    ) !?Queues.Families {
-        const checkpoint = scratch.checkpoint();
-        defer scratch.restoreCheckpoint(checkpoint);
-
-        const queue_families = try instance_dispatch.getPhysicalDeviceQueueFamilyPropertiesAlloc(physical_device, scratch.allocator());
-
-        var graphics_family: ?u32 = null;
-        for (queue_families, 0..) |family, i| {
-            if (family.queue_flags.graphics_bit) {
-                graphics_family = @intCast(i);
-                break;
-            }
-        }
-        const gfx = graphics_family orelse return null;
-
-        var present_family: ?u32 = null;
-        for (queue_families, 0..) |_, i| {
-            const idx: u32 = @intCast(i);
-            if (try instance_dispatch.getPhysicalDeviceSurfaceSupportKHR(physical_device, idx, surface) == .true) {
-                present_family = idx;
-                if (idx == gfx) break;
-            }
-        }
-        const present = present_family orelse return null;
-
-        var compute: u32 = gfx;
-        for (queue_families, 0..) |family, i| {
-            if (family.queue_flags.compute_bit and !family.queue_flags.graphics_bit) {
-                compute = @intCast(i);
-                break;
-            }
-        }
-
-        var transfer: u32 = gfx;
-        for (queue_families, 0..) |family, i| {
-            if (family.queue_flags.transfer_bit and !family.queue_flags.graphics_bit and !family.queue_flags.compute_bit) {
-                transfer = @intCast(i);
-                break;
-            }
-        }
-
-        return .{ .graphics = gfx, .present = present, .compute = compute, .transfer = transfer };
-    }
-
-    pub fn checkDeviceExtensionSupport(
-        physical_device: vk.PhysicalDevice,
-        instance_dispatch: vk.InstanceWrapper,
-        scratch: *Scratch,
-    ) !bool {
-        const checkpoint = scratch.checkpoint();
-        defer scratch.restoreCheckpoint(checkpoint);
-
-        const available_extensions = try instance_dispatch.enumerateDeviceExtensionPropertiesAlloc(physical_device, null, scratch.allocator());
-
-        for (required_device_extensions) |required_device_extension| {
-            for (available_extensions) |available_extension| {
-                if (std.mem.eql(
-                    u8,
-                    std.mem.sliceTo(&available_extension.extension_name, 0),
-                    std.mem.sliceTo(required_device_extension, 0),
-                )) break;
-            } else {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    pub fn createLogicalDevice(
-        physical_device: vk.PhysicalDevice,
-        instance_dispatch: vk.InstanceWrapper,
-        families: Queues.Families,
-    ) !vk.Device {
-        const unique = families.unique();
-        const queue_priorities: [1]f32 = .{1};
-
-        var queue_create_infos: [4]vk.DeviceQueueCreateInfo = undefined;
-        for (unique.families[0..unique.len], queue_create_infos[0..unique.len]) |family, *info| {
-            info.* = .{
-                .queue_family_index = family,
-                .queue_count = queue_priorities.len,
-                .p_queue_priorities = &queue_priorities,
-            };
-        }
-
-        var device_features_vk13: vk.PhysicalDeviceVulkan13Features = .{
-            .dynamic_rendering = .true,
-            .synchronization_2 = .true,
-        };
-        var device_features_vk12: vk.PhysicalDeviceVulkan12Features = .{
-            .p_next = &device_features_vk13,
-            .runtime_descriptor_array = .true,
-            .descriptor_binding_partially_bound = .true,
-            .descriptor_binding_sampled_image_update_after_bind = .true,
-            .descriptor_binding_storage_buffer_update_after_bind = .true,
-        };
-        const device_features_vk11: vk.PhysicalDeviceVulkan11Features = .{
-            .p_next = &device_features_vk12,
-            .shader_draw_parameters = .true,
-        };
-        return try instance_dispatch.createDevice(physical_device, &.{
-            .p_next = &device_features_vk11,
-            .p_queue_create_infos = queue_create_infos[0..unique.len].ptr,
-            .queue_create_info_count = unique.len,
-            .pp_enabled_extension_names = &required_device_extensions,
-            .enabled_extension_count = required_device_extensions.len,
-            .p_enabled_features = &.{
-                .shader_int_64 = .true,
-                .sampler_anisotropy = .true,
-                .multi_draw_indirect = .true,
-                .robust_buffer_access = .true,
-            },
-        }, null);
-    }
 };
 
 fn loadShader(gpa: Allocator, io: std.Io, file_path: []const u8) !ShaderData {
@@ -2650,7 +2036,6 @@ fn loadShader(gpa: Allocator, io: std.Io, file_path: []const u8) !ShaderData {
 }
 
 const std = @import("std");
-const Allocator = std.mem.Allocator;
 
 const vk = @import("vulkan");
 const c = @import("c");
@@ -2658,8 +2043,11 @@ const tracy = @import("tracy");
 const shaders = @import("shaders");
 const loader = @import("loader.zig");
 const zla = @import("zla");
-const vec = zla.vec;
 pub const Mat4 = zla.Mat(.cm, f32, 4, 4);
 const options = @import("options");
 const Scratch = @import("scratch_allocator");
-const SegmentedList = @import("segmented_list.zig").SegmentedList;
+const GraphicsCtx = @import("GraphicsCtx.zig");
+
+const Allocator = std.mem.Allocator;
+const Queues = GraphicsCtx.Queues;
+pub const BindlessDescriptors = GraphicsCtx.BindlessDescriptors;

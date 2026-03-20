@@ -23,8 +23,7 @@ pub fn loadGltf(
     default_sampler_linear: vk.Sampler,
     white_image: vk_engine.AllocatedImage,
     error_checkerboard_image: vk_engine.AllocatedImage,
-    device_ctx: vk_engine.Engine.DeviceContext,
-    imm: vk_engine.Engine.ImmSubmit,
+    graphics_ctx: GraphicsCtx,
     filePath: []const u8,
     bindless_descriptors: *vk_engine.BindlessDescriptors,
     materials_buffer: *vk_engine.GltfMetallicRoughness.MaterialsBuffer,
@@ -76,7 +75,7 @@ pub fn loadGltf(
             .unnormalized_coordinates = .false,
         };
 
-        const new_sampler: vk.Sampler = try device_ctx.device.createSampler(&sampl, null);
+        const new_sampler: vk.Sampler = try graphics_ctx.device.createSampler(&sampl, null);
         try scene.samplers.append(gpa, new_sampler);
     }
 
@@ -92,7 +91,7 @@ pub fn loadGltf(
 
     // load all textures
     for (gltf.data.images) |gltf_image| {
-        if (loadImage(gpa, io, base_dir, gltf, gltf_image, device_ctx, imm)) |image| {
+        if (loadImage(gpa, io, base_dir, gltf, gltf_image, graphics_ctx)) |image| {
             try images.append(gpa, image);
             try scene.images.put(gpa, gltf_image.name.?, image);
         } else |_| {
@@ -103,7 +102,7 @@ pub fn loadGltf(
 
     // create buffer to hold the material data
     scene.material_data_buffer = try .create(
-        device_ctx.vma_allocator,
+        graphics_ctx.vma_allocator,
         @sizeOf(vk_engine.GltfMetallicRoughness.GPUMaterialData) * gltf.data.materials.len,
         .{ .uniform_buffer_bit = true },
         .cpu_to_gpu,
@@ -147,7 +146,7 @@ pub fn loadGltf(
 
         new_mat.data = try metal_rough_material.writeMaterial(
             gpa,
-            device_ctx.device,
+            graphics_ctx.device,
             pass_type,
             &material_resources,
             bindless_descriptors,
@@ -329,8 +328,7 @@ fn loadImage(
     base_dir: std.Io.Dir,
     gltf: Gltf,
     gltf_image: Gltf.Image,
-    device_ctx: vk_engine.Engine.DeviceContext,
-    imm: vk_engine.Engine.ImmSubmit,
+    graphics_ctx: GraphicsCtx,
 ) !vk_engine.AllocatedImage {
     const zone = tracy.zone(@src());
     defer zone.end();
@@ -366,8 +364,7 @@ fn loadImage(
 
     const image_buff = image.rawBytes();
     return try vk_engine.Engine.createAndUploadImage(
-        device_ctx,
-        imm,
+        graphics_ctx,
         @ptrCast(image_buff),
         image_size,
         .r8g8b8a8_srgb,
@@ -384,5 +381,7 @@ const vk = @import("vulkan");
 const Scratch = @import("scratch_allocator");
 const Gltf = @import("gltf").Gltf;
 const vk_engine = @import("vk_engine.zig");
+const GraphicsCtx = @import("GraphicsCtx.zig");
+
 const LoadedGltf = vk_engine.scene.LoadedGltf;
 const assert = std.debug.assert;
