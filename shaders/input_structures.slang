@@ -5,6 +5,10 @@ struct SceneData {
     float4 ambient_color;
     float4 sunlight_direction;
     float4 sunlight_color;
+
+    GLTFMaterialData *materials;
+    Vertex *vertices;
+    DrawData *draw_data;
 };
 
 struct GLTFMaterialData {
@@ -32,18 +36,7 @@ struct DrawData {
 [[vk::binding(0, 0)]]
 Sampler2D textures[];
 
-[[vk::binding(1, 0)]]
-StructuredBuffer<GLTFMaterialData> materials;
-
-[[vk::binding(2, 0)]]
-StructuredBuffer<SceneData> scenes;
-
-[[vk::binding(3, 0)]]
-StructuredBuffer<Vertex> vertices;
-
-[[vk::binding(4, 0)]] 
-StructuredBuffer<DrawData> draw_data;
-
 struct Constants {
+    SceneData *scenes;
     uint scene_data_index;
 };

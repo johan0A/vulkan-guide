@@ -81,7 +81,7 @@ pub fn init(
         .physicalDevice = @ptrFromInt(@intFromEnum(physical_device)),
         .device = @ptrFromInt(@intFromEnum(device_handle)),
         .instance = @ptrFromInt(@intFromEnum(instance_handle)),
-        .flags = 0,
+        .flags = c.VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
         .pVulkanFunctions = &c.VmaVulkanFunctions{
             .vkGetDeviceProcAddr = @ptrCast(instance_dispatch.dispatch.vkGetDeviceProcAddr),
             .vkGetInstanceProcAddr = @ptrCast(base_dispatch.dispatch.vkGetInstanceProcAddr),
@@ -93,7 +93,7 @@ pub fn init(
 
     const push_range: vk.PushConstantRange = .{
         .offset = 0,
-        .size = @sizeOf(GPUDrawPushConstants),
+        .size = @sizeOf(vk_engine.GPUDrawPushConstants),
         .stage_flags = .{ .vertex_bit = true, .fragment_bit = true },
     };
     const bindless_pipeline_layout = try device.createPipelineLayout(&.{
@@ -135,10 +135,6 @@ pub fn deinit(self: *GraphicsCtx, gpa: Allocator) void {
     self.instance.destroyInstance(null);
     self.arena.deinit();
 }
-
-pub const GPUDrawPushConstants = extern struct {
-    frame_index: u32,
-};
 
 pub const ImmSubmit = struct {
     fence: vk.Fence,
@@ -233,7 +229,6 @@ pub const BindlessDescriptors = struct {
 
         const pool_sizes = [_]vk.DescriptorPoolSize{
             .{ .type = .combined_image_sampler, .descriptor_count = max_textures },
-            .{ .type = .storage_buffer, .descriptor_count = 4 },
         };
 
         const pool = try device.createDescriptorPool(&.{
@@ -251,42 +246,10 @@ pub const BindlessDescriptors = struct {
                 .stage_flags = .{ .fragment_bit = true },
                 .p_immutable_samplers = null,
             },
-            .{
-                .binding = 1,
-                .descriptor_type = .storage_buffer,
-                .descriptor_count = 1,
-                .stage_flags = .{ .vertex_bit = true, .fragment_bit = true },
-                .p_immutable_samplers = null,
-            },
-            .{
-                .binding = 2,
-                .descriptor_type = .storage_buffer,
-                .descriptor_count = 1,
-                .stage_flags = .{ .vertex_bit = true, .fragment_bit = true },
-                .p_immutable_samplers = null,
-            },
-            .{
-                .binding = 3,
-                .descriptor_type = .storage_buffer,
-                .descriptor_count = 1,
-                .stage_flags = .{ .vertex_bit = true, .fragment_bit = true },
-                .p_immutable_samplers = null,
-            },
-            .{
-                .binding = 4,
-                .descriptor_type = .storage_buffer,
-                .descriptor_count = 1,
-                .stage_flags = .{ .vertex_bit = true, .fragment_bit = true },
-                .p_immutable_samplers = null,
-            },
         };
 
         const binding_flags = [_]vk.DescriptorBindingFlags{
             .{ .partially_bound_bit = true, .update_after_bind_bit = true },
-            .{ .update_after_bind_bit = true },
-            .{ .update_after_bind_bit = true },
-            .{ .update_after_bind_bit = true },
-            .{ .update_after_bind_bit = true },
         };
         const flags_info: vk.DescriptorSetLayoutBindingFlagsCreateInfo = .{
             .binding_count = binding_flags.len,
@@ -362,23 +325,6 @@ pub const BindlessDescriptors = struct {
 
     pub fn releaseTexture(self: *BindlessDescriptors, idx: u32) void {
         self.free_texture_indices.appendAssumeCapacity(idx);
-    }
-
-    pub fn registerBuffer(self: *BindlessDescriptors, device: vk.DeviceProxy, binding: u32, buffer: vk.Buffer, size: usize) void {
-        device.updateDescriptorSets(&.{.{
-            .dst_set = self.set,
-            .dst_binding = binding,
-            .dst_array_element = 0,
-            .descriptor_count = 1,
-            .descriptor_type = .storage_buffer,
-            .p_image_info = undefined,
-            .p_buffer_info = &.{.{
-                .buffer = buffer,
-                .offset = 0,
-                .range = size,
-            }},
-            .p_texel_buffer_view = undefined,
-        }}, null);
     }
 };
 
@@ -463,10 +409,12 @@ pub fn createLogicalDevice(
     };
     var device_features_vk12: vk.PhysicalDeviceVulkan12Features = .{
         .p_next = &device_features_vk13,
+        .buffer_device_address = .true,
         .runtime_descriptor_array = .true,
         .descriptor_binding_partially_bound = .true,
         .descriptor_binding_sampled_image_update_after_bind = .true,
         .descriptor_binding_storage_buffer_update_after_bind = .true,
+        .scalar_block_layout = .true,
     };
     const device_features_vk11: vk.PhysicalDeviceVulkan11Features = .{
         .p_next = &device_features_vk12,
@@ -592,5 +540,7 @@ const c = @import("c");
 const std = @import("std");
 const Scratch = @import("scratch_allocator");
 const options = @import("options");
+
+const vk_engine = @import("vk_engine.zig"); // TODO: remove
 
 const Allocator = std.mem.Allocator;

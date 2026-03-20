@@ -11,13 +11,13 @@ struct VSOutput {
 [shader("vertex")]
 VSOutput main(
     uniform Constants push_constants,
-    uint vertex_id : SV_VulkanVertexID,
-    uint draw_id : SV_VulkanInstanceID,
+    uint vertex_id: SV_VulkanVertexID,
+    uint draw_id: SV_VulkanInstanceID,
 ) {
-    DrawData draw = draw_data[draw_id];
-    Vertex v = vertices[vertex_id];
-    SceneData scene = scenes[push_constants.scene_data_index];
-    GLTFMaterialData mat = materials[draw.material_index];
+    SceneData scene = push_constants.scenes[push_constants.scene_data_index];
+    DrawData draw = scene.draw_data[draw_id];
+    Vertex v = scene.vertices[vertex_id];
+    GLTFMaterialData mat = scene.materials[draw.material_index];
 
     float4 position = float4(v.position, 1.0f);
 
@@ -27,6 +27,5 @@ VSOutput main(
     output.color = v.color.xyz * mat.color_factors.xyz;
     output.uv = float2(v.uv_x, v.uv_y);
     output.material_index = draw.material_index;
-
     return output;
 }

@@ -65,7 +65,7 @@ pub const MeshBuffers = struct {
         const vertex_buffer: VmaGpuBuffer = try .create(
             allocator,
             len * @sizeOf(Vertex),
-            .{ .storage_buffer_bit = true },
+            .{ .storage_buffer_bit = true, .shader_device_address_bit = true },
             .auto,
             .sequential_write,
         );
@@ -258,7 +258,7 @@ pub const GltfMetallicRoughness = struct {
                 .gpu_buffer = try .create(
                     allocator,
                     max_len * @sizeOf(GPUMaterialData),
-                    .{ .storage_buffer_bit = true },
+                    .{ .storage_buffer_bit = true, .shader_device_address_bit = true },
                     .auto,
                     .sequential_write,
                 ),
@@ -468,6 +468,10 @@ pub const VmaGpuBuffer = struct {
         const ptr: [*]T = @ptrCast(@alignCast(self.mapped orelse std.debug.panic("getMappedSlice called on unmappable buffer", .{})));
         return ptr[0 .. self.size / @sizeOf(T)];
     }
+
+    pub fn getDeviceAddress(self: VmaGpuBuffer, device: vk.DeviceProxy) vk.DeviceAddress {
+        return device.getBufferDeviceAddress(&.{ .buffer = self.buffer });
+    }
 };
 
 pub const Vertex = extern struct {
@@ -485,9 +489,14 @@ pub const GPUSceneData = extern struct {
     ambientColor: [4]f32,
     sunlightDirection: [4]f32, // w for sun power
     sunlightColor: [4]f32,
+
+    materials: vk.DeviceAddress,
+    vertices: vk.DeviceAddress,
+    draw_data: vk.DeviceAddress,
 };
 
 pub const GPUDrawPushConstants = extern struct {
+    scene_data: vk.DeviceAddress,
     scene_data_index: u32,
 };
 
@@ -831,9 +840,11 @@ pub const Engine = struct {
     scene_data: GPUSceneData,
 
     materials_buffer: GltfMetallicRoughness.MaterialsBuffer,
-    scene_data_buffer: VmaGpuBuffer,
     mesh_buffers: MeshBuffers,
     draw_data_buffer: VmaGpuBuffer,
+
+    scene_data_buffer: VmaGpuBuffer,
+    scene_data_adress: vk.DeviceAddress,
 
     // default images
     white_image: AllocatedImage,
@@ -999,14 +1010,14 @@ pub const Engine = struct {
         var graphics_ctx: GraphicsCtx = try .init(gpa, scratch, window);
 
         const queues = graphics_ctx.queues;
-        const device_proxy = graphics_ctx.device;
+        const device = graphics_ctx.device;
         const vma_allocator = graphics_ctx.vma_allocator;
         const physical_device = graphics_ctx.physical_device;
         const sdl_window_surface = graphics_ctx.window_surface;
 
         const instance_dispatch = graphics_ctx.instance.wrapper;
-        const instance = graphics_ctx.instance.handle;
-        const device = graphics_ctx.device.handle;
+        const instance_handle = graphics_ctx.instance.handle;
+        const device_handle = graphics_ctx.device.handle;
         const bindless_descriptors = &graphics_ctx.bindless_descriptors;
         const bindless_pipeline_layout = graphics_ctx.bindless_pipeline_layout;
 
@@ -1023,7 +1034,7 @@ pub const Engine = struct {
 
         var frames: [FrameData.frame_overlap]FrameData = undefined;
         for (&frames) |*frame| {
-            const command_pool = try device_proxy.createCommandPool(&command_pool_info, null);
+            const command_pool = try device.createCommandPool(&command_pool_info, null);
 
             var main_command_buffer: vk.CommandBuffer = undefined;
             const cmd_alloc_info: vk.CommandBufferAllocateInfo = .{
@@ -1031,12 +1042,12 @@ pub const Engine = struct {
                 .command_buffer_count = 1,
                 .level = .primary,
             };
-            try device_proxy.allocateCommandBuffers(&cmd_alloc_info, (&main_command_buffer)[0..1]);
+            try device.allocateCommandBuffers(&cmd_alloc_info, (&main_command_buffer)[0..1]);
 
             frame.* = .{
                 .command_pool = command_pool,
-                .render_fence = try device_proxy.createFence(&fence_create_info, null),
-                .swapchain_semaphore = try device_proxy.createSemaphore(&.{}, null),
+                .render_fence = try device.createFence(&fence_create_info, null),
+                .swapchain_semaphore = try device.createSemaphore(&.{}, null),
                 .main_command_buffer = main_command_buffer,
                 .deletion_queue = .init,
                 .indirect_buffer = try .create(
@@ -1104,7 +1115,7 @@ pub const Engine = struct {
                 .depth = 1,
             },
             .image = draw_image,
-            .image_view = try device_proxy.createImageView(&rview_info, null),
+            .image_view = try device.createImageView(&rview_info, null),
             .allocation = draw_image_allocation,
         };
 
@@ -1124,7 +1135,7 @@ pub const Engine = struct {
         const depth_allocated_image: AllocatedImage = .{
             .image_format = depth_image_format,
             .image_extent = draw_image_extent,
-            .image_view = try device_proxy.createImageView(&dview_info, null),
+            .image_view = try device.createImageView(&dview_info, null),
             .image = depth_image,
             .allocation = depth_image_allocation,
         };
@@ -1134,7 +1145,7 @@ pub const Engine = struct {
             gpa,
             scratch,
             physical_device,
-            device_proxy,
+            device,
             sdl_window_surface,
             window_width,
             window_height,
@@ -1165,7 +1176,7 @@ pub const Engine = struct {
                 .p_pool_sizes = &pool_sizes,
             };
 
-            const imgui_pool = try device_proxy.createDescriptorPool(&pool_info, null);
+            const imgui_pool = try device.createDescriptorPool(&pool_info, null);
 
             const ImguiVkLoader = struct {
                 var instance_proc_addr: vk.PfnGetInstanceProcAddr = undefined;
@@ -1179,7 +1190,7 @@ pub const Engine = struct {
                 }
             };
             ImguiVkLoader.instance_proc_addr = base_dispatch.dispatch.vkGetInstanceProcAddr.?;
-            ImguiVkLoader.instance_ = instance;
+            ImguiVkLoader.instance_ = instance_handle;
 
             _ = c.cImGui_ImplVulkan_LoadFunctions(
                 @bitCast(vk.makeApiVersion(1, 3, 0, 0)), // TODO: set with global variable
@@ -1197,9 +1208,9 @@ pub const Engine = struct {
             const frag_shader = try loadShader(scratch.allocator(), io, shaders.imgui_frag);
 
             var init_info: c.ImGui_ImplVulkan_InitInfo = .{
-                .Instance = @ptrFromInt(@intFromEnum(instance)),
+                .Instance = @ptrFromInt(@intFromEnum(instance_handle)),
                 .PhysicalDevice = @ptrFromInt(@intFromEnum(physical_device)),
-                .Device = @ptrFromInt(@intFromEnum(device)),
+                .Device = @ptrFromInt(@intFromEnum(device_handle)),
                 .Queue = @ptrFromInt(@intFromEnum(queues.graphics)),
                 .DescriptorPool = @ptrFromInt(@intFromEnum(imgui_pool)),
                 .MinImageCount = 3,
@@ -1226,7 +1237,7 @@ pub const Engine = struct {
             try main_deletion_queue.append(gpa, .{ .descriptor_pool = imgui_pool });
         }
 
-        var metal_rough_material: GltfMetallicRoughness = try .init(scratch, io, bindless_pipeline_layout, draw_allocated_image, depth_allocated_image, device_proxy);
+        var metal_rough_material: GltfMetallicRoughness = try .init(scratch, io, bindless_pipeline_layout, draw_allocated_image, depth_allocated_image, device);
 
         // init_default_data {
 
@@ -1284,25 +1295,22 @@ pub const Engine = struct {
         try main_deletion_queue.append(gpa, .{ .sampler = default_sampler_linear });
 
         var materials_buffer: GltfMetallicRoughness.MaterialsBuffer = try .init(1024, vma_allocator);
-        bindless_descriptors.registerBuffer(device_proxy, 1, materials_buffer.gpu_buffer.buffer, materials_buffer.gpu_buffer.size);
 
         const scene_data_buffer: VmaGpuBuffer = try .create(
             vma_allocator,
             FrameData.frame_overlap * @sizeOf(GPUSceneData),
-            .{ .storage_buffer_bit = true },
+            .{ .storage_buffer_bit = true, .shader_device_address_bit = true },
             .auto,
             .sequential_write,
         );
-        bindless_descriptors.registerBuffer(device_proxy, 2, scene_data_buffer.buffer, scene_data_buffer.size);
 
         const draw_data_buffer: VmaGpuBuffer = try .create(
             vma_allocator,
             FrameData.max_draws * FrameData.frame_overlap * @sizeOf(GPUDrawData),
-            .{ .storage_buffer_bit = true },
+            .{ .storage_buffer_bit = true, .shader_device_address_bit = true },
             .cpu_to_gpu,
             .sequential_write,
         );
-        bindless_descriptors.registerBuffer(device_proxy, 4, draw_data_buffer.buffer, draw_data_buffer.size);
 
         var material_resources: GltfMetallicRoughness.MaterialResources = .{
             .color_image = white_image,
@@ -1315,7 +1323,7 @@ pub const Engine = struct {
 
         const default_data = try metal_rough_material.writeMaterial(
             gpa,
-            device_proxy,
+            device,
             .main_color,
             &material_resources,
             bindless_descriptors,
@@ -1325,7 +1333,6 @@ pub const Engine = struct {
         //}
 
         var mesh_buffers: MeshBuffers = try .init(vma_allocator, 64 * 1024 * 1024);
-        bindless_descriptors.registerBuffer(device_proxy, 3, mesh_buffers.vertex_buffer.buffer, mesh_buffers.vertex_buffer.size);
 
         const structure_path = options.assets_path ++ "/structure.glb";
         const structure_file = try loader.loadGltf(
@@ -1375,12 +1382,17 @@ pub const Engine = struct {
                 .ambientColor = @splat(0),
                 .sunlightDirection = @splat(0), // w for sun power
                 .sunlightColor = @splat(0),
+                .draw_data = draw_data_buffer.getDeviceAddress(device),
+                .materials = materials_buffer.gpu_buffer.getDeviceAddress(device),
+                .vertices = mesh_buffers.vertex_buffer.getDeviceAddress(device),
             },
 
             .materials_buffer = materials_buffer,
-            .scene_data_buffer = scene_data_buffer,
             .mesh_buffers = mesh_buffers,
             .draw_data_buffer = draw_data_buffer,
+
+            .scene_data_buffer = scene_data_buffer,
+            .scene_data_adress = scene_data_buffer.getDeviceAddress(device),
 
             .white_image = white_image,
             .grey_image = grey_image,
@@ -1751,7 +1763,10 @@ pub const Engine = struct {
             .{ .vertex_bit = true, .fragment_bit = true },
             0,
             @sizeOf(GPUDrawPushConstants),
-            std.mem.asBytes(&GPUDrawPushConstants{ .scene_data_index = @intCast(frame_index) }),
+            std.mem.asBytes(&GPUDrawPushConstants{
+                .scene_data = self.scene_data_adress,
+                .scene_data_index = @intCast(frame_index),
+            }),
         );
 
         for (batches.items) |batch| {

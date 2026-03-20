@@ -8,8 +8,8 @@ float4 main(
     float2 uv : TEXCOORD,
     nointerpolation uint material_index : TEXCOORD1,
 ) {
-    SceneData scene = scenes[push_constants.scene_data_index];
-    GLTFMaterialData mat = materials[material_index];
+    SceneData scene = push_constants.scenes[push_constants.scene_data_index];
+    GLTFMaterialData mat = scene.materials[material_index];
 
     float light_value = max(dot(normal, scene.sunlight_direction.xyz), 0.1f);
 
