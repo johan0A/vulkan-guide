@@ -46,12 +46,9 @@ pub fn build(b: *std.Build) !void {
         var shader_paths_src = b.addOptions();
 
         for ([_][]const u8{
-            "circle.slang",
-            "color.slang",
             "imgui_frag.slang",
             "mesh_frag.slang",
             "mesh_vert.slang",
-            "tex_image_frag.slang",
         }) |name| {
             const command: *std.Build.Step.Run = .create(b, b.fmt("compile shader {s}", .{name}));
             command.addFileArg(slang_path);
