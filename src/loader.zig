@@ -19,13 +19,12 @@ pub fn loadGltf(
     gpa: std.mem.Allocator,
     scratch: *Scratch,
     io: std.Io,
+    graphics_ctx: *GraphicsCtx,
     metal_rough_material: *vk_engine.GltfMetallicRoughness,
     default_sampler_linear: vk.Sampler,
     white_image: vk_engine.AllocatedImage,
     error_checkerboard_image: vk_engine.AllocatedImage,
-    graphics_ctx: GraphicsCtx,
     filePath: []const u8,
-    bindless_descriptors: *vk_engine.BindlessDescriptors,
     materials_buffer: *vk_engine.GltfMetallicRoughness.MaterialsBuffer,
     mesh_buffers: *vk_engine.MeshBuffers,
 ) !*LoadedGltf {
@@ -146,16 +145,13 @@ pub fn loadGltf(
 
         new_mat.data = try metal_rough_material.writeMaterial(
             gpa,
-            graphics_ctx.device,
+            graphics_ctx,
             pass_type,
             &material_resources,
-            bindless_descriptors,
             materials_buffer,
         );
     }
 
-    // use the same vectors for all meshes so that the memory doesnt reallocate as
-    // // often
     var indices: std.ArrayList(u32) = .empty;
     defer indices.deinit(gpa);
     var vertices: std.ArrayList(vk_engine.Vertex) = .empty;
@@ -328,7 +324,7 @@ fn loadImage(
     base_dir: std.Io.Dir,
     gltf: Gltf,
     gltf_image: Gltf.Image,
-    graphics_ctx: GraphicsCtx,
+    graphics_ctx: *const GraphicsCtx,
 ) !vk_engine.AllocatedImage {
     const zone = tracy.zone(@src());
     defer zone.end();

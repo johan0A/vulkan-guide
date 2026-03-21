@@ -291,21 +291,20 @@ pub const GltfMetallicRoughness = struct {
     pub fn init(
         scratch: *Scratch,
         io: std.Io,
-        bindless_pipeline_layout: vk.PipelineLayout,
+        gc: *GraphicsCtx,
         draw_image: AllocatedImage,
         depth_image: AllocatedImage,
-        device: vk.DeviceProxy,
     ) !GltfMetallicRoughness {
         const checkpoint = scratch.checkpoint();
         defer scratch.restoreCheckpoint(checkpoint);
 
         const mesh_frag_shader_data = try loadShader(scratch.allocator(), io, shaders.mesh_frag);
-        const mesh_frag_shader = try vk_init.loadShaderModule(mesh_frag_shader_data, device);
-        defer device.destroyShaderModule(mesh_frag_shader, null);
+        const mesh_frag_shader = try vk_init.loadShaderModule(mesh_frag_shader_data, gc.device);
+        defer gc.device.destroyShaderModule(mesh_frag_shader, null);
 
         const mesh_vertex_shader_data = try loadShader(scratch.allocator(), io, shaders.mesh_vert);
-        const mesh_vertex_shader = try vk_init.loadShaderModule(mesh_vertex_shader_data, device);
-        defer device.destroyShaderModule(mesh_vertex_shader, null);
+        const mesh_vertex_shader = try vk_init.loadShaderModule(mesh_vertex_shader_data, gc.device);
+        defer gc.device.destroyShaderModule(mesh_vertex_shader, null);
 
         var pipeline_config: PipelineConfig = .{
             .shaders = .{ mesh_vertex_shader, mesh_frag_shader },
@@ -314,12 +313,12 @@ pub const GltfMetallicRoughness = struct {
             .depth_format = depth_image.image_format,
         };
 
-        const opaque_pipeline = try createPipeline(device, bindless_pipeline_layout, pipeline_config);
+        const opaque_pipeline = try createPipeline(gc.device, gc.bindless_pipeline_layout, pipeline_config);
 
         pipeline_config.blending = .additive;
         pipeline_config.depth_test = .{ .write = false, .compare = .greater_or_equal };
 
-        const transparent_pipeline = try createPipeline(device, bindless_pipeline_layout, pipeline_config);
+        const transparent_pipeline = try createPipeline(gc.device, gc.bindless_pipeline_layout, pipeline_config);
 
         return .{
             .opaque_pipeline = opaque_pipeline,
@@ -335,21 +334,20 @@ pub const GltfMetallicRoughness = struct {
     pub fn writeMaterial(
         self: *GltfMetallicRoughness,
         gpa: Allocator,
-        device: vk.DeviceProxy,
+        gc: *GraphicsCtx,
         pass: MaterialPass,
         resources: *const MaterialResources,
-        bindless: *BindlessDescriptors,
         materials_buffer: *MaterialsBuffer,
     ) !MaterialInstance {
-        const color_tex_index = try bindless.registerTexture(
+        const color_tex_index = try gc.bindless_descriptors.registerTexture(
             gpa,
-            device,
+            gc.device,
             resources.color_image.image_view,
             resources.color_sampler,
         );
-        const metal_rough_tex_index = try bindless.registerTexture(
+        const metal_rough_tex_index = try gc.bindless_descriptors.registerTexture(
             gpa,
-            device,
+            gc.device,
             resources.metal_rough_image.image_view,
             resources.metal_rough_sampler,
         );
@@ -493,11 +491,6 @@ pub const GPUSceneData = extern struct {
     materials: vk.DeviceAddress,
     vertices: vk.DeviceAddress,
     draw_data: vk.DeviceAddress,
-};
-
-pub const GPUDrawPushConstants = extern struct {
-    scene_data: vk.DeviceAddress,
-    scene_data_index: u32,
 };
 
 pub const GPUDrawData = extern struct {
@@ -708,18 +701,14 @@ const SwapChain = struct {
     fn init(
         gpa: std.mem.Allocator,
         scratch: *Scratch,
-        physical_device: vk.PhysicalDevice,
-        device: vk.DeviceProxy,
-        window_surface: vk.SurfaceKHR,
+        gc: *const GraphicsCtx,
         window_width: u32,
         window_height: u32,
-        instance_dispatch: vk.InstanceWrapper,
-        queues: Queues,
     ) !SwapChain {
         const checkpoint = scratch.checkpoint();
         defer scratch.restoreCheckpoint(checkpoint);
 
-        const surface_formats = try instance_dispatch.getPhysicalDeviceSurfaceFormatsAllocKHR(physical_device, window_surface, scratch.allocator());
+        const surface_formats = try gc.instance.getPhysicalDeviceSurfaceFormatsAllocKHR(gc.physical_device, gc.window_surface, scratch.allocator());
 
         const swapchain_image_format = blk: {
             const preferred_format: vk.SurfaceFormatKHR = .{ .format = .b8g8r8a8_srgb, .color_space = .srgb_nonlinear_khr };
@@ -728,15 +717,15 @@ const SwapChain = struct {
             return error.SwapchainCreationFailed;
         };
 
-        const surface_capabilities = try instance_dispatch.getPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, window_surface);
+        const surface_capabilities = try gc.instance.getPhysicalDeviceSurfaceCapabilitiesKHR(gc.physical_device, gc.window_surface);
         const min_image_count = @min(surface_capabilities.min_image_count, 3);
 
         const swapchain_extent: vk.Extent2D = .{ .width = window_width, .height = window_height };
 
-        const concurrent = queues.families.graphics != queues.families.present;
-        const family_indices = [_]u32{ queues.families.graphics, queues.families.present };
+        const concurrent = gc.queues.families.graphics != gc.queues.families.present;
+        const family_indices = [_]u32{ gc.queues.families.graphics, gc.queues.families.present };
         const swapchain_create_info = vk.SwapchainCreateInfoKHR{
-            .surface = window_surface,
+            .surface = gc.window_surface,
             .min_image_count = min_image_count,
             .image_format = swapchain_image_format.format,
             .image_color_space = swapchain_image_format.color_space,
@@ -748,29 +737,29 @@ const SwapChain = struct {
             .p_queue_family_indices = if (concurrent) &family_indices else null,
             .pre_transform = .{ .identity_bit_khr = true },
             .composite_alpha = .{ .opaque_bit_khr = true },
-            .present_mode = .immediate_khr,
+            .present_mode = .mailbox_khr,
             .clipped = .false,
             .old_swapchain = .null_handle,
         };
 
-        const swapchain_handle = try device.createSwapchainKHR(&swapchain_create_info, null);
-        errdefer device.destroySwapchainKHR(swapchain_handle, null);
+        const swapchain_handle = try gc.device.createSwapchainKHR(&swapchain_create_info, null);
+        errdefer gc.device.destroySwapchainKHR(swapchain_handle, null);
 
-        const images = try device.getSwapchainImagesAllocKHR(swapchain_handle, scratch.allocator());
+        const images = try gc.device.getSwapchainImagesAllocKHR(swapchain_handle, scratch.allocator());
 
         const swap_images = try gpa.alloc(SwapImage, images.len);
         errdefer {
             gpa.free(swap_images);
             for (swap_images) |image| {
-                if (image.view != .null_handle) device.destroyImageView(image.view, null);
+                if (image.view != .null_handle) gc.device.destroyImageView(image.view, null);
             }
         }
 
         for (images, swap_images) |image, *swapchain_image| {
             swapchain_image.* = .{
                 .handle = image,
-                .render_semaphore = try device.createSemaphore(&.{}, null),
-                .view = try device.createImageView(&.{
+                .render_semaphore = try gc.device.createSemaphore(&.{}, null),
+                .view = try gc.device.createImageView(&.{
                     .image = image,
                     .view_type = .@"2d",
                     .format = swapchain_image_format.format,
@@ -1007,34 +996,18 @@ pub const Engine = struct {
         const base_dispatch = vk.BaseWrapper.load(@as(vk.PfnGetInstanceProcAddr, @ptrCast(c.SDL_Vulkan_GetVkGetInstanceProcAddr())));
         tracy_load_base_dispatch.end();
 
-        var graphics_ctx: GraphicsCtx = try .init(gpa, scratch, window);
+        var gc: GraphicsCtx = try .init(gpa, scratch, window);
 
-        const queues = graphics_ctx.queues;
-        const device = graphics_ctx.device;
-        const vma_allocator = graphics_ctx.vma_allocator;
-        const physical_device = graphics_ctx.physical_device;
-        const sdl_window_surface = graphics_ctx.window_surface;
-
-        const instance_dispatch = graphics_ctx.instance.wrapper;
-        const instance_handle = graphics_ctx.instance.handle;
-        const device_handle = graphics_ctx.device.handle;
-        const bindless_descriptors = &graphics_ctx.bindless_descriptors;
-        const bindless_pipeline_layout = graphics_ctx.bindless_pipeline_layout;
-
-        // init_commands() {
-        // init_sync_structures() {
         const command_pool_info: vk.CommandPoolCreateInfo = .{
             .flags = .{ .reset_command_buffer_bit = true },
-            .queue_family_index = queues.families.graphics,
+            .queue_family_index = gc.queues.families.graphics,
         };
-
         const fence_create_info: vk.FenceCreateInfo = .{ .flags = .{ .signaled_bit = true } };
         var main_deletion_queue: DeletionQueue = .init;
-        // }}
 
         var frames: [FrameData.frame_overlap]FrameData = undefined;
         for (&frames) |*frame| {
-            const command_pool = try device.createCommandPool(&command_pool_info, null);
+            const command_pool = try gc.device.createCommandPool(&command_pool_info, null);
 
             var main_command_buffer: vk.CommandBuffer = undefined;
             const cmd_alloc_info: vk.CommandBufferAllocateInfo = .{
@@ -1042,16 +1015,16 @@ pub const Engine = struct {
                 .command_buffer_count = 1,
                 .level = .primary,
             };
-            try device.allocateCommandBuffers(&cmd_alloc_info, (&main_command_buffer)[0..1]);
+            try gc.device.allocateCommandBuffers(&cmd_alloc_info, (&main_command_buffer)[0..1]);
 
             frame.* = .{
                 .command_pool = command_pool,
-                .render_fence = try device.createFence(&fence_create_info, null),
-                .swapchain_semaphore = try device.createSemaphore(&.{}, null),
+                .render_fence = try gc.device.createFence(&fence_create_info, null),
+                .swapchain_semaphore = try gc.device.createSemaphore(&.{}, null),
                 .main_command_buffer = main_command_buffer,
                 .deletion_queue = .init,
                 .indirect_buffer = try .create(
-                    vma_allocator,
+                    gc.vma_allocator,
                     FrameData.max_draws * @sizeOf(vk.DrawIndexedIndirectCommand),
                     .{ .indirect_buffer_bit = true, .storage_buffer_bit = true },
                     .cpu_to_gpu,
@@ -1061,7 +1034,7 @@ pub const Engine = struct {
         }
 
         //allocate images {
-        const draw_image_format: vk.Format = .r16g16b16a16_sfloat;
+        const draw_image_format: vk.Format = .b10g11r11_ufloat_pack32;
 
         const draw_image_usages: vk.ImageUsageFlags = .{
             .transfer_src_bit = true,
@@ -1089,7 +1062,7 @@ pub const Engine = struct {
 
         //allocate and create the image
         const result: vk.Result = @enumFromInt(c.vmaCreateImage(
-            vma_allocator,
+            gc.vma_allocator,
             @ptrCast(&rimg_info),
             @ptrCast(&rimg_allocinfo),
             @ptrCast(&draw_image),
@@ -1115,19 +1088,17 @@ pub const Engine = struct {
                 .depth = 1,
             },
             .image = draw_image,
-            .image_view = try device.createImageView(&rview_info, null),
+            .image_view = try gc.device.createImageView(&rview_info, null),
             .allocation = draw_image_allocation,
         };
 
-        const depthImageUsages: vk.ImageUsageFlags = .{ .depth_stencil_attachment_bit = true };
-
+        const depth_image_usages: vk.ImageUsageFlags = .{ .depth_stencil_attachment_bit = true };
         const depth_image_format: vk.Format = .d32_sfloat;
-        const dimg_info: vk.ImageCreateInfo = vk_init.imageCreateInfo(depth_image_format, depthImageUsages, draw_image_extent);
+        const depth_image_info: vk.ImageCreateInfo = vk_init.imageCreateInfo(depth_image_format, depth_image_usages, draw_image_extent);
 
         var depth_image_allocation: c.VmaAllocation = undefined;
-        //allocate and create the image
         var depth_image: vk.Image = undefined;
-        _ = c.vmaCreateImage(vma_allocator, @ptrCast(&dimg_info), &rimg_allocinfo, @ptrCast(&depth_image), &depth_image_allocation, null); // TODO: handle error?
+        _ = c.vmaCreateImage(gc.vma_allocator, @ptrCast(&depth_image_info), &rimg_allocinfo, @ptrCast(&depth_image), &depth_image_allocation, null); // TODO: handle error?
 
         //build a image-view for the draw image to use for rendering
         const dview_info: vk.ImageViewCreateInfo = vk_init.imageViewCreateInfo(depth_image_format, depth_image, .{ .depth_bit = true });
@@ -1135,7 +1106,7 @@ pub const Engine = struct {
         const depth_allocated_image: AllocatedImage = .{
             .image_format = depth_image_format,
             .image_extent = draw_image_extent,
-            .image_view = try device.createImageView(&dview_info, null),
+            .image_view = try gc.device.createImageView(&dview_info, null),
             .image = depth_image,
             .allocation = depth_image_allocation,
         };
@@ -1144,13 +1115,9 @@ pub const Engine = struct {
         const swapchain: SwapChain = try .init(
             gpa,
             scratch,
-            physical_device,
-            device,
-            sdl_window_surface,
+            &gc,
             window_width,
             window_height,
-            instance_dispatch.*,
-            queues,
         );
 
         {
@@ -1176,7 +1143,7 @@ pub const Engine = struct {
                 .p_pool_sizes = &pool_sizes,
             };
 
-            const imgui_pool = try device.createDescriptorPool(&pool_info, null);
+            const imgui_pool = try gc.device.createDescriptorPool(&pool_info, null);
 
             const ImguiVkLoader = struct {
                 var instance_proc_addr: vk.PfnGetInstanceProcAddr = undefined;
@@ -1190,7 +1157,7 @@ pub const Engine = struct {
                 }
             };
             ImguiVkLoader.instance_proc_addr = base_dispatch.dispatch.vkGetInstanceProcAddr.?;
-            ImguiVkLoader.instance_ = instance_handle;
+            ImguiVkLoader.instance_ = gc.instance.handle;
 
             _ = c.cImGui_ImplVulkan_LoadFunctions(
                 @bitCast(vk.makeApiVersion(1, 3, 0, 0)), // TODO: set with global variable
@@ -1208,10 +1175,10 @@ pub const Engine = struct {
             const frag_shader = try loadShader(scratch.allocator(), io, shaders.imgui_frag);
 
             var init_info: c.ImGui_ImplVulkan_InitInfo = .{
-                .Instance = @ptrFromInt(@intFromEnum(instance_handle)),
-                .PhysicalDevice = @ptrFromInt(@intFromEnum(physical_device)),
-                .Device = @ptrFromInt(@intFromEnum(device_handle)),
-                .Queue = @ptrFromInt(@intFromEnum(queues.graphics)),
+                .Instance = @ptrFromInt(@intFromEnum(gc.instance.handle)),
+                .PhysicalDevice = @ptrFromInt(@intFromEnum(gc.physical_device)),
+                .Device = @ptrFromInt(@intFromEnum(gc.device.handle)),
+                .Queue = @ptrFromInt(@intFromEnum(gc.queues.graphics)),
                 .DescriptorPool = @ptrFromInt(@intFromEnum(imgui_pool)),
                 .MinImageCount = 3,
                 .ImageCount = 3,
@@ -1237,23 +1204,21 @@ pub const Engine = struct {
             try main_deletion_queue.append(gpa, .{ .descriptor_pool = imgui_pool });
         }
 
-        var metal_rough_material: GltfMetallicRoughness = try .init(scratch, io, bindless_pipeline_layout, draw_allocated_image, depth_allocated_image, device);
+        var metal_rough_material: GltfMetallicRoughness = try .init(scratch, io, &gc, draw_allocated_image, depth_allocated_image);
 
         // init_default_data {
-
-        //{ default images
         const Color = packed struct(u32) { r: u8, g: u8, b: u8, a: u8 };
 
         const white: Color = .{ .r = 255, .g = 255, .b = 255, .a = 255 };
-        const white_image = try createAndUploadImage(graphics_ctx, @ptrCast(&white), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
+        const white_image = try createAndUploadImage(&gc, @ptrCast(&white), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
         try main_deletion_queue.append(gpa, .{ .vma_allocated_image = white_image });
 
         const grey: Color = .{ .r = 168, .g = 168, .b = 168, .a = 255 };
-        const grey_image = try createAndUploadImage(graphics_ctx, @ptrCast(&grey), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
+        const grey_image = try createAndUploadImage(&gc, @ptrCast(&grey), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
         try main_deletion_queue.append(gpa, .{ .vma_allocated_image = grey_image });
 
         const black: Color = .{ .r = 0, .g = 0, .b = 0, .a = 255 };
-        const black_image = try createAndUploadImage(graphics_ctx, @ptrCast(&black), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
+        const black_image = try createAndUploadImage(&gc, @ptrCast(&black), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
         try main_deletion_queue.append(gpa, .{ .vma_allocated_image = black_image });
 
         const error_checkerboard_image = blk: {
@@ -1264,7 +1229,7 @@ pub const Engine = struct {
                     pixels[x][y] = if ((x % 2) ^ (y % 2) != 0) magenta else black;
                 }
             }
-            break :blk try createAndUploadImage(graphics_ctx, @ptrCast(&pixels), .{ .width = 16, .height = 16, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
+            break :blk try createAndUploadImage(&gc, @ptrCast(&pixels), .{ .width = 16, .height = 16, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
         };
         try main_deletion_queue.append(gpa, .{ .vma_allocated_image = error_checkerboard_image });
 
@@ -1286,18 +1251,18 @@ pub const Engine = struct {
             .unnormalized_coordinates = .false,
         };
 
-        const default_sampler_nearest = try graphics_ctx.device.createSampler(&sampler_create_info, null);
+        const default_sampler_nearest = try gc.device.createSampler(&sampler_create_info, null);
         try main_deletion_queue.append(gpa, .{ .sampler = default_sampler_nearest });
 
         sampler_create_info.mag_filter = .linear;
         sampler_create_info.min_filter = .linear;
-        const default_sampler_linear = try graphics_ctx.device.createSampler(&sampler_create_info, null);
+        const default_sampler_linear = try gc.device.createSampler(&sampler_create_info, null);
         try main_deletion_queue.append(gpa, .{ .sampler = default_sampler_linear });
 
-        var materials_buffer: GltfMetallicRoughness.MaterialsBuffer = try .init(1024, vma_allocator);
+        var materials_buffer: GltfMetallicRoughness.MaterialsBuffer = try .init(1024, gc.vma_allocator);
 
         const scene_data_buffer: VmaGpuBuffer = try .create(
-            vma_allocator,
+            gc.vma_allocator,
             FrameData.frame_overlap * @sizeOf(GPUSceneData),
             .{ .storage_buffer_bit = true, .shader_device_address_bit = true },
             .auto,
@@ -1305,7 +1270,7 @@ pub const Engine = struct {
         );
 
         const draw_data_buffer: VmaGpuBuffer = try .create(
-            vma_allocator,
+            gc.vma_allocator,
             FrameData.max_draws * FrameData.frame_overlap * @sizeOf(GPUDrawData),
             .{ .storage_buffer_bit = true, .shader_device_address_bit = true },
             .cpu_to_gpu,
@@ -1323,29 +1288,27 @@ pub const Engine = struct {
 
         const default_data = try metal_rough_material.writeMaterial(
             gpa,
-            device,
+            &gc,
             .main_color,
             &material_resources,
-            bindless_descriptors,
             &materials_buffer,
         );
 
         //}
 
-        var mesh_buffers: MeshBuffers = try .init(vma_allocator, 64 * 1024 * 1024);
+        var mesh_buffers: MeshBuffers = try .init(gc.vma_allocator, 64 * 1024 * 1024);
 
         const structure_path = options.assets_path ++ "/structure.glb";
         const structure_file = try loader.loadGltf(
             gpa,
             scratch,
             io,
+            &gc,
             &metal_rough_material,
             default_sampler_linear,
             white_image,
             error_checkerboard_image,
-            graphics_ctx,
             structure_path,
-            bindless_descriptors,
             &materials_buffer,
             &mesh_buffers,
         );
@@ -1360,7 +1323,7 @@ pub const Engine = struct {
         try loaded_scenes.put(gpa, "structure", loaded_scene_node);
 
         return .{
-            .graphics_ctx = graphics_ctx,
+            .graphics_ctx = gc,
 
             .window = window,
 
@@ -1382,9 +1345,9 @@ pub const Engine = struct {
                 .ambientColor = @splat(0),
                 .sunlightDirection = @splat(0), // w for sun power
                 .sunlightColor = @splat(0),
-                .draw_data = draw_data_buffer.getDeviceAddress(device),
-                .materials = materials_buffer.gpu_buffer.getDeviceAddress(device),
-                .vertices = mesh_buffers.vertex_buffer.getDeviceAddress(device),
+                .draw_data = draw_data_buffer.getDeviceAddress(gc.device),
+                .materials = materials_buffer.gpu_buffer.getDeviceAddress(gc.device),
+                .vertices = mesh_buffers.vertex_buffer.getDeviceAddress(gc.device),
             },
 
             .materials_buffer = materials_buffer,
@@ -1392,7 +1355,7 @@ pub const Engine = struct {
             .draw_data_buffer = draw_data_buffer,
 
             .scene_data_buffer = scene_data_buffer,
-            .scene_data_adress = scene_data_buffer.getDeviceAddress(device),
+            .scene_data_adress = scene_data_buffer.getDeviceAddress(gc.device),
 
             .white_image = white_image,
             .grey_image = grey_image,
@@ -1421,7 +1384,7 @@ pub const Engine = struct {
         return .{ .width = self.draw_image.image_extent.width, .height = self.draw_image.image_extent.height };
     }
 
-    pub fn createImage(graphics_ctx: GraphicsCtx, size: vk.Extent3D, format: vk.Format, usage: vk.ImageUsageFlags, mipmapped: bool) !AllocatedImage {
+    pub fn createImage(gc: *const GraphicsCtx, size: vk.Extent3D, format: vk.Format, usage: vk.ImageUsageFlags, mipmapped: bool) !AllocatedImage {
         var img_info: vk.ImageCreateInfo = vk_init.imageCreateInfo(format, usage, size);
         if (mipmapped) {
             img_info.mip_levels = std.math.log2(@max(size.width, size.height)) + 1;
@@ -1435,7 +1398,7 @@ pub const Engine = struct {
 
         var image: vk.Image = undefined;
         var image_allocation: c.VmaAllocation = undefined;
-        _ = c.vmaCreateImage(graphics_ctx.vma_allocator, @ptrCast(&img_info), &alloc_info, @ptrCast(&image), &image_allocation, null);
+        _ = c.vmaCreateImage(gc.vma_allocator, @ptrCast(&img_info), &alloc_info, @ptrCast(&image), &image_allocation, null);
 
         // if the format is a depth format, we will need to have it use the correct aspect flag
         const aspect_flag: vk.ImageAspectFlags = switch (format == .d32_sfloat) {
@@ -1451,15 +1414,15 @@ pub const Engine = struct {
             .image_format = format,
             .image_extent = size,
             .image = image,
-            .image_view = try graphics_ctx.device.createImageView(&view_info, null),
+            .image_view = try gc.device.createImageView(&view_info, null),
             .allocation = image_allocation,
         };
     }
 
-    pub fn createAndUploadImage(graphics_ctx: GraphicsCtx, data: *const anyopaque, size: vk.Extent3D, format: vk.Format, usage: vk.ImageUsageFlags, mipmapped: bool) !AllocatedImage {
+    pub fn createAndUploadImage(gc: *const GraphicsCtx, data: *const anyopaque, size: vk.Extent3D, format: vk.Format, usage: vk.ImageUsageFlags, mipmapped: bool) !AllocatedImage {
         const data_size: usize = size.depth * size.width * size.height * 4;
         const upload_buffer: VmaGpuBuffer = try .create(
-            graphics_ctx.vma_allocator,
+            gc.vma_allocator,
             data_size,
             .{ .transfer_src_bit = true },
             .cpu_to_gpu,
@@ -1472,12 +1435,12 @@ pub const Engine = struct {
         var new_usage = usage;
         new_usage.transfer_dst_bit = true;
         new_usage.transfer_src_bit = true;
-        const new_image = try createImage(graphics_ctx, size, format, new_usage, mipmapped);
+        const new_image = try createImage(gc, size, format, new_usage, mipmapped);
 
         {
-            try immediateModeBegin(graphics_ctx.device, graphics_ctx.imm.fence, graphics_ctx.imm.cmd);
+            try immediateModeBegin(gc.device, gc.imm.fence, gc.imm.cmd);
 
-            vk_image.transitionImage(graphics_ctx.device, graphics_ctx.imm.cmd, new_image.image, .undefined, .transfer_dst_optimal);
+            vk_image.transitionImage(gc.device, gc.imm.cmd, new_image.image, .undefined, .transfer_dst_optimal);
 
             const copy_region: vk.BufferImageCopy = .{
                 .buffer_offset = 0,
@@ -1493,18 +1456,18 @@ pub const Engine = struct {
                 .image_extent = size,
                 .image_offset = .{ .x = 0, .y = 0, .z = 0 },
             };
-            graphics_ctx.device.cmdCopyBufferToImage(graphics_ctx.imm.cmd, upload_buffer.buffer, new_image.image, .transfer_dst_optimal, &.{copy_region});
+            gc.device.cmdCopyBufferToImage(gc.imm.cmd, upload_buffer.buffer, new_image.image, .transfer_dst_optimal, &.{copy_region});
 
             if (mipmapped) {
-                vk_image.generateMipmaps(graphics_ctx.device, graphics_ctx.imm.cmd, new_image.image, .{ .width = new_image.image_extent.width, .height = new_image.image_extent.height });
+                vk_image.generateMipmaps(gc.device, gc.imm.cmd, new_image.image, .{ .width = new_image.image_extent.width, .height = new_image.image_extent.height });
             } else {
-                vk_image.transitionImage(graphics_ctx.device, graphics_ctx.imm.cmd, new_image.image, .transfer_dst_optimal, .read_only_optimal);
+                vk_image.transitionImage(gc.device, gc.imm.cmd, new_image.image, .transfer_dst_optimal, .read_only_optimal);
             }
 
-            try immediateModeEnd(graphics_ctx.device, graphics_ctx.imm.fence, graphics_ctx.imm.cmd, graphics_ctx.queues.graphics);
+            try immediateModeEnd(gc.device, gc.imm.fence, gc.imm.cmd, gc.queues.graphics);
         }
 
-        upload_buffer.destroy(graphics_ctx.vma_allocator);
+        upload_buffer.destroy(gc.vma_allocator);
         return new_image;
     }
 
@@ -1528,13 +1491,9 @@ pub const Engine = struct {
         self.swapchain = try .init(
             gpa,
             scratch,
-            self.graphics_ctx.physical_device,
-            device,
-            self.graphics_ctx.window_surface,
+            &self.graphics_ctx,
             new_width,
             new_height,
-            self.graphics_ctx.instance.wrapper.*,
-            self.graphics_ctx.queues,
         );
 
         self.destroyImage(&self.draw_image);
@@ -1543,7 +1502,7 @@ pub const Engine = struct {
         const new_extent: vk.Extent3D = .{ .width = new_width, .height = new_height, .depth = 1 };
 
         self.draw_image = try createImage(
-            self.graphics_ctx,
+            &self.graphics_ctx,
             new_extent,
             .r16g16b16a16_sfloat,
             .{ .transfer_src_bit = true, .transfer_dst_bit = true, .storage_bit = true, .color_attachment_bit = true },
@@ -1551,7 +1510,7 @@ pub const Engine = struct {
         );
 
         self.depth_image = try createImage(
-            self.graphics_ctx,
+            &self.graphics_ctx,
             new_extent,
             .d32_sfloat,
             .{ .depth_stencil_attachment_bit = true },
@@ -1757,16 +1716,18 @@ pub const Engine = struct {
 
         device.cmdBindIndexBuffer(cmd, self.mesh_buffers.index_buffer.buffer, 0, .uint32);
 
+        const push_constants: GraphicsCtx.GPUDrawPushConstants = .{
+            .scene_data = self.scene_data_adress,
+            .scene_data_index = @intCast(frame_index),
+        };
+
         device.cmdPushConstants(
             cmd,
             self.graphics_ctx.bindless_pipeline_layout,
             .{ .vertex_bit = true, .fragment_bit = true },
             0,
-            @sizeOf(GPUDrawPushConstants),
-            std.mem.asBytes(&GPUDrawPushConstants{
-                .scene_data = self.scene_data_adress,
-                .scene_data_index = @intCast(frame_index),
-            }),
+            @sizeOf(@TypeOf(push_constants)),
+            std.mem.asBytes(&push_constants),
         );
 
         for (batches.items) |batch| {

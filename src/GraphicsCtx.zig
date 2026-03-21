@@ -1,6 +1,11 @@
 const validation_layers = [_][:0]const u8{"VK_LAYER_KHRONOS_validation"};
 const required_device_extensions = [_][*:0]const u8{vk.extensions.khr_swapchain.name};
 
+pub const GPUDrawPushConstants = extern struct {
+    scene_data: vk.DeviceAddress,
+    scene_data_index: u32,
+};
+
 base_dispatch: vk.BaseWrapper,
 instance: vk.InstanceProxy,
 physical_device: vk.PhysicalDevice,
@@ -30,7 +35,7 @@ pub fn init(
 
     const instance_handle = try createVkInstance(scratch, base_dispatch, options.enable_validation_layers);
     const instance_dispatch = try arena.create(vk.InstanceWrapper);
-    instance_dispatch.* = vk.InstanceWrapper.load(instance_handle, base_dispatch.dispatch.vkGetInstanceProcAddr.?);
+    instance_dispatch.* = .load(instance_handle, base_dispatch.dispatch.vkGetInstanceProcAddr.?);
     const instance: vk.InstanceProxy = .init(instance_handle, instance_dispatch);
 
     var window_surface: vk.SurfaceKHR = undefined;
@@ -42,7 +47,7 @@ pub fn init(
 
     const device_handle = try createLogicalDevice(physical_device, instance_dispatch.*, families);
     const device_dispatch = try arena.create(vk.DeviceWrapper);
-    device_dispatch.* = vk.DeviceWrapper.load(device_handle, instance_dispatch.dispatch.vkGetDeviceProcAddr.?);
+    device_dispatch.* = .load(device_handle, instance_dispatch.dispatch.vkGetDeviceProcAddr.?);
     const device: vk.DeviceProxy = .init(device_handle, device_dispatch);
 
     const queues: Queues = .init(families, device);
@@ -93,7 +98,7 @@ pub fn init(
 
     const push_range: vk.PushConstantRange = .{
         .offset = 0,
-        .size = @sizeOf(vk_engine.GPUDrawPushConstants),
+        .size = @sizeOf(GPUDrawPushConstants),
         .stage_flags = .{ .vertex_bit = true, .fragment_bit = true },
     };
     const bindless_pipeline_layout = try device.createPipelineLayout(&.{
@@ -230,7 +235,6 @@ pub const BindlessDescriptors = struct {
         const pool_sizes = [_]vk.DescriptorPoolSize{
             .{ .type = .combined_image_sampler, .descriptor_count = max_textures },
         };
-
         const pool = try device.createDescriptorPool(&.{
             .flags = .{ .update_after_bind_bit = true },
             .max_sets = 1,
@@ -238,16 +242,13 @@ pub const BindlessDescriptors = struct {
             .p_pool_sizes = &pool_sizes,
         }, null);
 
-        const bindings = [_]vk.DescriptorSetLayoutBinding{
-            .{
-                .binding = 0,
-                .descriptor_type = .combined_image_sampler,
-                .descriptor_count = max_textures,
-                .stage_flags = .{ .fragment_bit = true },
-                .p_immutable_samplers = null,
-            },
-        };
-
+        const bindings = [_]vk.DescriptorSetLayoutBinding{.{
+            .binding = 0,
+            .descriptor_type = .combined_image_sampler,
+            .descriptor_count = max_textures,
+            .stage_flags = .{ .fragment_bit = true },
+            .p_immutable_samplers = null,
+        }};
         const binding_flags = [_]vk.DescriptorBindingFlags{
             .{ .partially_bound_bit = true, .update_after_bind_bit = true },
         };
@@ -255,7 +256,6 @@ pub const BindlessDescriptors = struct {
             .binding_count = binding_flags.len,
             .p_binding_flags = &binding_flags,
         };
-
         const layout = try device.createDescriptorSetLayout(&.{
             .p_next = &flags_info,
             .flags = .{ .update_after_bind_pool_bit = true },
@@ -268,7 +268,6 @@ pub const BindlessDescriptors = struct {
             .descriptor_set_count = 1,
             .p_set_layouts = &.{layout},
         };
-
         var set: vk.DescriptorSet = undefined;
         try device.allocateDescriptorSets(&alloc_info, (&set)[0..1]);
 
@@ -540,7 +539,5 @@ const c = @import("c");
 const std = @import("std");
 const Scratch = @import("scratch_allocator");
 const options = @import("options");
-
-const vk_engine = @import("vk_engine.zig"); // TODO: remove
 
 const Allocator = std.mem.Allocator;
