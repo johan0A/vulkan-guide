@@ -688,7 +688,6 @@ const SwapChain = struct {
     pub const SwapImage = struct {
         handle: vk.Image,
         view: vk.ImageView,
-        render_semaphore: vk.Semaphore,
     };
 
     handle: vk.SwapchainKHR,
@@ -758,7 +757,6 @@ const SwapChain = struct {
         for (images, swap_images) |image, *swapchain_image| {
             swapchain_image.* = .{
                 .handle = image,
-                .render_semaphore = try gc.device.createSemaphore(&.{}, null),
                 .view = try gc.device.createImageView(&.{
                     .image = image,
                     .view_type = .@"2d",
@@ -788,7 +786,6 @@ const SwapChain = struct {
         device.destroySwapchainKHR(self.handle, null);
         for (self.images) |image| {
             device.destroyImageView(image.view, null);
-            device.destroySemaphore(image.render_semaphore, null);
         }
         gpa.free(self.images);
     }
@@ -799,7 +796,8 @@ const FrameData = struct {
     const max_draws = 65536;
 
     swapchain_semaphore: vk.Semaphore,
-    render_fence: vk.Fence,
+    render_semaphore: vk.Semaphore,
+    graphics_timeline_value: u64,
 
     command_pool: vk.CommandPool,
     main_command_buffer: vk.CommandBuffer,
@@ -864,10 +862,16 @@ pub const Engine = struct {
 
         const device = self.graphics_ctx.device;
 
-        const wait_fence = tracy.zoneEx(@src(), .{ .name = "wait_fence" });
-        const wait_result = try device.waitForFences(&.{self.currentFrame().render_fence}, .true, 1e9);
-        if (wait_result == .timeout) return error.FenceTimeout;
-        wait_fence.end();
+        {
+            const wait_fence = tracy.zoneEx(@src(), .{ .name = "wait_fence" });
+            defer wait_fence.end();
+            const wait_result = try device.waitSemaphores(&.{
+                .semaphore_count = 1,
+                .p_semaphores = &.{self.graphics_ctx.queues.graphics_timeline},
+                .p_values = &.{self.currentFrame().graphics_timeline_value},
+            }, 1e9);
+            if (wait_result == .timeout) return error.FenceTimeout;
+        }
 
         self.currentFrame().deletion_queue.flush(.{ .device = device, .vma_allocator = self.graphics_ctx.vma_allocator });
 
@@ -883,8 +887,6 @@ pub const Engine = struct {
             },
             else => |e| return e,
         };
-
-        _ = try device.resetFences(&.{self.currentFrame().render_fence});
 
         const swapchain_image_index = acquire_next_image_result.image_index;
         const current_swap_image = self.swapchain.images[swapchain_image_index];
@@ -921,21 +923,35 @@ pub const Engine = struct {
         //we want to wait on the _presentSemaphore, as that semaphore is signaled when the swapchain is ready
         //we will signal the _renderSemaphore, to signal that rendering has finished
         {
+            self.graphics_ctx.queues.graphics_timeline_value += 1;
+            self.currentFrame().graphics_timeline_value = self.graphics_ctx.queues.graphics_timeline_value;
+
             const cmd_info: vk.CommandBufferSubmitInfo = vk_init.commandBufferSubmitInfo(cmd);
             const wait_info: vk.SemaphoreSubmitInfo = vk_init.semaphoreSubmitInfo(.{ .color_attachment_output_bit = true }, self.currentFrame().swapchain_semaphore);
-            const signal_info: vk.SemaphoreSubmitInfo = vk_init.semaphoreSubmitInfo(.{ .all_graphics_bit = true }, current_swap_image.render_semaphore);
+            const signal_render: vk.SemaphoreSubmitInfo = vk_init.semaphoreSubmitInfo(.{ .all_graphics_bit = true }, self.currentFrame().render_semaphore);
+            const signal_timeline: vk.SemaphoreSubmitInfo = .{
+                .semaphore = self.graphics_ctx.queues.graphics_timeline,
+                .value = self.currentFrame().graphics_timeline_value,
+                .stage_mask = .{ .all_graphics_bit = true },
+                .device_index = 0,
+            };
 
-            const submit_info = vk_init.submitInfo(&cmd_info, &signal_info, &wait_info);
+            const submit_info: vk.SubmitInfo2 = .{
+                .command_buffer_info_count = 1,
+                .p_command_buffer_infos = (&cmd_info)[0..1],
+                .wait_semaphore_info_count = 1,
+                .p_wait_semaphore_infos = (&wait_info)[0..1],
+                .signal_semaphore_info_count = 2,
+                .p_signal_semaphore_infos = &.{ signal_render, signal_timeline },
+            };
 
-            //submit command buffer to the queue and execute it.
-            // _render_fence will now block until the graphic commands finish execution
-            try device.queueSubmit2(self.graphics_ctx.queues.graphics, &.{submit_info}, self.currentFrame().render_fence);
+            try device.queueSubmit2(self.graphics_ctx.queues.graphics, &.{submit_info}, .null_handle);
         }
 
         const present_info: vk.PresentInfoKHR = .{
             .p_swapchains = (&self.swapchain.handle)[0..1],
             .swapchain_count = 1,
-            .p_wait_semaphores = (&current_swap_image.render_semaphore)[0..1],
+            .p_wait_semaphores = (&self.currentFrame().render_semaphore)[0..1],
             .wait_semaphore_count = 1,
             .p_image_indices = (&swapchain_image_index)[0..1],
         };
@@ -1002,7 +1018,6 @@ pub const Engine = struct {
             .flags = .{ .reset_command_buffer_bit = true },
             .queue_family_index = gc.queues.families.graphics,
         };
-        const fence_create_info: vk.FenceCreateInfo = .{ .flags = .{ .signaled_bit = true } };
         var main_deletion_queue: DeletionQueue = .init;
 
         var frames: [FrameData.frame_overlap]FrameData = undefined;
@@ -1019,8 +1034,9 @@ pub const Engine = struct {
 
             frame.* = .{
                 .command_pool = command_pool,
-                .render_fence = try gc.device.createFence(&fence_create_info, null),
+                .render_semaphore = try gc.device.createSemaphore(&.{}, null),
                 .swapchain_semaphore = try gc.device.createSemaphore(&.{}, null),
+                .graphics_timeline_value = 0,
                 .main_command_buffer = main_command_buffer,
                 .deletion_queue = .init,
                 .indirect_buffer = try .create(
@@ -1526,9 +1542,8 @@ pub const Engine = struct {
 
         for (0..self.frames.len) |i| {
             device.destroyCommandPool(self.frames[i].command_pool, null);
-
-            device.destroyFence(self.frames[i].render_fence, null);
             device.destroySemaphore(self.frames[i].swapchain_semaphore, null);
+            device.destroySemaphore(self.frames[i].render_semaphore, null);
 
             self.frames[i].indirect_buffer.destroy(self.graphics_ctx.vma_allocator);
 

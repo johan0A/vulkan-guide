@@ -50,7 +50,7 @@ pub fn init(
     device_dispatch.* = .load(device_handle, instance_dispatch.dispatch.vkGetDeviceProcAddr.?);
     const device: vk.DeviceProxy = .init(device_handle, device_dispatch);
 
-    const queues: Queues = .init(families, device);
+    const queues: Queues = try .init(families, device);
 
     const debug_callback = struct {
         fn debugCallback(
@@ -129,9 +129,11 @@ pub fn init(
 }
 
 pub fn deinit(self: *GraphicsCtx, gpa: Allocator) void {
+    // TODO: figure out order
     self.device.deviceWaitIdle() catch {};
     self.device.destroyPipelineLayout(self.bindless_pipeline_layout, null);
     self.bindless_descriptors.deinit(gpa, self.device);
+    self.queues.deinit(self.device);
     self.imm.deinit(self.device);
     c.vmaDestroyAllocator(self.vma_allocator);
     self.device.destroyDevice(null);
@@ -191,6 +193,14 @@ pub const Queues = struct {
     compute: vk.Queue,
     transfer: vk.Queue,
 
+    graphics_timeline: vk.Semaphore,
+    compute_timeline: vk.Semaphore,
+    transfer_timeline: vk.Semaphore,
+
+    graphics_timeline_value: u64 = 0,
+    compute_timeline_value: u64 = 0,
+    transfer_timeline_value: u64 = 0,
+
     pub const Families = struct {
         graphics: u32,
         present: u32,
@@ -210,14 +220,28 @@ pub const Queues = struct {
         }
     };
 
-    pub fn init(families: Families, device: vk.DeviceProxy) Queues {
+    pub fn init(families: Families, device: vk.DeviceProxy) !Queues {
+        const semaphore_info: vk.SemaphoreTypeCreateInfo = .{
+            .semaphore_type = .timeline,
+            .initial_value = 0,
+        };
+
         return .{
             .families = families,
             .graphics = device.getDeviceQueue(families.graphics, 0),
             .present = device.getDeviceQueue(families.present, 0),
             .compute = device.getDeviceQueue(families.compute, 0),
             .transfer = device.getDeviceQueue(families.transfer, 0),
+            .graphics_timeline = try device.createSemaphore(&.{ .p_next = &semaphore_info }, null),
+            .compute_timeline = try device.createSemaphore(&.{ .p_next = &semaphore_info }, null),
+            .transfer_timeline = try device.createSemaphore(&.{ .p_next = &semaphore_info }, null),
         };
+    }
+
+    pub fn deinit(self: Queues, device: vk.DeviceProxy) void {
+        device.destroySemaphore(self.graphics_timeline, null);
+        device.destroySemaphore(self.compute_timeline, null);
+        device.destroySemaphore(self.transfer_timeline, null);
     }
 };
 
@@ -414,6 +438,7 @@ pub fn createLogicalDevice(
         .descriptor_binding_sampled_image_update_after_bind = .true,
         .descriptor_binding_storage_buffer_update_after_bind = .true,
         .scalar_block_layout = .true,
+        .timeline_semaphore = .true,
     };
     const device_features_vk11: vk.PhysicalDeviceVulkan11Features = .{
         .p_next = &device_features_vk12,
