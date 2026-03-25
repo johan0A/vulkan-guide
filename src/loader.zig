@@ -101,11 +101,9 @@ pub fn loadGltf(
 
     // create buffer to hold the material data
     scene.material_data_buffer = try .create(
-        graphics_ctx.vma_allocator,
+        graphics_ctx,
         @sizeOf(vk_engine.GltfMetallicRoughness.GPUMaterialData) * gltf.data.materials.len,
-        .{ .uniform_buffer_bit = true },
-        .cpu_to_gpu,
-        .sequential_write,
+        .{ .usage = .{ .uniform_buffer_bit = true }, .access = .cpu_gpu },
     );
 
     for (gltf.data.materials) |material| {
@@ -248,7 +246,7 @@ pub fn loadGltf(
             try new_mesh.surfaces.append(gpa, new_surface);
         }
 
-        new_mesh.mesh = mesh_buffers.upload(vertices.items, indices.items);
+        new_mesh.mesh = try mesh_buffers.upload(graphics_ctx, vertices.items, indices.items);
     }
 
     // load all nodes and their meshes

@@ -49,8 +49,8 @@ const Camera = struct {
 };
 
 pub const MeshBuffers = struct {
-    vertex_buffer: VmaGpuBuffer,
-    index_buffer: VmaGpuBuffer,
+    vertex_buffer: GpuBuffer,
+    index_buffer: GpuBuffer,
 
     next_vertex: u32,
     next_index: u32,
@@ -61,37 +61,38 @@ pub const MeshBuffers = struct {
         vertex_offset: u32,
     };
 
-    pub fn init(allocator: c.VmaAllocator, len: usize) !MeshBuffers {
-        const vertex_buffer: VmaGpuBuffer = try .create(
-            allocator,
+    pub fn init(gc: *const GraphicsCtx, len: usize) !MeshBuffers {
+        const vertex_buffer: GpuBuffer = try .create(
+            gc,
             len * @sizeOf(Vertex),
-            .{ .storage_buffer_bit = true, .shader_device_address_bit = true },
-            .auto,
-            .sequential_write,
+            .{ .usage = .{ .storage_buffer_bit = true, .shader_device_address_bit = true }, .access = .cpu_gpu },
         );
 
         return .{
             .vertex_buffer = vertex_buffer,
             .index_buffer = try .create(
-                allocator,
+                gc,
                 len * @sizeOf(u32),
-                .{ .storage_buffer_bit = true, .index_buffer_bit = true },
-                .auto,
-                .sequential_write,
+                .{ .usage = .{ .storage_buffer_bit = true, .index_buffer_bit = true }, .access = .cpu_gpu },
             ),
             .next_vertex = 0,
             .next_index = 0,
         };
     }
 
-    pub fn upload(self: *MeshBuffers, vertices: []const Vertex, indices: []const u32) MeshEntry {
+    pub fn upload(self: *MeshBuffers, gc: *const GraphicsCtx, vertices: []const Vertex, indices: []const u32) !MeshEntry {
         const entry: MeshEntry = .{
             .index_count = @intCast(indices.len),
             .index_offset = self.next_index,
             .vertex_offset = @intCast(self.next_vertex),
         };
-        @memcpy(self.vertex_buffer.getMappedSlice(Vertex)[self.next_vertex..][0..vertices.len], vertices);
-        @memcpy(self.index_buffer.getMappedSlice(u32)[self.next_index..][0..indices.len], indices);
+        const vertex_buffer = try self.vertex_buffer.map(gc, Vertex);
+        defer self.vertex_buffer.unmap(gc);
+        const index_buffer = try self.index_buffer.map(gc, u32);
+        defer self.index_buffer.unmap(gc);
+
+        @memcpy(vertex_buffer[self.next_vertex..][0..vertices.len], vertices);
+        @memcpy(index_buffer[self.next_index..][0..indices.len], indices);
         self.next_vertex += @intCast(vertices.len);
         self.next_index += @intCast(indices.len);
         return entry;
@@ -123,7 +124,7 @@ pub const scene = struct {
 
         samplers: std.ArrayListUnmanaged(vk.Sampler),
 
-        material_data_buffer: VmaGpuBuffer,
+        material_data_buffer: GpuBuffer,
     };
 
     pub const Node = struct {
@@ -178,7 +179,7 @@ pub const scene = struct {
             self.children.deinit(gpa);
 
             if (self.gltf) |gltf| {
-                gltf.material_data_buffer.destroy(engine.graphics_ctx.vma_allocator);
+                gltf.material_data_buffer.deinit(&engine.graphics_ctx);
 
                 var mesh_it = gltf.meshes.valueIterator();
                 while (mesh_it.next()) |mesh| {
@@ -249,31 +250,30 @@ pub const GltfMetallicRoughness = struct {
     };
 
     pub const MaterialsBuffer = struct {
-        gpu_buffer: VmaGpuBuffer,
+        gpu_buffer: GpuBuffer,
         capacity: u32,
         len: u32,
 
-        fn init(max_len: u32, allocator: c.VmaAllocator) !MaterialsBuffer {
+        fn init(max_len: u32, gc: *const GraphicsCtx) !MaterialsBuffer {
             return .{
                 .gpu_buffer = try .create(
-                    allocator,
+                    gc,
                     max_len * @sizeOf(GPUMaterialData),
-                    .{ .storage_buffer_bit = true, .shader_device_address_bit = true },
-                    .auto,
-                    .sequential_write,
+                    .{ .usage = .{ .storage_buffer_bit = true, .shader_device_address_bit = true }, .access = .cpu_gpu },
                 ),
                 .capacity = max_len,
                 .len = 0,
             };
         }
 
-        fn deinit(self: MaterialsBuffer, allocator: c.VmaAllocator) void {
-            self.gpu_buffer.destroy(allocator);
+        fn deinit(self: MaterialsBuffer, gc: *const GraphicsCtx) void {
+            self.gpu_buffer.deinit(gc);
         }
 
-        fn append(self: *MaterialsBuffer, item: GPUMaterialData) u32 {
+        fn append(self: *MaterialsBuffer, gc: *const GraphicsCtx, item: GPUMaterialData) !u32 {
             std.debug.assert(self.len < self.capacity);
-            self.gpu_buffer.getMappedSlice(GPUMaterialData)[self.len] = item;
+            (try self.gpu_buffer.map(gc, GPUMaterialData))[self.len] = item;
+            self.gpu_buffer.unmap(gc);
             defer self.len += 1;
             return self.len;
         }
@@ -352,7 +352,7 @@ pub const GltfMetallicRoughness = struct {
             resources.metal_rough_sampler,
         );
 
-        const bindless_index = materials_buffer.append(.{
+        const bindless_index = try materials_buffer.append(gc, .{
             .color_factors = resources.color_factors,
             .metal_rough_factors = resources.metal_rough_factors,
             .color_texture = color_tex_index,
@@ -371,105 +371,6 @@ const ShaderData = struct {
     ptr: [*]const u32,
     /// in bytes
     size: usize,
-};
-
-pub const VmaGpuBuffer = struct {
-    buffer: vk.Buffer,
-    size: usize,
-    allocation: c.VmaAllocation,
-    mapped: ?[*]u8,
-
-    pub const MemoryUsage = enum(c_uint) {
-        unknown = 0,
-        gpu_only = 1,
-        cpu_only = 2,
-        cpu_to_gpu = 3,
-        gpu_to_cpu = 4,
-        cpu_copy = 5,
-        gpu_lazily_allocated = 6,
-        auto = 7,
-        auto_prefer_device = 8,
-        auto_prefer_host = 9,
-    };
-
-    pub const HostAccess = enum(c_uint) {
-        /// GPU-only, no host access needed
-        none = 0,
-        /// CPU writes, GPU reads (uniforms, dynamic vertex data, staging)
-        sequential_write = c.VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
-        /// CPU readback or random access writes
-        random = c.VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
-    };
-
-    pub fn create(
-        allocator: c.VmaAllocator,
-        size: usize,
-        usage: vk.BufferUsageFlags,
-        memory_usage: MemoryUsage,
-        host_access: HostAccess,
-    ) !VmaGpuBuffer {
-        const buffer_info: vk.BufferCreateInfo = .{
-            .usage = usage,
-            .size = size,
-            .sharing_mode = .exclusive,
-        };
-
-        const host_flags: c_uint = @intFromEnum(host_access);
-        const mapped_flag: c_uint = if (host_access != .none) c.VMA_ALLOCATION_CREATE_MAPPED_BIT else 0;
-
-        const vma_alloc_info: c.VmaAllocationCreateInfo = .{
-            .usage = @intFromEnum(memory_usage),
-            .flags = host_flags | mapped_flag,
-        };
-
-        var info: c.VmaAllocationInfo = undefined;
-        var new_buffer: VmaGpuBuffer = undefined;
-        new_buffer.size = size;
-
-        const result: vk.Result = @enumFromInt(c.vmaCreateBuffer(
-            allocator,
-            @ptrCast(&buffer_info),
-            &vma_alloc_info,
-            @ptrCast(&new_buffer.buffer),
-            &new_buffer.allocation,
-            &info,
-        ));
-
-        if (result != .success) {
-            std.log.err("vma allocation: error {s}\n", .{@tagName(result)});
-            return error.vma_allocation_failed;
-        }
-
-        new_buffer.mapped = @ptrCast(info.pMappedData);
-        return new_buffer;
-    }
-
-    pub fn destroy(self: VmaGpuBuffer, allocator: c.VmaAllocator) void {
-        c.vmaDestroyBuffer(allocator, @ptrFromInt(@intFromEnum(self.buffer)), self.allocation);
-    }
-
-    /// Returns the persistently mapped memory as a typed slice.
-    pub fn getMappedSlice(self: VmaGpuBuffer, comptime T: type) []T {
-        switch (@typeInfo(T)) {
-            inline .@"struct", .@"union" => |info| switch (info.layout) {
-                .@"extern", .@"packed" => {},
-                .auto => @compileError("T must have a well-defined memory layout (extern or packed)"),
-            },
-            .int, .float => {},
-            .pointer => |info| switch (info.size) {
-                .one, .many, .c => {},
-                .slice => @compileError("T must have a well-defined memory layout"),
-            },
-            else => @compileError("unsupported type for buffer mapping"),
-        }
-        std.debug.assert(self.size % @sizeOf(T) == 0);
-        const ptr: [*]T = @ptrCast(@alignCast(self.mapped orelse std.debug.panic("getMappedSlice called on unmappable buffer", .{})));
-        return ptr[0 .. self.size / @sizeOf(T)];
-    }
-
-    pub fn getDeviceAddress(self: VmaGpuBuffer, device: vk.DeviceProxy) vk.DeviceAddress {
-        return device.getBufferDeviceAddress(&.{ .buffer = self.buffer });
-    }
 };
 
 pub const Vertex = extern struct {
@@ -632,6 +533,7 @@ const DeletionQueue = struct {
     const DeinitContext = struct {
         device: vk.DeviceProxy,
         vma_allocator: ?c.VmaAllocator,
+        gc: ?*const GraphicsCtx,
     };
 
     const QueueItem = union(enum) {
@@ -643,7 +545,7 @@ const DeletionQueue = struct {
         command_pool: vk.CommandPool,
         fence: vk.Fence,
         descriptor_pool: vk.DescriptorPool,
-        allocated_buffer: VmaGpuBuffer,
+        allocated_buffer: GpuBuffer,
         sampler: vk.Sampler,
 
         fn deinit(self: QueueItem, context: DeinitContext) void {
@@ -659,7 +561,7 @@ const DeletionQueue = struct {
                 .command_pool => |item| context.device.destroyCommandPool(item, null),
                 .fence => |item| context.device.destroyFence(item, null),
                 .descriptor_pool => |item| context.device.destroyDescriptorPool(item, null),
-                .allocated_buffer => |item| item.destroy(context.vma_allocator.?),
+                .allocated_buffer => |item| item.deinit(context.gc.?),
                 .sampler => |item| context.device.destroySampler(item, null),
             }
         }
@@ -802,7 +704,7 @@ const FrameData = struct {
     command_pool: vk.CommandPool,
     main_command_buffer: vk.CommandBuffer,
 
-    indirect_buffer: VmaGpuBuffer,
+    indirect_buffer: GpuBuffer,
 
     deletion_queue: DeletionQueue,
 };
@@ -828,9 +730,9 @@ pub const Engine = struct {
 
     materials_buffer: GltfMetallicRoughness.MaterialsBuffer,
     mesh_buffers: MeshBuffers,
-    draw_data_buffer: VmaGpuBuffer,
+    draw_data_buffer: GpuBuffer,
 
-    scene_data_buffer: VmaGpuBuffer,
+    scene_data_buffer: GpuBuffer,
     scene_data_adress: vk.DeviceAddress,
 
     // default images
@@ -873,7 +775,11 @@ pub const Engine = struct {
             if (wait_result == .timeout) return error.FenceTimeout;
         }
 
-        self.currentFrame().deletion_queue.flush(.{ .device = device, .vma_allocator = self.graphics_ctx.vma_allocator });
+        self.currentFrame().deletion_queue.flush(.{
+            .gc = &self.graphics_ctx,
+            .device = device,
+            .vma_allocator = self.graphics_ctx.vma_allocator,
+        });
 
         const acquire_next_image_result = device.acquireNextImageKHR(
             self.swapchain.handle,
@@ -1040,11 +946,9 @@ pub const Engine = struct {
                 .main_command_buffer = main_command_buffer,
                 .deletion_queue = .init,
                 .indirect_buffer = try .create(
-                    gc.vma_allocator,
+                    &gc,
                     FrameData.max_draws * @sizeOf(vk.DrawIndexedIndirectCommand),
-                    .{ .indirect_buffer_bit = true, .storage_buffer_bit = true },
-                    .cpu_to_gpu,
-                    .sequential_write,
+                    .{ .usage = .{ .indirect_buffer_bit = true, .storage_buffer_bit = true }, .access = .cpu_gpu },
                 ),
             };
         }
@@ -1275,22 +1179,18 @@ pub const Engine = struct {
         const default_sampler_linear = try gc.device.createSampler(&sampler_create_info, null);
         try main_deletion_queue.append(gpa, .{ .sampler = default_sampler_linear });
 
-        var materials_buffer: GltfMetallicRoughness.MaterialsBuffer = try .init(1024, gc.vma_allocator);
+        var materials_buffer: GltfMetallicRoughness.MaterialsBuffer = try .init(1024, &gc);
 
-        const scene_data_buffer: VmaGpuBuffer = try .create(
-            gc.vma_allocator,
+        const scene_data_buffer: GpuBuffer = try .create(
+            &gc,
             FrameData.frame_overlap * @sizeOf(GPUSceneData),
-            .{ .storage_buffer_bit = true, .shader_device_address_bit = true },
-            .auto,
-            .sequential_write,
+            .{ .usage = .{ .storage_buffer_bit = true, .shader_device_address_bit = true }, .access = .cpu_gpu },
         );
 
-        const draw_data_buffer: VmaGpuBuffer = try .create(
-            gc.vma_allocator,
+        const draw_data_buffer: GpuBuffer = try .create(
+            &gc,
             FrameData.max_draws * FrameData.frame_overlap * @sizeOf(GPUDrawData),
-            .{ .storage_buffer_bit = true, .shader_device_address_bit = true },
-            .cpu_to_gpu,
-            .sequential_write,
+            .{ .usage = .{ .storage_buffer_bit = true, .shader_device_address_bit = true }, .access = .cpu_gpu },
         );
 
         var material_resources: GltfMetallicRoughness.MaterialResources = .{
@@ -1312,7 +1212,7 @@ pub const Engine = struct {
 
         //}
 
-        var mesh_buffers: MeshBuffers = try .init(gc.vma_allocator, 64 * 1024 * 1024);
+        var mesh_buffers: MeshBuffers = try .init(&gc, 64 * 1024 * 1024);
 
         const structure_path = options.assets_path ++ "/structure.glb";
         const structure_file = try loader.loadGltf(
@@ -1437,16 +1337,11 @@ pub const Engine = struct {
 
     pub fn createAndUploadImage(gc: *const GraphicsCtx, data: *const anyopaque, size: vk.Extent3D, format: vk.Format, usage: vk.ImageUsageFlags, mipmapped: bool) !AllocatedImage {
         const data_size: usize = size.depth * size.width * size.height * 4;
-        const upload_buffer: VmaGpuBuffer = try .create(
-            gc.vma_allocator,
-            data_size,
-            .{ .transfer_src_bit = true },
-            .cpu_to_gpu,
-            .sequential_write,
-        );
+        const upload_buffer: GpuBuffer = try .create(gc, data_size, .{ .access = .cpu });
 
-        const map = upload_buffer.getMappedSlice(u8);
+        const map = try upload_buffer.map(gc, u8);
         @memcpy(map, @as([*]const u8, @ptrCast(data)));
+        upload_buffer.unmap(gc);
 
         var new_usage = usage;
         new_usage.transfer_dst_bit = true;
@@ -1483,7 +1378,7 @@ pub const Engine = struct {
             try immediateModeEnd(gc.device, gc.imm.fence, gc.imm.cmd, gc.queues.graphics);
         }
 
-        upload_buffer.destroy(gc.vma_allocator);
+        upload_buffer.deinit(gc);
         return new_image;
     }
 
@@ -1545,9 +1440,10 @@ pub const Engine = struct {
             device.destroySemaphore(self.frames[i].swapchain_semaphore, null);
             device.destroySemaphore(self.frames[i].render_semaphore, null);
 
-            self.frames[i].indirect_buffer.destroy(self.graphics_ctx.vma_allocator);
+            self.frames[i].indirect_buffer.deinit(&self.graphics_ctx);
 
             self.frames[i].deletion_queue.deinit(gpa, .{
+                .gc = &self.graphics_ctx,
                 .device = device,
                 .vma_allocator = self.graphics_ctx.vma_allocator,
             });
@@ -1561,11 +1457,11 @@ pub const Engine = struct {
 
         self.metal_rough_material.deinit(device);
 
-        self.mesh_buffers.vertex_buffer.destroy(self.graphics_ctx.vma_allocator);
-        self.mesh_buffers.index_buffer.destroy(self.graphics_ctx.vma_allocator);
-        self.materials_buffer.deinit(self.graphics_ctx.vma_allocator);
-        self.scene_data_buffer.destroy(self.graphics_ctx.vma_allocator);
-        self.draw_data_buffer.destroy(self.graphics_ctx.vma_allocator);
+        self.mesh_buffers.vertex_buffer.deinit(&self.graphics_ctx);
+        self.mesh_buffers.index_buffer.deinit(&self.graphics_ctx);
+        self.materials_buffer.deinit(&self.graphics_ctx);
+        self.scene_data_buffer.deinit(&self.graphics_ctx);
+        self.draw_data_buffer.deinit(&self.graphics_ctx);
 
         self.destroyImage(&self.draw_image);
         self.destroyImage(&self.depth_image);
@@ -1573,6 +1469,7 @@ pub const Engine = struct {
         c.cImGui_ImplVulkan_Shutdown();
 
         self.main_deletion_queue.deinit(gpa, .{
+            .gc = &self.graphics_ctx,
             .device = device,
             .vma_allocator = self.graphics_ctx.vma_allocator,
         });
@@ -1660,7 +1557,8 @@ pub const Engine = struct {
         const frame_index = self.currentFrameIndex();
         const frame = &self.frames[frame_index];
 
-        self.scene_data_buffer.getMappedSlice(GPUSceneData)[frame_index] = self.scene_data;
+        (try self.scene_data_buffer.map(&self.graphics_ctx, GPUSceneData))[frame_index] = self.scene_data;
+        self.scene_data_buffer.unmap(&self.graphics_ctx);
 
         const opaque_surfaces = self.main_draw_context.opaque_surfaces.items;
         const transparent_surfaces = self.main_draw_context.transparent_surfaces.items;
@@ -1677,23 +1575,27 @@ pub const Engine = struct {
             }
         }.lessThan);
 
-        const commands = frame.indirect_buffer.getMappedSlice(vk.DrawIndexedIndirectCommand);
+        {
+            const commands = try frame.indirect_buffer.map(&self.graphics_ctx, vk.DrawIndexedIndirectCommand);
+            defer frame.indirect_buffer.unmap(&self.graphics_ctx);
 
-        const base_offset = frame_index * FrameData.max_draws;
-        const draw_data = self.draw_data_buffer.getMappedSlice(GPUDrawData);
+            const base_offset = frame_index * FrameData.max_draws;
+            const draw_data = try self.draw_data_buffer.map(&self.graphics_ctx, GPUDrawData);
+            defer self.draw_data_buffer.unmap(&self.graphics_ctx);
 
-        for (all_surfaces, 0..) |surface, i| {
-            commands[i] = .{
-                .index_count = surface.mesh_entry.index_count,
-                .instance_count = 1,
-                .first_index = surface.mesh_entry.index_offset,
-                .vertex_offset = @intCast(surface.mesh_entry.vertex_offset),
-                .first_instance = @intCast(base_offset + i),
-            };
-            draw_data[base_offset + i] = .{
-                .world_matrix = surface.transform,
-                .material_index = surface.material.?.bindless_index,
-            };
+            for (all_surfaces, 0..) |surface, i| {
+                commands[i] = .{
+                    .index_count = surface.mesh_entry.index_count,
+                    .instance_count = 1,
+                    .first_index = surface.mesh_entry.index_offset,
+                    .vertex_offset = @intCast(surface.mesh_entry.vertex_offset),
+                    .first_instance = @intCast(base_offset + i),
+                };
+                draw_data[base_offset + i] = .{
+                    .world_matrix = surface.transform,
+                    .material_index = surface.material.?.bindless_index,
+                };
+            }
         }
 
         const Batch = struct { pipeline: vk.Pipeline, offset: u32, count: u32 };
@@ -2025,6 +1927,138 @@ fn loadShader(gpa: Allocator, io: std.Io, file_path: []const u8) !ShaderData {
     const data = try std.Io.Dir.cwd().readFileAllocOptions(io, file_path, gpa, .unlimited, .of(u32), null);
     return .{ .ptr = @ptrCast(data.ptr), .size = data.len };
 }
+
+const GpuBuffer = struct {
+    buffer: vk.Buffer,
+    // memory: vk.DeviceMemory,
+    allocation: c.VmaAllocation,
+    size: usize,
+
+    const Config = struct {
+        pub const Access = enum {
+            gpu,
+            cpu,
+            cpu_gpu,
+        };
+
+        usage: vk.BufferUsageFlags = .{},
+        access: Access = .gpu,
+    };
+
+    pub fn create(gc: *const GraphicsCtx, size: usize, config: Config) !GpuBuffer {
+        const zone = tracy.zone(@src());
+        defer zone.end();
+
+        const usage = config.usage.merge(switch (config.access) {
+            .gpu => .{ .transfer_dst_bit = true },
+            .cpu => .{ .transfer_src_bit = true },
+            .cpu_gpu => .{},
+        });
+
+        // const info: vk.BufferCreateInfo = .{
+        //     .size = size,
+        //     .usage = usage,
+        //     .sharing_mode = .exclusive,
+        // };
+        // const buffer = try gc.device.createBuffer(&info, null);
+        //
+        // const mem_requirements = gc.device.getBufferMemoryRequirements(buffer);
+        //
+        // const properties: vk.MemoryPropertyFlags = switch (config.access) {
+        //     .cpu => .{ .host_visible_bit = true, .host_coherent_bit = true },
+        //     .gpu => .{ .device_local_bit = true },
+        //     .cpu_gpu => .{ .host_visible_bit = true, .host_coherent_bit = true, .device_local_bit = true },
+        // };
+        // const alloc_info: vk.MemoryAllocateInfo = .{
+        //     .allocation_size = mem_requirements.size,
+        //     .memory_type_index = findMemoryType(gc, mem_requirements.memory_type_bits, properties),
+        // };
+        //
+        // const buffer_memory = try gc.device.allocateMemory(&alloc_info, null);
+        // try gc.device.bindBufferMemory(buffer, buffer_memory, 0);
+
+        const buffer_info: c.VkBufferCreateInfo = .{
+            .sType = c.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = size,
+            .usage = @bitCast(usage),
+            .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
+        };
+
+        const alloc_info: c.VmaAllocationCreateInfo = .{
+            .usage = switch (config.access) {
+                .gpu => c.VMA_MEMORY_USAGE_GPU_ONLY,
+                .cpu => c.VMA_MEMORY_USAGE_CPU_ONLY,
+                .cpu_gpu => c.VMA_MEMORY_USAGE_CPU_TO_GPU,
+            },
+            .flags = if (config.access != .gpu) c.VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT else 0,
+        };
+
+        var buffer: c.VkBuffer = undefined;
+        var allocation: c.VmaAllocation = undefined;
+
+        const result = c.vmaCreateBuffer(gc.vma_allocator, &buffer_info, &alloc_info, &buffer, &allocation, null);
+        if (result != c.VK_SUCCESS) return error.VmaAllocationFailed;
+
+        return .{
+            .buffer = @enumFromInt(@intFromPtr(buffer)),
+            // .memory = buffer_memory,
+            .allocation = allocation,
+            .size = size,
+        };
+    }
+
+    pub fn deinit(self: GpuBuffer, gc: *const GraphicsCtx) void {
+        // gc.device.destroyBuffer(self.buffer, null);
+        // gc.device.freeMemory(self.memory, null);
+        c.vmaDestroyBuffer(gc.vma_allocator, @ptrFromInt(@intFromEnum(self.buffer)), self.allocation);
+    }
+
+    // fn findMemoryType(gc: *const GraphicsCtx, type_filter: u32, properties: vk.MemoryPropertyFlags) u32 {
+    //     const zone = tracy.zone(@src());
+    //     defer zone.end();
+    //
+    //     const mem_properties = gc.instance.getPhysicalDeviceMemoryProperties(gc.physical_device);
+    //     for (0..mem_properties.memory_type_count) |i| {
+    //         if ((type_filter & (@as(u32, 1) << @intCast(i))) != 0 and
+    //             (mem_properties.memory_types[i].property_flags.intersect(properties)) == properties)
+    //         {
+    //             return @intCast(i);
+    //         }
+    //     }
+    //     @panic(""); // TODO
+    // }
+
+    pub fn map(self: GpuBuffer, gc: *const GraphicsCtx, comptime T: type) ![]T {
+        switch (@typeInfo(T)) {
+            inline .@"struct", .@"union" => |info| switch (info.layout) {
+                .@"extern", .@"packed" => {},
+                .auto => @compileError("T must have a well-defined memory layout (extern or packed)"),
+            },
+            .int, .float => {},
+            .pointer => |info| switch (info.size) {
+                .one, .many, .c => {},
+                .slice => @compileError("T must have a well-defined memory layout"),
+            },
+            else => @compileError("unsupported type for buffer mapping"),
+        }
+        // const ptr = try device.mapMemory(self.memory, 0, self.size, .{});
+        var raw_ptr: ?*anyopaque = undefined;
+        const result = c.vmaMapMemory(gc.vma_allocator, self.allocation, &raw_ptr);
+        if (result != c.VK_SUCCESS) return error.VmaMapFailed;
+        const ptr = raw_ptr orelse return error.VmaMapFailed;
+        const aligned: [*]T = @ptrCast(@alignCast(ptr));
+        return aligned[0..@divExact(self.size, @sizeOf(T))];
+    }
+
+    fn unmap(self: GpuBuffer, gc: *const GraphicsCtx) void {
+        // device.unmapMemory(self.memory);
+        c.vmaUnmapMemory(gc.vma_allocator, self.allocation);
+    }
+
+    pub fn getDeviceAddress(self: GpuBuffer, device: vk.DeviceProxy) vk.DeviceAddress {
+        return device.getBufferDeviceAddress(&.{ .buffer = self.buffer });
+    }
+};
 
 const std = @import("std");
 
