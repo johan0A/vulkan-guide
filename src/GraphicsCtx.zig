@@ -355,7 +355,7 @@ pub fn createVkInstance(scratch: *Scratch, base_dispatch: vk.BaseWrapper, enable
     const checkpoint = scratch.checkpoint();
     defer scratch.restoreCheckpoint(checkpoint);
 
-    const appinfo = vk.ApplicationInfo{
+    const app_info = vk.ApplicationInfo{
         .p_application_name = "Vulkan Tutorial",
         .application_version = @bitCast(vk.makeApiVersion(1, 0, 0, 0)),
         .p_engine_name = "No Engine",
@@ -379,34 +379,27 @@ pub fn createVkInstance(scratch: *Scratch, base_dispatch: vk.BaseWrapper, enable
         }
     }
 
-    if (enable_validation_layers) try checkValidationLayerSupport(scratch, base_dispatch);
+    if (enable_validation_layers) {
+        const available_layers = try base_dispatch.enumerateInstanceLayerPropertiesAlloc(scratch.allocator());
+        for (validation_layers) |validation_layer| {
+            for (available_layers) |available_layer| {
+                if (std.mem.eql(u8, std.mem.sliceTo(&available_layer.layer_name, 0), validation_layer)) break;
+            } else std.debug.panic("validation layers unsupported", .{});
+        }
+    }
 
     var extensions: std.ArrayList([*:0]const u8) = .empty;
     try extensions.appendSlice(scratch.allocator(), @ptrCast(sdl_required_extensions));
-    try extensions.appendSlice(scratch.allocator(), &.{
-        vk.extensions.ext_debug_utils.name.ptr,
-    });
+    try extensions.appendSlice(scratch.allocator(), &.{vk.extensions.ext_debug_utils.name.ptr});
 
-    const create_info = vk.InstanceCreateInfo{
-        .p_application_info = &appinfo,
+    const create_info: vk.InstanceCreateInfo = .{
+        .p_application_info = &app_info,
         .enabled_extension_count = @intCast(extensions.items.len),
         .pp_enabled_extension_names = @ptrCast(extensions.items),
         .pp_enabled_layer_names = if (enable_validation_layers) @ptrCast(&validation_layers) else null,
         .enabled_layer_count = if (enable_validation_layers) @intCast(validation_layers.len) else 0,
     };
-
     return try base_dispatch.createInstance(&create_info, null);
-}
-
-pub fn checkValidationLayerSupport(scratch: *Scratch, base_dispatch: vk.BaseWrapper) !void {
-    const checkpoint = scratch.checkpoint();
-    defer scratch.restoreCheckpoint(checkpoint);
-    const available_layers = try base_dispatch.enumerateInstanceLayerPropertiesAlloc(scratch.allocator());
-    for (validation_layers) |validation_layer| {
-        for (available_layers) |available_layer| {
-            if (std.mem.eql(u8, std.mem.sliceTo(&available_layer.layer_name, 0), validation_layer)) break;
-        } else return error.NotAllValidationLayersSupported;
-    }
 }
 
 pub fn createLogicalDevice(
@@ -415,14 +408,12 @@ pub fn createLogicalDevice(
     families: Queues.Families,
 ) !vk.Device {
     const unique = families.unique();
-    const queue_priorities: [1]f32 = .{1};
-
     var queue_create_infos: [4]vk.DeviceQueueCreateInfo = undefined;
     for (unique.families[0..unique.len], queue_create_infos[0..unique.len]) |family, *info| {
         info.* = .{
             .queue_family_index = family,
-            .queue_count = queue_priorities.len,
-            .p_queue_priorities = &queue_priorities,
+            .queue_count = 1,
+            .p_queue_priorities = &.{1},
         };
     }
 
@@ -464,49 +455,29 @@ pub fn pickPhysicalDevice(scratch: *Scratch, instance: vk.InstanceProxy, surface
     defer scratch.restoreCheckpoint(checkpoint);
 
     const physical_devices = try instance.enumeratePhysicalDevicesAlloc(scratch.allocator());
-
     if (physical_devices.len == 0) return error.NoPhysicalDeviceFound;
 
-    for (physical_devices) |physical_device| {
-        const is_suitable = blk: {
-            const formats = try instance.getPhysicalDeviceSurfaceFormatsAllocKHR(physical_device, surface, scratch.allocator());
-            const present_modes = try instance.getPhysicalDeviceSurfacePresentModesAllocKHR(physical_device, surface, scratch.allocator());
-            const has_families = (try findQueueFamilies(scratch, physical_device, instance.wrapper.*, surface)) != null;
-            break :blk has_families and
-                try checkDeviceExtensionSupport(physical_device, instance.wrapper.*, scratch) and
-                formats.len > 0 and
-                present_modes.len > 0;
-        };
+    outer: for (physical_devices) |physical_device| {
+        const available_extensions = try instance.enumerateDeviceExtensionPropertiesAlloc(physical_device, null, scratch.allocator());
+        for (required_device_extensions) |required_device_extension| {
+            for (available_extensions) |available_extension| {
+                const name = std.mem.sliceTo(&available_extension.extension_name, 0);
+                const required_name = std.mem.sliceTo(required_device_extension, 0);
+                if (std.mem.eql(u8, name, required_name)) break;
+            } else continue :outer;
+        }
 
-        if (is_suitable) return physical_device;
+        const families = try findQueueFamilies(scratch, physical_device, instance.wrapper.*, surface);
+        if (families == null) continue;
+        const formats = try instance.getPhysicalDeviceSurfaceFormatsAllocKHR(physical_device, surface, scratch.allocator());
+        if (formats.len == 0) continue;
+        const present_modes = try instance.getPhysicalDeviceSurfacePresentModesAllocKHR(physical_device, surface, scratch.allocator());
+        if (present_modes.len == 0) continue;
+
+        return physical_device;
     }
 
     return error.NoSuitablePhysicalDeviceFound;
-}
-
-pub fn checkDeviceExtensionSupport(
-    physical_device: vk.PhysicalDevice,
-    instance_dispatch: vk.InstanceWrapper,
-    scratch: *Scratch,
-) !bool {
-    const checkpoint = scratch.checkpoint();
-    defer scratch.restoreCheckpoint(checkpoint);
-
-    const available_extensions = try instance_dispatch.enumerateDeviceExtensionPropertiesAlloc(physical_device, null, scratch.allocator());
-
-    for (required_device_extensions) |required_device_extension| {
-        for (available_extensions) |available_extension| {
-            if (std.mem.eql(
-                u8,
-                std.mem.sliceTo(&available_extension.extension_name, 0),
-                std.mem.sliceTo(required_device_extension, 0),
-            )) break;
-        } else {
-            return false;
-        }
-    }
-
-    return true;
 }
 
 pub fn findQueueFamilies(
