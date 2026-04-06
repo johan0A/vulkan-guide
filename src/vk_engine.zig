@@ -590,6 +590,7 @@ const SwapChain = struct {
     pub const SwapImage = struct {
         handle: vk.Image,
         view: vk.ImageView,
+        render_semaphore: vk.Semaphore,
     };
 
     handle: vk.SwapchainKHR,
@@ -619,13 +620,30 @@ const SwapChain = struct {
         };
 
         const surface_capabilities = try gc.instance.getPhysicalDeviceSurfaceCapabilitiesKHR(gc.physical_device, gc.window_surface);
-        const min_image_count = @min(surface_capabilities.min_image_count, 3);
+        const max_image_count = if (surface_capabilities.max_image_count != 0) surface_capabilities.max_image_count else std.math.maxInt(u32);
+        const min_image_count = @min(@max(surface_capabilities.min_image_count, FrameData.frame_overlap + 1), max_image_count);
+
+        const supported_present_modes = try gc.instance.getPhysicalDeviceSurfacePresentModesAllocKHR(gc.physical_device, gc.window_surface, scratch.allocator());
+
+        var present_mode_score: u8 = 0;
+        var present_mode: vk.PresentModeKHR = undefined;
+        for (supported_present_modes) |spm| {
+            const score: u8 = switch (spm) {
+                .mailbox_khr => 3,
+                .immediate_khr => 2,
+                else => 1,
+            };
+            if (score > present_mode_score) {
+                present_mode_score = score;
+                present_mode = spm;
+            }
+        }
 
         const swapchain_extent: vk.Extent2D = .{ .width = window_width, .height = window_height };
 
         const concurrent = gc.queues.families.graphics != gc.queues.families.present;
         const family_indices = [_]u32{ gc.queues.families.graphics, gc.queues.families.present };
-        const swapchain_create_info = vk.SwapchainCreateInfoKHR{
+        const swapchain_create_info: vk.SwapchainCreateInfoKHR = .{
             .surface = gc.window_surface,
             .min_image_count = min_image_count,
             .image_format = swapchain_image_format.format,
@@ -638,7 +656,7 @@ const SwapChain = struct {
             .p_queue_family_indices = if (concurrent) &family_indices else null,
             .pre_transform = .{ .identity_bit_khr = true },
             .composite_alpha = .{ .opaque_bit_khr = true },
-            .present_mode = .mailbox_khr,
+            .present_mode = present_mode,
             .clipped = .false,
             .old_swapchain = .null_handle,
         };
@@ -658,6 +676,8 @@ const SwapChain = struct {
 
         for (images, swap_images) |image, *swapchain_image| {
             swapchain_image.* = .{
+                .render_semaphore = try gc.device.createSemaphore(&.{}, null),
+
                 .handle = image,
                 .view = try gc.device.createImageView(&.{
                     .image = image,
@@ -688,6 +708,7 @@ const SwapChain = struct {
         device.destroySwapchainKHR(self.handle, null);
         for (self.images) |image| {
             device.destroyImageView(image.view, null);
+            device.destroySemaphore(image.render_semaphore, null);
         }
         gpa.free(self.images);
     }
@@ -698,7 +719,6 @@ const FrameData = struct {
     const max_draws = 65536;
 
     swapchain_semaphore: vk.Semaphore,
-    render_semaphore: vk.Semaphore,
     graphics_timeline_value: u64,
 
     command_pool: vk.CommandPool,
@@ -834,7 +854,7 @@ pub const Engine = struct {
 
             const cmd_info: vk.CommandBufferSubmitInfo = vk_init.commandBufferSubmitInfo(cmd);
             const wait_info: vk.SemaphoreSubmitInfo = vk_init.semaphoreSubmitInfo(.{ .color_attachment_output_bit = true }, self.currentFrame().swapchain_semaphore);
-            const signal_render: vk.SemaphoreSubmitInfo = vk_init.semaphoreSubmitInfo(.{ .all_graphics_bit = true }, self.currentFrame().render_semaphore);
+            const signal_render: vk.SemaphoreSubmitInfo = vk_init.semaphoreSubmitInfo(.{ .all_graphics_bit = true }, current_swap_image.render_semaphore);
             const signal_timeline: vk.SemaphoreSubmitInfo = .{
                 .semaphore = self.graphics_ctx.queues.graphics_timeline,
                 .value = self.currentFrame().graphics_timeline_value,
@@ -857,7 +877,7 @@ pub const Engine = struct {
         const present_info: vk.PresentInfoKHR = .{
             .p_swapchains = (&self.swapchain.handle)[0..1],
             .swapchain_count = 1,
-            .p_wait_semaphores = (&self.currentFrame().render_semaphore)[0..1],
+            .p_wait_semaphores = (&current_swap_image.render_semaphore)[0..1],
             .wait_semaphore_count = 1,
             .p_image_indices = (&swapchain_image_index)[0..1],
         };
@@ -940,7 +960,6 @@ pub const Engine = struct {
 
             frame.* = .{
                 .command_pool = command_pool,
-                .render_semaphore = try gc.device.createSemaphore(&.{}, null),
                 .swapchain_semaphore = try gc.device.createSemaphore(&.{}, null),
                 .graphics_timeline_value = 0,
                 .main_command_buffer = main_command_buffer,
@@ -1438,7 +1457,6 @@ pub const Engine = struct {
         for (0..self.frames.len) |i| {
             device.destroyCommandPool(self.frames[i].command_pool, null);
             device.destroySemaphore(self.frames[i].swapchain_semaphore, null);
-            device.destroySemaphore(self.frames[i].render_semaphore, null);
 
             self.frames[i].indirect_buffer.deinit(&self.graphics_ctx);
 

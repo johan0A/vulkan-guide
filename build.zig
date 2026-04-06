@@ -138,7 +138,7 @@ pub fn build(b: *std.Build) !void {
             },
             .imconfig = b.addWriteFiles().add("imconfig.h",
                 \\ #pragma once
-                \\ #define IMGUI_IMPL_VULKAN_NO_PROTOTYPES 
+                \\ #define IMGUI_IMPL_VULKAN_NO_PROTOTYPES
             ),
         });
         root_module.linkLibrary(dcimgui_dep.artifact("dcimgui"));

@@ -2,7 +2,7 @@
     .name = .vulkan_tutorial,
     .version = "0.0.0",
     .fingerprint = 0xe6a82ece1521df, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.16.0-dev.3073",
     .dependencies = .{
         .vulkan_headers = .{
             .url = "git+https://github.com/KhronosGroup/Vulkan-Headers?ref=v1.4.326#d1cd37e925510a167d4abef39340dbdea47d8989",
