@@ -538,12 +538,8 @@ const DeletionQueue = struct {
 
     const QueueItem = union(enum) {
         image_view: vk.ImageView,
-        vma_allocated_image: AllocatedImage,
-        descriptor_set_layout: vk.DescriptorSetLayout,
-        pipeline_layout: vk.PipelineLayout,
-        pipeline: vk.Pipeline,
+        allocated_image: AllocatedImage,
         command_pool: vk.CommandPool,
-        fence: vk.Fence,
         descriptor_pool: vk.DescriptorPool,
         allocated_buffer: GpuBuffer,
         sampler: vk.Sampler,
@@ -551,15 +547,11 @@ const DeletionQueue = struct {
         fn deinit(self: QueueItem, context: DeinitContext) void {
             switch (self) {
                 .image_view => |item| context.device.destroyImageView(item, null),
-                .vma_allocated_image => |item| {
+                .allocated_image => |item| {
                     c.vmaDestroyImage(context.vma_allocator.?, @ptrFromInt(@intFromEnum(item.image)), item.allocation);
                     context.device.destroyImageView(item.image_view, null);
                 },
-                .descriptor_set_layout => |item| context.device.destroyDescriptorSetLayout(item, null),
-                .pipeline_layout => |item| context.device.destroyPipelineLayout(item, null),
-                .pipeline => |item| context.device.destroyPipeline(item, null),
                 .command_pool => |item| context.device.destroyCommandPool(item, null),
-                .fence => |item| context.device.destroyFence(item, null),
                 .descriptor_pool => |item| context.device.destroyDescriptorPool(item, null),
                 .allocated_buffer => |item| item.deinit(context.gc.?),
                 .sampler => |item| context.device.destroySampler(item, null),
@@ -1150,15 +1142,15 @@ pub const Engine = struct {
 
         const white: Color = .{ .r = 255, .g = 255, .b = 255, .a = 255 };
         const white_image = try createAndUploadImage(&gc, @ptrCast(&white), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
-        try main_deletion_queue.append(gpa, .{ .vma_allocated_image = white_image });
+        try main_deletion_queue.append(gpa, .{ .allocated_image = white_image });
 
         const grey: Color = .{ .r = 168, .g = 168, .b = 168, .a = 255 };
         const grey_image = try createAndUploadImage(&gc, @ptrCast(&grey), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
-        try main_deletion_queue.append(gpa, .{ .vma_allocated_image = grey_image });
+        try main_deletion_queue.append(gpa, .{ .allocated_image = grey_image });
 
         const black: Color = .{ .r = 0, .g = 0, .b = 0, .a = 255 };
         const black_image = try createAndUploadImage(&gc, @ptrCast(&black), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
-        try main_deletion_queue.append(gpa, .{ .vma_allocated_image = black_image });
+        try main_deletion_queue.append(gpa, .{ .allocated_image = black_image });
 
         const error_checkerboard_image = blk: {
             const magenta: Color = .{ .r = 255, .g = 0, .b = 255, .a = 255 };
@@ -1170,7 +1162,7 @@ pub const Engine = struct {
             }
             break :blk try createAndUploadImage(&gc, @ptrCast(&pixels), .{ .width = 16, .height = 16, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
         };
-        try main_deletion_queue.append(gpa, .{ .vma_allocated_image = error_checkerboard_image });
+        try main_deletion_queue.append(gpa, .{ .allocated_image = error_checkerboard_image });
 
         var sampler_create_info: vk.SamplerCreateInfo = .{
             .mag_filter = .nearest,
