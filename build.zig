@@ -72,12 +72,6 @@ pub fn build(b: *std.Build) !void {
     const vulkan_headers_dep = b.dependency("vulkan_headers", .{});
 
     {
-        const zigimg = b.dependency("zigimg", .{
-            .target = target,
-            .optimize = optimize,
-        });
-        root_module.addImport("zigimg", zigimg.module("zigimg"));
-
         const vulkan = b.dependency("vulkan", .{
             .registry = vulkan_headers_dep.path("registry/vk.xml"),
         });
@@ -113,10 +107,10 @@ pub fn build(b: *std.Build) !void {
             .optimize = optimize,
             .preferred_link_mode = .static,
         });
-        root_module.linkLibrary(sdl_dep.artifact("SDL3"));
+        const sdl_lib = sdl_dep.artifact("SDL3");
+        root_module.linkLibrary(sdl_lib);
 
         const vulkan_include_path = vulkan_headers_dep.path("include");
-
         const vma_dep = b.dependency("VulkanMemoryAllocator", .{
             .target = target,
             .optimize = optimize,
@@ -124,7 +118,8 @@ pub fn build(b: *std.Build) !void {
             .VMA_DYNAMIC_VULKAN_FUNCTIONS = true,
             .VMA_STATIC_VULKAN_FUNCTIONS = false,
         });
-        root_module.linkLibrary(vma_dep.artifact("VulkanMemoryAllocator"));
+        const vma_lib = vma_dep.artifact("VulkanMemoryAllocator");
+        root_module.linkLibrary(vma_lib);
 
         const ImguiBackend = @import("dcimgui").Backend;
         const dcimgui_dep = b.dependency("dcimgui", .{
@@ -134,16 +129,24 @@ pub fn build(b: *std.Build) !void {
             .backends = &[_]ImguiBackend{ .imgui_impl_sdl3, .imgui_impl_vulkan },
             .@"include-path-list" = &[_]std.Build.LazyPath{
                 vulkan_include_path,
-                sdl_dep.artifact("SDL3").getEmittedIncludeTree(),
+                sdl_lib.getEmittedIncludeTree(),
             },
             .imconfig = b.addWriteFiles().add("imconfig.h",
                 \\ #pragma once
                 \\ #define IMGUI_IMPL_VULKAN_NO_PROTOTYPES
             ),
         });
-        root_module.linkLibrary(dcimgui_dep.artifact("dcimgui"));
+        const dcimgui_lib = dcimgui_dep.artifact("dcimgui");
+        root_module.linkLibrary(dcimgui_lib);
 
-        const c_translate = b.addTranslateC(.{
+        const stb_image_dep = b.dependency("stb_image", .{
+            .target = target,
+            .optimize = .ReleaseFast,
+        });
+        const stb_image_lib = stb_image_dep.artifact("stb_image");
+        root_module.linkLibrary(stb_image_lib);
+
+        const translate_c = b.addTranslateC(.{
             .root_source_file = b.addWriteFiles().add("stub.h",
                 \\#include <SDL3/SDL.h>
                 \\#include <SDL3/SDL_vulkan.h>
@@ -152,15 +155,18 @@ pub fn build(b: *std.Build) !void {
                 \\#include <dcimgui.h>
                 \\#include <dcimgui_impl_sdl3.h>
                 \\#include <dcimgui_impl_vulkan.h>
+                \\#include <dcimgui_impl_vulkan.h>
+                \\#include <stb_image.h>
             ),
             .target = target,
             .optimize = optimize,
         });
-        c_translate.addIncludePath(vulkan_include_path);
-        c_translate.addIncludePath(sdl_dep.artifact("SDL3").getEmittedIncludeTree());
-        c_translate.addIncludePath(vma_dep.artifact("VulkanMemoryAllocator").getEmittedIncludeTree());
-        c_translate.addIncludePath(dcimgui_dep.artifact("dcimgui").getEmittedIncludeTree());
-        root_module.addImport("c", c_translate.createModule());
+        translate_c.addIncludePath(vulkan_include_path);
+        translate_c.addIncludePath(sdl_lib.getEmittedIncludeTree());
+        translate_c.addIncludePath(vma_lib.getEmittedIncludeTree());
+        translate_c.addIncludePath(dcimgui_lib.getEmittedIncludeTree());
+        translate_c.addIncludePath(stb_image_lib.getEmittedIncludeTree());
+        root_module.addImport("c", translate_c.createModule());
     }
 
     {

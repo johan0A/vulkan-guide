@@ -226,9 +226,9 @@ pub fn loadGltf(
                         const accessor = gltf.data.accessors[idx];
                         var it = accessor.iterator(f32, &gltf, gltf.glb_binary.?);
                         var i: u32 = 0;
-                        while (it.next()) |c| : (i += 1) {
-                            assert(c.len == 4);
-                            vertices.items[initial_vertex + i].color = c[0..4].*;
+                        while (it.next()) |color| : (i += 1) {
+                            assert(color.len == 4);
+                            vertices.items[initial_vertex + i].color = color[0..4].*;
                         }
                     },
                     else => {
@@ -330,33 +330,33 @@ fn loadImage(
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
 
-    var image = if (gltf_image.data) |data| blk: {
-        break :blk try img.Image.fromMemory(gpa, data);
-    } else if (gltf_image.buffer_view) |_| {
+    const image_data = if (gltf_image.data) |data|
+        data
+    else if (gltf_image.buffer_view) |_| {
         _ = gltf;
         std.debug.panic("TODO", .{});
     } else if (gltf_image.uri) |uri| blk: {
         const file = try base_dir.openFile(io, uri, .{});
+        defer file.close(io);
         var file_reader = file.reader(io, &.{});
-        const data = try file_reader.interface.allocRemaining(arena.allocator(), .unlimited);
-        break :blk try img.Image.fromMemory(gpa, data);
+        break :blk try file_reader.interface.allocRemaining(arena.allocator(), .unlimited);
     } else {
         return error.NoImageData;
     };
-    defer image.deinit(gpa);
 
-    image.convert(gpa, .rgba32) catch |err| switch (err) {
-        error.NoConversionNeeded => {},
-        else => |e| return e,
-    };
+    var channels: c_int = undefined;
+    var width: c_int = undefined;
+    var height: c_int = undefined;
+    const image_buff = c.stbi_load_from_memory(image_data.ptr, @intCast(image_data.len), &width, &height, &channels, 4);
+    if (image_buff == null) return error.OutOfMemory;
+    defer c.stbi_image_free(image_buff);
 
     const image_size: vk.Extent3D = .{
-        .width = @intCast(image.width),
-        .height = @intCast(image.height),
+        .width = @intCast(width),
+        .height = @intCast(height),
         .depth = 1,
     };
 
-    const image_buff = image.rawBytes();
     return try vk_engine.Engine.createAndUploadImage(
         graphics_ctx,
         @ptrCast(image_buff),
@@ -367,8 +367,8 @@ fn loadImage(
     );
 }
 
+const c = @import("c");
 const tracy = @import("tracy");
-const img = @import("zigimg");
 const std = @import("std");
 const zla = @import("zla");
 const vk = @import("vulkan");
