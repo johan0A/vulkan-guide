@@ -18,8 +18,6 @@ pub fn main(init: std.process.Init) !void {
 
     var mouse_captured = false;
 
-    
-
     while (!quit) {
         while (c.SDL_PollEvent(&event) != false) {
             switch (event.type) {

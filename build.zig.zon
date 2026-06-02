@@ -21,8 +21,8 @@
             .hash = "sdl-0.2.6+3.2.20-7uIn9NgjfwHH5a6HhyLHat2nHU3OP5B05QHhKJKuxEex",
         },
         .tracy = .{
-            .url = "git+https://github.com/johan0A/zig-tracy#c9a57c45445a31a50722b31008f826c48cd4163d",
-            .hash = "tracy-0.12.0-bsH_aofjGQCinKATGY4XMKF_5FnmY0POjxeeUSrmsVIV",
+            .url = "git+https://github.com/johan0A/zig-tracy#4ee06c3d21c13b9863f6fd5c283c4bf6be1f7366",
+            .hash = "tracy-0.13.1-bsH_aofjGQA4Upf_dRTAeCIBjiHhc_ETd4k-ddcwPyeV",
         },
         .zig_slang_binaries = .{ // TODO: dont vendor it after this is fixed: https://github.com/ziglang/zig/issues/25527
             .path = "vendor/zig-slang-binaries",

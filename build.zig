@@ -1,9 +1,10 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) !void {
-    const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
     const is_release = b.option(bool, "release", "build a release") orelse false;
+    const target = b.standardTargetOptions(.{});
+    const optimize = if (is_release) .ReleaseFast else b.standardOptimizeOption(.{});
+    std.debug.print("", .{});
 
     const options = .{
         .assets_path = b.option([]const u8, "assets-path", "") orelse "assets",
@@ -78,7 +79,7 @@ pub fn build(b: *std.Build) !void {
         root_module.addImport("vulkan", vulkan.module("vulkan-zig"));
 
         const tracy = b.dependency("tracy", .{
-            .enable_tracy = b.option(bool, "enable_tracy", "Enable Tracy profile markers") orelse false,
+            .enable_tracy = b.option(bool, "tracy", "Enable Tracy profile markers") orelse false,
         });
         root_module.addImport("tracy", tracy.module("tracy"));
 

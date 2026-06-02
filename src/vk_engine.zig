@@ -596,8 +596,8 @@ const SwapChain = struct {
         gpa: std.mem.Allocator,
         scratch: *Scratch,
         gc: *const GraphicsCtx,
-        window_width: u32,
-        window_height: u32,
+        fallback_width: u32,
+        fallback_height: u32,
     ) !SwapChain {
         const checkpoint = scratch.checkpoint();
         defer scratch.restoreCheckpoint(checkpoint);
@@ -631,7 +631,13 @@ const SwapChain = struct {
             }
         }
 
-        const swapchain_extent: vk.Extent2D = .{ .width = window_width, .height = window_height };
+        const swapchain_extent: vk.Extent2D = switch (surface_capabilities.current_extent.width != std.math.maxInt(u32)) {
+            true => surface_capabilities.current_extent,
+            false => .{
+                .width = std.math.clamp(fallback_width, surface_capabilities.min_image_extent.width, surface_capabilities.max_image_extent.width),
+                .height = std.math.clamp(fallback_height, surface_capabilities.min_image_extent.height, surface_capabilities.max_image_extent.height),
+            },
+        };
 
         const concurrent = gc.queues.families.graphics != gc.queues.families.present;
         const family_indices = [_]u32{ gc.queues.families.graphics, gc.queues.families.present };
@@ -818,8 +824,6 @@ pub const Engine = struct {
         // we will use this command buffer exactly once, so we want to let vulkan know that
         try device.beginCommandBuffer(cmd, &.{ .flags = .{ .one_time_submit_bit = true } });
         {
-            // device.cmdClearAttachments(cmd, p_attachments: []const ClearAttachment, p_rects: []const ClearRect)
-
             vk_image.transitionImage(device, cmd, self.draw_image.image, .undefined, .color_attachment_optimal);
             vk_image.transitionImage(device, cmd, self.depth_image.image, .undefined, .depth_attachment_optimal);
             try self.drawGeometry(scratch, cmd);
@@ -1223,9 +1227,9 @@ pub const Engine = struct {
 
         //}
 
-        var mesh_buffers: MeshBuffers = try .init(&gc, 64 * 1024 * 1024);
+        var mesh_buffers: MeshBuffers = try .init(&gc, 1024 * 1024);
 
-        const structure_path = options.assets_path ++ "/structure.glb";
+        const structure_path = options.assets_path ++ "/basicmesh.glb";
         const structure_file = try loader.loadGltf(
             gpa,
             scratch,
@@ -1426,7 +1430,7 @@ pub const Engine = struct {
         self.draw_image = try createImage(
             &self.graphics_ctx,
             new_extent,
-            .r16g16b16a16_sfloat,
+            .b10g11r11_ufloat_pack32,
             .{ .transfer_src_bit = true, .transfer_dst_bit = true, .storage_bit = true, .color_attachment_bit = true },
             false,
         );

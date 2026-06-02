@@ -220,18 +220,14 @@ pub const Queues = struct {
         }
     };
 
-    pub fn init(families: Families, device: vk.DeviceProxy) !Queues {
-        const semaphore_info: vk.SemaphoreTypeCreateInfo = .{
-            .semaphore_type = .timeline,
-            .initial_value = 0,
-        };
-
+    pub fn init(families: QueueFamiliesFound, device: vk.DeviceProxy) !Queues {
+        const semaphore_info: vk.SemaphoreTypeCreateInfo = .{ .semaphore_type = .timeline, .initial_value = 0 };
         return .{
-            .families = families,
-            .graphics = device.getDeviceQueue(families.graphics, 0),
-            .present = device.getDeviceQueue(families.present, 0),
-            .compute = device.getDeviceQueue(families.compute, 0),
-            .transfer = device.getDeviceQueue(families.transfer, 0),
+            .families = families.families(),
+            .graphics = device.getDeviceQueue(families.graphics.family, families.graphics.index),
+            .present = device.getDeviceQueue(families.present.family, families.present.index),
+            .compute = device.getDeviceQueue(families.compute.family, families.compute.index),
+            .transfer = device.getDeviceQueue(families.transfer.family, families.transfer.index),
             .graphics_timeline = try device.createSemaphore(&.{ .p_next = &semaphore_info }, null),
             .compute_timeline = try device.createSemaphore(&.{ .p_next = &semaphore_info }, null),
             .transfer_timeline = try device.createSemaphore(&.{ .p_next = &semaphore_info }, null),
@@ -355,14 +351,6 @@ pub fn createVkInstance(scratch: *Scratch, base_dispatch: vk.BaseWrapper, enable
     const checkpoint = scratch.checkpoint();
     defer scratch.restoreCheckpoint(checkpoint);
 
-    const app_info = vk.ApplicationInfo{
-        .p_application_name = "Vulkan Tutorial",
-        .application_version = @bitCast(vk.makeApiVersion(1, 0, 0, 0)),
-        .p_engine_name = "No Engine",
-        .engine_version = @bitCast(vk.makeApiVersion(1, 0, 0, 0)),
-        .api_version = @bitCast(vk.makeApiVersion(1, 3, 0, 0)),
-    };
-
     const sdl_required_extensions = blk: {
         var sdl_required_extensions_count: u32 = undefined;
         const sdl_required_extensions_ptr = c.SDL_Vulkan_GetInstanceExtensions(&sdl_required_extensions_count) orelse
@@ -393,7 +381,13 @@ pub fn createVkInstance(scratch: *Scratch, base_dispatch: vk.BaseWrapper, enable
     try extensions.appendSlice(scratch.allocator(), &.{vk.extensions.ext_debug_utils.name.ptr});
 
     const create_info: vk.InstanceCreateInfo = .{
-        .p_application_info = &app_info,
+        .p_application_info = &.{
+            .p_application_name = "Vulkan Tutorial",
+            .application_version = @bitCast(vk.makeApiVersion(1, 0, 0, 0)),
+            .p_engine_name = "No Engine",
+            .engine_version = @bitCast(vk.makeApiVersion(1, 0, 0, 0)),
+            .api_version = @bitCast(vk.makeApiVersion(1, 3, 0, 0)),
+        },
         .enabled_extension_count = @intCast(extensions.items.len),
         .pp_enabled_extension_names = @ptrCast(extensions.items),
         .pp_enabled_layer_names = if (enable_validation_layers) @ptrCast(&validation_layers) else null,
@@ -405,15 +399,18 @@ pub fn createVkInstance(scratch: *Scratch, base_dispatch: vk.BaseWrapper, enable
 pub fn createLogicalDevice(
     physical_device: vk.PhysicalDevice,
     instance_dispatch: vk.InstanceWrapper,
-    families: Queues.Families,
+    families: QueueFamiliesFound,
 ) !vk.Device {
-    const unique = families.unique();
+    const priorities: [4]f32 = @splat(0); // up to 4 roles can share one family
+
+    const unique = families.families().unique();
     var queue_create_infos: [4]vk.DeviceQueueCreateInfo = undefined;
     for (unique.families[0..unique.len], queue_create_infos[0..unique.len]) |family, *info| {
+        const count = families.queueCount(family); // the helper from the plan
         info.* = .{
             .queue_family_index = family,
-            .queue_count = 1,
-            .p_queue_priorities = &.{1},
+            .queue_count = count,
+            .p_queue_priorities = priorities[0..count].ptr,
         };
     }
 
@@ -430,10 +427,16 @@ pub fn createLogicalDevice(
         .descriptor_binding_storage_buffer_update_after_bind = .true,
         .scalar_block_layout = .true,
         .timeline_semaphore = .true,
+        .shader_float_16 = .true,
+        .shader_int_8 = .true,
+        .storage_buffer_8_bit_access = .true,
+        .uniform_and_storage_buffer_8_bit_access = .true,
     };
     const device_features_vk11: vk.PhysicalDeviceVulkan11Features = .{
         .p_next = &device_features_vk12,
         .shader_draw_parameters = .true,
+        .storage_buffer_16_bit_access = .true,
+        .uniform_and_storage_buffer_16_bit_access = .true,
     };
     return try instance_dispatch.createDevice(physical_device, &.{
         .p_next = &device_features_vk11,
@@ -443,9 +446,10 @@ pub fn createLogicalDevice(
         .enabled_extension_count = required_device_extensions.len,
         .p_enabled_features = &.{
             .shader_int_64 = .true,
+            .shader_int_16 = .true,
             .sampler_anisotropy = .true,
             .multi_draw_indirect = .true,
-            .robust_buffer_access = .true,
+            // .robust_buffer_access = .true, TODO: consider
         },
     }, null);
 }
@@ -480,12 +484,38 @@ pub fn pickPhysicalDevice(scratch: *Scratch, instance: vk.InstanceProxy, surface
     return error.NoSuitablePhysicalDeviceFound;
 }
 
+pub const QueueFamiliesFound = struct {
+    graphics: Ref,
+    present: Ref,
+    compute: Ref,
+    transfer: Ref,
+
+    pub const Ref = struct { family: u32, index: u32 };
+
+    pub fn families(self: QueueFamiliesFound) Queues.Families {
+        return .{
+            .graphics = self.graphics.family,
+            .present = self.present.family,
+            .compute = self.compute.family,
+            .transfer = self.transfer.family,
+        };
+    }
+
+    pub fn queueCount(self: QueueFamiliesFound, family: u32) u32 {
+        var n: u32 = 0;
+        for ([_]Ref{ self.graphics, self.present, self.compute, self.transfer }) |r| {
+            if (r.family == family) n = @max(n, r.index + 1);
+        }
+        return n;
+    }
+};
+
 pub fn findQueueFamilies(
     scratch: *Scratch,
     physical_device: vk.PhysicalDevice,
     instance_dispatch: vk.InstanceWrapper,
     surface: vk.SurfaceKHR,
-) !?Queues.Families {
+) !?QueueFamiliesFound {
     const checkpoint = scratch.checkpoint();
     defer scratch.restoreCheckpoint(checkpoint);
 
@@ -498,19 +528,19 @@ pub fn findQueueFamilies(
             break;
         }
     }
-    const gfx = graphics_family orelse return null;
+    const graphics = graphics_family orelse return null;
 
     var present_family: ?u32 = null;
     for (queue_families, 0..) |_, i| {
         const idx: u32 = @intCast(i);
         if (try instance_dispatch.getPhysicalDeviceSurfaceSupportKHR(physical_device, idx, surface) == .true) {
             present_family = idx;
-            if (idx == gfx) break;
+            if (idx == graphics) break;
         }
     }
     const present = present_family orelse return null;
 
-    var compute: u32 = gfx;
+    var compute: u32 = graphics;
     for (queue_families, 0..) |family, i| {
         if (family.queue_flags.compute_bit and !family.queue_flags.graphics_bit) {
             compute = @intCast(i);
@@ -518,15 +548,45 @@ pub fn findQueueFamilies(
         }
     }
 
-    var transfer: u32 = gfx;
+    var transfer: u32 = compute;
     for (queue_families, 0..) |family, i| {
-        if (family.queue_flags.transfer_bit and !family.queue_flags.graphics_bit and !family.queue_flags.compute_bit) {
+        if (family.queue_flags.transfer_bit and
+            !family.queue_flags.graphics_bit and
+            !family.queue_flags.compute_bit)
+        {
             transfer = @intCast(i);
             break;
         }
     }
 
-    return .{ .graphics = gfx, .present = present, .compute = compute, .transfer = transfer };
+    const next_index = try scratch.allocator().alloc(u32, queue_families.len);
+    @memset(next_index, 0);
+
+    const local = struct {
+        fn claim(idx: []u32, families: []const vk.QueueFamilyProperties, fam: u32) u32 {
+            const max = families[fam].queue_count;
+            const i = @min(idx[fam], max - 1);
+            idx[fam] += 1;
+            return i;
+        }
+    };
+
+    const graphics_id: QueueFamiliesFound.Ref = .{ .family = graphics, .index = local.claim(next_index, queue_families, graphics) };
+
+    const present_id: QueueFamiliesFound.Ref = switch (present == graphics) {
+        true => graphics_id,
+        false => .{ .family = present, .index = local.claim(next_index, queue_families, present) },
+    };
+
+    const compute_id: QueueFamiliesFound.Ref = .{ .family = compute, .index = local.claim(next_index, queue_families, compute) };
+    const transfer_id: QueueFamiliesFound.Ref = .{ .family = transfer, .index = local.claim(next_index, queue_families, transfer) };
+
+    return .{
+        .graphics = graphics_id,
+        .present = present_id,
+        .compute = compute_id,
+        .transfer = transfer_id,
+    };
 }
 
 const GraphicsCtx = @This();
