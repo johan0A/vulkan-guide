@@ -245,9 +245,7 @@ pub const BindlessDescriptors = struct {
     pool: vk.DescriptorPool,
     layout: vk.DescriptorSetLayout,
     set: vk.DescriptorSet,
-
-    free_texture_indices: std.ArrayList(u32),
-    next_texture_index: u32,
+    texture_indices: FreeList(void),
 
     pub fn init(device: vk.DeviceProxy) !BindlessDescriptors {
         const max_textures = 16384;
@@ -295,15 +293,14 @@ pub const BindlessDescriptors = struct {
             .pool = pool,
             .layout = layout,
             .set = set,
-            .free_texture_indices = .empty,
-            .next_texture_index = 0,
+            .texture_indices = .empty,
         };
     }
 
     pub fn deinit(self: *BindlessDescriptors, gpa: Allocator, device: vk.DeviceProxy) void {
         device.destroyDescriptorPool(self.pool, null);
         device.destroyDescriptorSetLayout(self.layout, null);
-        self.free_texture_indices.deinit(gpa);
+        self.texture_indices.deinit(gpa);
     }
 
     pub fn registerTexture(
@@ -332,18 +329,11 @@ pub const BindlessDescriptors = struct {
     }
 
     pub fn allocTextureIndex(self: *BindlessDescriptors, gpa: Allocator) !u32 {
-        if (self.free_texture_indices.pop()) |idx| {
-            return idx;
-        } else {
-            const result = self.next_texture_index;
-            self.next_texture_index += 1;
-            try self.free_texture_indices.ensureTotalCapacity(gpa, self.next_texture_index);
-            return result;
-        }
+        return @intCast(try self.texture_indices.new(gpa, {}));
     }
 
     pub fn releaseTexture(self: *BindlessDescriptors, idx: u32) void {
-        self.free_texture_indices.appendAssumeCapacity(idx);
+        return @intCast(self.texture_indices.delete(idx));
     }
 };
 
@@ -362,9 +352,7 @@ pub fn createVkInstance(scratch: *Scratch, base_dispatch: vk.BaseWrapper, enable
     for (sdl_required_extensions) |required_ext| {
         for (available_extensions) |available_ext| {
             if (std.mem.eql(u8, std.mem.span(required_ext), std.mem.sliceTo(&available_ext.extension_name, 0))) break;
-        } else {
-            return error.extensionRequiredBySdlIsNotAvailable;
-        }
+        } else return error.extensionRequiredBySdlIsNotAvailable;
     }
 
     if (enable_validation_layers) {
@@ -378,18 +366,18 @@ pub fn createVkInstance(scratch: *Scratch, base_dispatch: vk.BaseWrapper, enable
 
     var extensions: std.ArrayList([*:0]const u8) = .empty;
     try extensions.appendSlice(scratch.allocator(), @ptrCast(sdl_required_extensions));
-    try extensions.appendSlice(scratch.allocator(), &.{vk.extensions.ext_debug_utils.name.ptr});
+    try extensions.append(scratch.allocator(), vk.extensions.ext_debug_utils.name.ptr);
 
     const create_info: vk.InstanceCreateInfo = .{
         .p_application_info = &.{
             .p_application_name = "Vulkan Tutorial",
-            .application_version = @bitCast(vk.makeApiVersion(1, 0, 0, 0)),
+            .application_version = vk.makeApiVersion(1, 0, 0, 0).toU32(),
             .p_engine_name = "No Engine",
-            .engine_version = @bitCast(vk.makeApiVersion(1, 0, 0, 0)),
-            .api_version = @bitCast(vk.makeApiVersion(1, 3, 0, 0)),
+            .engine_version = vk.makeApiVersion(1, 0, 0, 0).toU32(),
+            .api_version = vk.makeApiVersion(1, 3, 0, 0).toU32(),
         },
         .enabled_extension_count = @intCast(extensions.items.len),
-        .pp_enabled_extension_names = @ptrCast(extensions.items),
+        .pp_enabled_extension_names = extensions.items.ptr,
         .pp_enabled_layer_names = if (enable_validation_layers) @ptrCast(&validation_layers) else null,
         .enabled_layer_count = if (enable_validation_layers) @intCast(validation_layers.len) else 0,
     };
@@ -595,5 +583,6 @@ const c = @import("c");
 const std = @import("std");
 const Scratch = @import("scratch_allocator");
 const options = @import("options");
+const FreeList = @import("free_list.zig").FreeList;
 
 const Allocator = std.mem.Allocator;
