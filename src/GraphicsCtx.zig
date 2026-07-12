@@ -1,4 +1,4 @@
-const validation_layers = [_][:0]const u8{"VK_LAYER_KHRONOS_validation"};
+const validation_layers = [_][*:0]const u8{"VK_LAYER_KHRONOS_validation"};
 const required_device_extensions = [_][*:0]const u8{vk.extensions.khr_swapchain.name};
 
 pub const GPUDrawPushConstants = extern struct {
@@ -359,7 +359,7 @@ pub fn createVkInstance(scratch: *Scratch, base_dispatch: vk.BaseWrapper, enable
         const available_layers = try base_dispatch.enumerateInstanceLayerPropertiesAlloc(scratch.allocator());
         for (validation_layers) |validation_layer| {
             for (available_layers) |available_layer| {
-                if (std.mem.eql(u8, std.mem.sliceTo(&available_layer.layer_name, 0), validation_layer)) break;
+                if (std.mem.eql(u8, std.mem.sliceTo(&available_layer.layer_name, 0), std.mem.span(validation_layer))) break;
             } else std.debug.panic("validation layers unsupported", .{});
         }
     }
@@ -378,7 +378,7 @@ pub fn createVkInstance(scratch: *Scratch, base_dispatch: vk.BaseWrapper, enable
         },
         .enabled_extension_count = @intCast(extensions.items.len),
         .pp_enabled_extension_names = extensions.items.ptr,
-        .pp_enabled_layer_names = if (enable_validation_layers) @ptrCast(&validation_layers) else null,
+        .pp_enabled_layer_names = if (enable_validation_layers) &validation_layers else null,
         .enabled_layer_count = if (enable_validation_layers) @intCast(validation_layers.len) else 0,
     };
     return try base_dispatch.createInstance(&create_info, null);
