@@ -476,7 +476,7 @@ pub fn Mat(
         }
 
         pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
-            var max_widths: [cols]usize = [_]usize{0} ** cols;
+            var max_widths: [cols]usize = @splat(0);
 
             for (0..cols) |c| {
                 for (0..rows) |r| {

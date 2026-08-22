@@ -103,7 +103,7 @@ pub fn loadGltf(
     scene.material_data_buffer = try .create(
         graphics_ctx,
         @sizeOf(vk_engine.GltfMetallicRoughness.GPUMaterialData) * gltf.data.materials.len,
-        .{ .usage = .{ .uniform_buffer_bit = true }, .access = .cpu_gpu },
+        .{ .usage = .{ .uniform_buffer = true }, .access = .cpu_gpu },
     );
 
     for (gltf.data.materials) |material| {
@@ -362,7 +362,7 @@ fn loadImage(
         @ptrCast(image_buff),
         image_size,
         .r8g8b8a8_srgb,
-        .{ .sampled_bit = true },
+        .{ .sampled = true },
         true,
     );
 }

@@ -3,8 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) !void {
     const is_release = b.option(bool, "release", "build a release") orelse false;
     const target = b.standardTargetOptions(.{});
-    const optimize = if (is_release) .ReleaseFast else b.standardOptimizeOption(.{});
-    std.debug.print("", .{});
+    const optimize = if (is_release) .fast else b.standardOptimizeOption(.{});
 
     const options = .{
         .assets_path = b.option([]const u8, "assets-path", "") orelse "assets",
@@ -30,8 +29,9 @@ pub fn build(b: *std.Build) !void {
 
     {
         var options_step = b.addOptions();
-        inline for (std.meta.fields(@TypeOf(options))) |field| {
-            options_step.addOption(field.type, field.name, @field(options, field.name));
+        const info = @typeInfo(@TypeOf(options)).@"struct";
+        inline for (info.field_names, info.field_types) |name, @"type"| {
+            options_step.addOption(@"type", name, @field(options, name));
         }
         root_module.addImport("options", options_step.createModule());
     }
@@ -106,7 +106,6 @@ pub fn build(b: *std.Build) !void {
         const sdl_dep = b.dependency("sdl", .{
             .target = target,
             .optimize = optimize,
-            .preferred_link_mode = .static,
         });
         const sdl_lib = sdl_dep.artifact("SDL3");
         root_module.linkLibrary(sdl_lib);
@@ -172,16 +171,15 @@ pub fn build(b: *std.Build) !void {
 
     {
         const exe = b.addExecutable(.{ .name = "vulkan-tutorial", .root_module = root_module });
-        exe.subsystem = if (is_release) .Windows else null;
+        exe.subsystem = if (is_release) .windows else null;
 
         b.getInstallStep().dependOn(&b.addInstallArtifact(exe, .{
             .dest_dir = if (is_release) .{ .override = .{ .custom = "release" } } else .default,
         }).step);
         const run_cmd = b.addRunArtifact(exe);
-        run_cmd.cwd = b.path("");
+        run_cmd.setCwd(b.path(""));
         run_cmd.step.dependOn(b.getInstallStep());
-
-        if (b.args) |args| run_cmd.addArgs(args);
+        run_cmd.addPassthruArgs();
 
         const run_step = b.step("run", "Run the app");
         run_step.dependOn(&run_cmd.step);

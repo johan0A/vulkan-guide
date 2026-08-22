@@ -65,7 +65,7 @@ pub const MeshBuffers = struct {
         const vertex_buffer: GpuBuffer = try .create(
             gc,
             len * @sizeOf(Vertex),
-            .{ .usage = .{ .storage_buffer_bit = true, .shader_device_address_bit = true }, .access = .cpu_gpu },
+            .{ .usage = .{ .storage_buffer = true, .shader_device_address = true }, .access = .cpu_gpu },
         );
 
         return .{
@@ -73,7 +73,7 @@ pub const MeshBuffers = struct {
             .index_buffer = try .create(
                 gc,
                 len * @sizeOf(u32),
-                .{ .usage = .{ .storage_buffer_bit = true, .index_buffer_bit = true }, .access = .cpu_gpu },
+                .{ .usage = .{ .storage_buffer = true, .index_buffer = true }, .access = .cpu_gpu },
             ),
             .next_vertex = 0,
             .next_index = 0,
@@ -259,7 +259,7 @@ pub const GltfMetallicRoughness = struct {
                 .gpu_buffer = try .create(
                     gc,
                     max_len * @sizeOf(GPUMaterialData),
-                    .{ .usage = .{ .storage_buffer_bit = true, .shader_device_address_bit = true }, .access = .cpu_gpu },
+                    .{ .usage = .{ .storage_buffer = true, .shader_device_address = true }, .access = .cpu_gpu },
                 ),
                 .capacity = max_len,
                 .len = 0,
@@ -422,17 +422,17 @@ const PipelineConfig = struct {
 
 fn createPipeline(device: vk.DeviceProxy, layout: vk.PipelineLayout, cfg: PipelineConfig) !vk.Pipeline {
     const stages = [_]vk.PipelineShaderStageCreateInfo{
-        .{ .stage = .{ .vertex_bit = true }, .module = cfg.shaders[0], .p_name = "main" },
-        .{ .stage = .{ .fragment_bit = true }, .module = cfg.shaders[1], .p_name = "main" },
+        .{ .stage = .{ .vertex = true }, .module = cfg.shaders[0], .p_name = "main" },
+        .{ .stage = .{ .fragment = true }, .module = cfg.shaders[1], .p_name = "main" },
     };
 
     const color_blend_attachment: vk.PipelineColorBlendAttachmentState = switch (cfg.blending) {
         .none => std.mem.zeroInit(vk.PipelineColorBlendAttachmentState, .{
-            .color_write_mask = .{ .r_bit = true, .g_bit = true, .b_bit = true, .a_bit = true },
+            .color_write_mask = .{ .r = true, .g = true, .b = true, .a = true },
             .blend_enable = .false,
         }),
         .additive => .{
-            .color_write_mask = .{ .r_bit = true, .g_bit = true, .b_bit = true, .a_bit = true },
+            .color_write_mask = .{ .r = true, .g = true, .b = true, .a = true },
             .blend_enable = .true,
             .src_color_blend_factor = .src_alpha,
             .dst_color_blend_factor = .one,
@@ -442,7 +442,7 @@ fn createPipeline(device: vk.DeviceProxy, layout: vk.PipelineLayout, cfg: Pipeli
             .alpha_blend_op = .add,
         },
         .alpha => .{
-            .color_write_mask = .{ .r_bit = true, .g_bit = true, .b_bit = true, .a_bit = true },
+            .color_write_mask = .{ .r = true, .g = true, .b = true, .a = true },
             .blend_enable = .true,
             .src_color_blend_factor = .src_alpha,
             .dst_color_blend_factor = .one_minus_src_alpha,
@@ -484,7 +484,7 @@ fn createPipeline(device: vk.DeviceProxy, layout: vk.PipelineLayout, cfg: Pipeli
                 .depth_bias_slope_factor = 0,
             },
             .p_multisample_state = &.{
-                .rasterization_samples = .{ .@"1_bit" = true },
+                .rasterization_samples = .{ .@"1" = true },
                 .min_sample_shading = 1,
                 .sample_shading_enable = .false,
                 .alpha_to_coverage_enable = .false,
@@ -648,12 +648,12 @@ const SwapChain = struct {
             .image_color_space = swapchain_image_format.color_space,
             .image_extent = swapchain_extent,
             .image_array_layers = 1,
-            .image_usage = .{ .transfer_src_bit = true, .color_attachment_bit = true, .transfer_dst_bit = true },
+            .image_usage = .{ .transfer_src = true, .color_attachment = true, .transfer_dst = true },
             .image_sharing_mode = if (concurrent) .concurrent else .exclusive,
             .queue_family_index_count = if (concurrent) 2 else 0,
             .p_queue_family_indices = if (concurrent) &family_indices else null,
-            .pre_transform = .{ .identity_bit_khr = true },
-            .composite_alpha = .{ .opaque_bit_khr = true },
+            .pre_transform = .{ .identity_khr = true },
+            .composite_alpha = .{ .opaque_khr = true },
             .present_mode = present_mode,
             .clipped = .false,
             .old_swapchain = .null_handle,
@@ -683,7 +683,7 @@ const SwapChain = struct {
                     .format = swapchain_image_format.format,
                     .components = .{ .r = .identity, .g = .identity, .b = .identity, .a = .identity },
                     .subresource_range = .{
-                        .aspect_mask = .{ .color_bit = true },
+                        .aspect_mask = .{ .color = true },
                         .base_mip_level = 0,
                         .level_count = 1,
                         .base_array_layer = 0,
@@ -822,7 +822,7 @@ pub const Engine = struct {
         try device.resetCommandBuffer(cmd, .{});
 
         // we will use this command buffer exactly once, so we want to let vulkan know that
-        try device.beginCommandBuffer(cmd, &.{ .flags = .{ .one_time_submit_bit = true } });
+        try device.beginCommandBuffer(cmd, &.{ .flags = .{ .one_time_submit = true } });
         {
             vk_image.transitionImage(device, cmd, self.draw_image.image, .undefined, .color_attachment_optimal);
             vk_image.transitionImage(device, cmd, self.depth_image.image, .undefined, .depth_attachment_optimal);
@@ -849,12 +849,12 @@ pub const Engine = struct {
             self.currentFrame().graphics_timeline_value = self.graphics_ctx.queues.graphics_timeline_value;
 
             const cmd_info: vk.CommandBufferSubmitInfo = vk_init.commandBufferSubmitInfo(cmd);
-            const wait_info: vk.SemaphoreSubmitInfo = vk_init.semaphoreSubmitInfo(.{ .color_attachment_output_bit = true }, self.currentFrame().swapchain_semaphore);
-            const signal_render: vk.SemaphoreSubmitInfo = vk_init.semaphoreSubmitInfo(.{ .all_graphics_bit = true }, current_swap_image.render_semaphore);
+            const wait_info: vk.SemaphoreSubmitInfo = vk_init.semaphoreSubmitInfo(.{ .color_attachment_output = true }, self.currentFrame().swapchain_semaphore);
+            const signal_render: vk.SemaphoreSubmitInfo = vk_init.semaphoreSubmitInfo(.{ .all_graphics = true }, current_swap_image.render_semaphore);
             const signal_timeline: vk.SemaphoreSubmitInfo = .{
                 .semaphore = self.graphics_ctx.queues.graphics_timeline,
                 .value = self.currentFrame().graphics_timeline_value,
-                .stage_mask = .{ .all_graphics_bit = true },
+                .stage_mask = .{ .all_graphics = true },
                 .device_index = 0,
             };
 
@@ -892,7 +892,7 @@ pub const Engine = struct {
         try device.resetFences(&.{imm_fence});
         try device.resetCommandBuffer(imm_command_buffer, .{});
 
-        try device.beginCommandBuffer(imm_command_buffer, &.{ .flags = .{ .one_time_submit_bit = true } });
+        try device.beginCommandBuffer(imm_command_buffer, &.{ .flags = .{ .one_time_submit = true } });
     }
 
     fn immediateModeEnd(device: vk.DeviceProxy, imm_fence: vk.Fence, imm_command_buffer: vk.CommandBuffer, queue: vk.Queue) !void {
@@ -937,7 +937,7 @@ pub const Engine = struct {
         var gc: GraphicsCtx = try .init(gpa, scratch, window);
 
         const command_pool_info: vk.CommandPoolCreateInfo = .{
-            .flags = .{ .reset_command_buffer_bit = true },
+            .flags = .{ .reset_command_buffer = true },
             .queue_family_index = gc.queues.families.graphics,
         };
         var main_deletion_queue: DeletionQueue = .init;
@@ -963,7 +963,7 @@ pub const Engine = struct {
                 .indirect_buffer = try .create(
                     &gc,
                     FrameData.max_draws * @sizeOf(vk.DrawIndexedIndirectCommand),
-                    .{ .usage = .{ .indirect_buffer_bit = true, .storage_buffer_bit = true }, .access = .cpu_gpu },
+                    .{ .usage = .{ .indirect_buffer = true, .storage_buffer = true }, .access = .cpu_gpu },
                 ),
             };
         }
@@ -972,10 +972,10 @@ pub const Engine = struct {
         const draw_image_format: vk.Format = .b10g11r11_ufloat_pack32;
 
         const draw_image_usages: vk.ImageUsageFlags = .{
-            .transfer_src_bit = true,
-            .transfer_dst_bit = true,
-            .storage_bit = true,
-            .color_attachment_bit = true,
+            .transfer_src = true,
+            .transfer_dst = true,
+            .storage = true,
+            .color_attachment = true,
         };
 
         const draw_image_extent: vk.Extent3D = .{
@@ -989,7 +989,7 @@ pub const Engine = struct {
         //for the draw image, we want to allocate it from gpu local memory
         const rimg_allocinfo: c.VmaAllocationCreateInfo = .{
             .usage = c.VMA_MEMORY_USAGE_GPU_ONLY,
-            .requiredFlags = @bitCast(vk.MemoryPropertyFlags{ .device_local_bit = true }),
+            .requiredFlags = @bitCast(vk.MemoryPropertyFlags{ .device_local = true }),
         };
 
         var draw_image: vk.Image = undefined;
@@ -1010,7 +1010,7 @@ pub const Engine = struct {
         const rview_info: vk.ImageViewCreateInfo = vk_init.imageViewCreateInfo(
             draw_image_format,
             draw_image,
-            .{ .color_bit = true },
+            .{ .color = true },
         );
 
         const draw_allocated_image: AllocatedImage = .{
@@ -1027,7 +1027,7 @@ pub const Engine = struct {
             .allocation = draw_image_allocation,
         };
 
-        const depth_image_usages: vk.ImageUsageFlags = .{ .depth_stencil_attachment_bit = true };
+        const depth_image_usages: vk.ImageUsageFlags = .{ .depth_stencil_attachment = true };
         const depth_image_format: vk.Format = .d32_sfloat;
         const depth_image_info: vk.ImageCreateInfo = vk_init.imageCreateInfo(depth_image_format, depth_image_usages, draw_image_extent);
 
@@ -1036,7 +1036,7 @@ pub const Engine = struct {
         _ = c.vmaCreateImage(gc.vma_allocator, @ptrCast(&depth_image_info), &rimg_allocinfo, @ptrCast(&depth_image), &depth_image_allocation, null); // TODO: handle error?
 
         //build a image-view for the draw image to use for rendering
-        const dview_info: vk.ImageViewCreateInfo = vk_init.imageViewCreateInfo(depth_image_format, depth_image, .{ .depth_bit = true });
+        const dview_info: vk.ImageViewCreateInfo = vk_init.imageViewCreateInfo(depth_image_format, depth_image, .{ .depth = true });
 
         const depth_allocated_image: AllocatedImage = .{
             .image_format = depth_image_format,
@@ -1072,7 +1072,7 @@ pub const Engine = struct {
             };
 
             const pool_info: vk.DescriptorPoolCreateInfo = .{
-                .flags = .{ .free_descriptor_set_bit = true },
+                .flags = .{ .free_descriptor_set = true },
                 .max_sets = 1000,
                 .pool_size_count = pool_sizes.len,
                 .p_pool_sizes = &pool_sizes,
@@ -1110,10 +1110,10 @@ pub const Engine = struct {
             const frag_shader = try loadShader(scratch.allocator(), io, shaders.imgui_frag);
 
             var init_info: c.ImGui_ImplVulkan_InitInfo = .{
-                .Instance = @ptrFromInt(@intFromEnum(gc.instance.handle)),
-                .PhysicalDevice = @ptrFromInt(@intFromEnum(gc.physical_device)),
-                .Device = @ptrFromInt(@intFromEnum(gc.device.handle)),
-                .Queue = @ptrFromInt(@intFromEnum(gc.queues.graphics)),
+                .Instance = @ptrCast(gc.instance.handle),
+                .PhysicalDevice = @ptrCast(gc.physical_device),
+                .Device = @ptrCast(gc.device.handle),
+                .Queue = @ptrCast(gc.queues.graphics),
                 .DescriptorPool = @ptrFromInt(@intFromEnum(imgui_pool)),
                 .MinImageCount = 3,
                 .ImageCount = 3,
@@ -1145,15 +1145,15 @@ pub const Engine = struct {
         const Color = packed struct(u32) { r: u8, g: u8, b: u8, a: u8 };
 
         const white: Color = .{ .r = 255, .g = 255, .b = 255, .a = 255 };
-        const white_image = try createAndUploadImage(&gc, @ptrCast(&white), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
+        const white_image = try createAndUploadImage(&gc, @ptrCast(&white), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled = true }, false);
         try main_deletion_queue.append(gpa, .{ .allocated_image = white_image });
 
         const grey: Color = .{ .r = 168, .g = 168, .b = 168, .a = 255 };
-        const grey_image = try createAndUploadImage(&gc, @ptrCast(&grey), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
+        const grey_image = try createAndUploadImage(&gc, @ptrCast(&grey), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled = true }, false);
         try main_deletion_queue.append(gpa, .{ .allocated_image = grey_image });
 
         const black: Color = .{ .r = 0, .g = 0, .b = 0, .a = 255 };
-        const black_image = try createAndUploadImage(&gc, @ptrCast(&black), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
+        const black_image = try createAndUploadImage(&gc, @ptrCast(&black), .{ .width = 1, .height = 1, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled = true }, false);
         try main_deletion_queue.append(gpa, .{ .allocated_image = black_image });
 
         const error_checkerboard_image = blk: {
@@ -1164,7 +1164,7 @@ pub const Engine = struct {
                     pixels[x][y] = if ((x % 2) ^ (y % 2) != 0) magenta else black;
                 }
             }
-            break :blk try createAndUploadImage(&gc, @ptrCast(&pixels), .{ .width = 16, .height = 16, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled_bit = true }, false);
+            break :blk try createAndUploadImage(&gc, @ptrCast(&pixels), .{ .width = 16, .height = 16, .depth = 1 }, .r8g8b8a8_unorm, .{ .sampled = true }, false);
         };
         try main_deletion_queue.append(gpa, .{ .allocated_image = error_checkerboard_image });
 
@@ -1199,13 +1199,13 @@ pub const Engine = struct {
         const scene_data_buffer: GpuBuffer = try .create(
             &gc,
             FrameData.frame_overlap * @sizeOf(GPUSceneData),
-            .{ .usage = .{ .storage_buffer_bit = true, .shader_device_address_bit = true }, .access = .cpu_gpu },
+            .{ .usage = .{ .storage_buffer = true, .shader_device_address = true }, .access = .cpu_gpu },
         );
 
         const draw_data_buffer: GpuBuffer = try .create(
             &gc,
             FrameData.max_draws * FrameData.frame_overlap * @sizeOf(GPUDrawData),
-            .{ .usage = .{ .storage_buffer_bit = true, .shader_device_address_bit = true }, .access = .cpu_gpu },
+            .{ .usage = .{ .storage_buffer = true, .shader_device_address = true }, .access = .cpu_gpu },
         );
 
         var material_resources: GltfMetallicRoughness.MaterialResources = .{
@@ -1333,8 +1333,8 @@ pub const Engine = struct {
 
         // if the format is a depth format, we will need to have it use the correct aspect flag
         const aspect_flag: vk.ImageAspectFlags = switch (format == .d32_sfloat) {
-            true => .{ .depth_bit = true },
-            false => .{ .color_bit = true },
+            true => .{ .depth = true },
+            false => .{ .color = true },
         };
 
         // build a image-view for the image
@@ -1359,8 +1359,8 @@ pub const Engine = struct {
         upload_buffer.unmap(gc);
 
         var new_usage = usage;
-        new_usage.transfer_dst_bit = true;
-        new_usage.transfer_src_bit = true;
+        new_usage.transfer_dst = true;
+        new_usage.transfer_src = true;
         const new_image = try createImage(gc, size, format, new_usage, mipmapped);
 
         {
@@ -1374,7 +1374,7 @@ pub const Engine = struct {
                 .buffer_image_height = 0,
 
                 .image_subresource = .{
-                    .aspect_mask = .{ .color_bit = true },
+                    .aspect_mask = .{ .color = true },
                     .mip_level = 0,
                     .base_array_layer = 0,
                     .layer_count = 1,
@@ -1431,7 +1431,7 @@ pub const Engine = struct {
             &self.graphics_ctx,
             new_extent,
             .b10g11r11_ufloat_pack32,
-            .{ .transfer_src_bit = true, .transfer_dst_bit = true, .storage_bit = true, .color_attachment_bit = true },
+            .{ .transfer_src = true, .transfer_dst = true, .storage = true, .color_attachment = true },
             false,
         );
 
@@ -1439,7 +1439,7 @@ pub const Engine = struct {
             &self.graphics_ctx,
             new_extent,
             .d32_sfloat,
-            .{ .depth_stencil_attachment_bit = true },
+            .{ .depth_stencil_attachment = true },
             false,
         );
 
@@ -1517,7 +1517,7 @@ pub const Engine = struct {
         c.ImGui_End();
 
         c.ImGui_Render();
-        c.cImGui_ImplVulkan_RenderDrawData(c.ImGui_GetDrawData(), @ptrFromInt(@intFromEnum(cmd)));
+        c.cImGui_ImplVulkan_RenderDrawData(c.ImGui_GetDrawData(), @ptrCast(cmd));
 
         device.cmdEndRendering(cmd);
     }
@@ -1655,7 +1655,7 @@ pub const Engine = struct {
         device.cmdPushConstants(
             cmd,
             self.graphics_ctx.bindless_pipeline_layout,
-            .{ .vertex_bit = true, .fragment_bit = true },
+            .{ .vertex = true, .fragment = true },
             0,
             @sizeOf(@TypeOf(push_constants)),
             std.mem.asBytes(&push_constants),
@@ -1683,14 +1683,14 @@ const vk_image = struct {
         new_layout: vk.ImageLayout,
     ) void {
         const image_barrier: vk.ImageMemoryBarrier2 = .{
-            .src_stage_mask = .{ .all_commands_bit = true },
-            .src_access_mask = .{ .memory_write_bit = true },
-            .dst_stage_mask = .{ .all_commands_bit = true },
-            .dst_access_mask = .{ .memory_write_bit = true, .memory_read_bit = true },
+            .src_stage_mask = .{ .all_commands = true },
+            .src_access_mask = .{ .memory_write = true },
+            .dst_stage_mask = .{ .all_commands = true },
+            .dst_access_mask = .{ .memory_write = true, .memory_read = true },
             .old_layout = current_layout,
             .new_layout = new_layout,
             .subresource_range = vk_init.imageSubresourceRange(
-                if (new_layout == .depth_attachment_optimal) .{ .depth_bit = true } else .{ .color_bit = true },
+                if (new_layout == .depth_attachment_optimal) .{ .depth = true } else .{ .color = true },
             ),
             .image = image,
             .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
@@ -1711,7 +1711,7 @@ const vk_image = struct {
         dst_size: vk.Extent2D,
     ) void {
         const subresource: vk.ImageSubresourceLayers = .{
-            .aspect_mask = .{ .color_bit = true },
+            .aspect_mask = .{ .color = true },
             .base_array_layer = 0,
             .layer_count = 1,
             .mip_level = 0,
@@ -1749,16 +1749,16 @@ const vk_image = struct {
                 .height = @max(previous_size.height / 2, 1),
             };
 
-            const aspect_mask: vk.ImageAspectFlags = .{ .color_bit = true };
+            const aspect_mask: vk.ImageAspectFlags = .{ .color = true };
             var subresource_range = vk_init.imageSubresourceRange(aspect_mask);
             subresource_range.level_count = 1;
             subresource_range.base_mip_level = @intCast(mip);
 
             const image_barrier: vk.ImageMemoryBarrier2 = .{
-                .src_stage_mask = .{ .all_commands_bit = true },
-                .src_access_mask = .{ .memory_write_bit = true },
-                .dst_stage_mask = .{ .all_commands_bit = true },
-                .dst_access_mask = .{ .memory_write_bit = true, .memory_read_bit = true },
+                .src_stage_mask = .{ .all_commands = true },
+                .src_access_mask = .{ .memory_write = true },
+                .dst_stage_mask = .{ .all_commands = true },
+                .dst_access_mask = .{ .memory_write = true, .memory_read = true },
 
                 .old_layout = .transfer_dst_optimal,
                 .new_layout = .transfer_src_optimal,
@@ -1787,13 +1787,13 @@ const vk_image = struct {
                         .{ .x = @intCast(half_size.width), .y = @intCast(half_size.height), .z = 1 },
                     },
                     .src_subresource = .{
-                        .aspect_mask = .{ .color_bit = true },
+                        .aspect_mask = .{ .color = true },
                         .base_array_layer = 0,
                         .layer_count = 1,
                         .mip_level = @intCast(mip),
                     },
                     .dst_subresource = .{
-                        .aspect_mask = .{ .color_bit = true },
+                        .aspect_mask = .{ .color = true },
                         .base_array_layer = 0,
                         .layer_count = 1,
                         .mip_level = @intCast(mip + 1),
@@ -1872,7 +1872,7 @@ const vk_init = struct {
             .array_layers = 1,
 
             //for MSAA. we will not be using it by default, so default it to 1 sample per pixel.
-            .samples = .{ .@"1_bit" = true },
+            .samples = .{ .@"1" = true },
 
             //optimal tiling, which means the image is stored on the best gpu format
             .tiling = .optimal,
@@ -1964,8 +1964,8 @@ const GpuBuffer = struct {
         defer zone.end();
 
         const usage = config.usage.merge(switch (config.access) {
-            .gpu => .{ .transfer_dst_bit = true },
-            .cpu => .{ .transfer_src_bit = true },
+            .gpu => .{ .transfer_dst = true },
+            .cpu => .{ .transfer_src = true },
             .cpu_gpu => .{},
         });
 
@@ -1979,9 +1979,9 @@ const GpuBuffer = struct {
         // const mem_requirements = gc.device.getBufferMemoryRequirements(buffer);
         //
         // const properties: vk.MemoryPropertyFlags = switch (config.access) {
-        //     .cpu => .{ .host_visible_bit = true, .host_coherent_bit = true },
-        //     .gpu => .{ .device_local_bit = true },
-        //     .cpu_gpu => .{ .host_visible_bit = true, .host_coherent_bit = true, .device_local_bit = true },
+        //     .cpu => .{ .host_visible = true, .host_coherent = true },
+        //     .gpu => .{ .device_local = true },
+        //     .cpu_gpu => .{ .host_visible = true, .host_coherent = true, .device_local = true },
         // };
         // const alloc_info: vk.MemoryAllocateInfo = .{
         //     .allocation_size = mem_requirements.size,

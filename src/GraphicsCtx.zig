@@ -39,7 +39,7 @@ pub fn init(
     const instance: vk.InstanceProxy = .init(instance_handle, instance_dispatch);
 
     var window_surface: vk.SurfaceKHR = undefined;
-    if (!c.SDL_Vulkan_CreateSurface(window, @ptrFromInt(@intFromEnum(instance_handle)), null, @ptrCast(&window_surface))) return error.engine_init_failure;
+    if (!c.SDL_Vulkan_CreateSurface(window, @ptrCast(instance_handle), null, @ptrCast(&window_surface))) return error.engine_init_failure;
 
     const physical_device = try pickPhysicalDevice(scratch, instance, window_surface);
 
@@ -62,9 +62,9 @@ pub fn init(
             _ = .{ message_types, p_user_data };
             const callback_data = p_callback_data orelse @panic("");
             const message = std.mem.span(callback_data.p_message orelse "no message");
-            if (message_severity.error_bit_ext) {
+            if (message_severity.error_ext) {
                 std.log.err("Validation: {s}", .{message});
-            } else if (message_severity.warning_bit_ext) {
+            } else if (message_severity.warning_ext) {
                 std.log.warn("Validation: {s}", .{message});
             } else {
                 std.log.info("Validation: {s}", .{message});
@@ -75,17 +75,17 @@ pub fn init(
     };
 
     const debug_messenger_info: vk.DebugUtilsMessengerCreateInfoEXT = .{
-        .message_severity = .{ .verbose_bit_ext = true, .warning_bit_ext = true, .error_bit_ext = true },
-        .message_type = .{ .general_bit_ext = true, .validation_bit_ext = true, .performance_bit_ext = true },
+        .message_severity = .{ .verbose_ext = true, .warning_ext = true, .error_ext = true },
+        .message_type = .{ .general_ext = true, .validation_ext = true, .performance_ext = true },
         .pfn_user_callback = debug_callback.debugCallback,
     };
     const debug_messenger = try instance.createDebugUtilsMessengerEXT(&debug_messenger_info, null);
 
     var vma_allocator: c.VmaAllocator = undefined;
     if (c.vmaCreateAllocator(&.{
-        .physicalDevice = @ptrFromInt(@intFromEnum(physical_device)),
-        .device = @ptrFromInt(@intFromEnum(device_handle)),
-        .instance = @ptrFromInt(@intFromEnum(instance_handle)),
+        .physicalDevice = @ptrCast(physical_device),
+        .device = @ptrCast(device_handle),
+        .instance = @ptrCast(instance_handle),
         .flags = c.VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
         .pVulkanFunctions = &c.VmaVulkanFunctions{
             .vkGetDeviceProcAddr = @ptrCast(instance_dispatch.dispatch.vkGetDeviceProcAddr),
@@ -99,7 +99,7 @@ pub fn init(
     const push_range: vk.PushConstantRange = .{
         .offset = 0,
         .size = @sizeOf(GPUDrawPushConstants),
-        .stage_flags = .{ .vertex_bit = true, .fragment_bit = true },
+        .stage_flags = .{ .vertex = true, .fragment = true },
     };
     const bindless_pipeline_layout = try device.createPipelineLayout(&.{
         .set_layout_count = 1,
@@ -153,11 +153,11 @@ pub const ImmSubmit = struct {
         queues: Queues,
     ) !ImmSubmit {
         const command_pool_info: vk.CommandPoolCreateInfo = .{
-            .flags = .{ .reset_command_buffer_bit = true },
+            .flags = .{ .reset_command_buffer = true },
             .queue_family_index = queues.families.graphics,
         };
 
-        const fence_create_info: vk.FenceCreateInfo = .{ .flags = .{ .signaled_bit = true } };
+        const fence_create_info: vk.FenceCreateInfo = .{ .flags = .{ .signaled = true } };
 
         const imm_command_pool = try device.createCommandPool(&command_pool_info, null);
 
@@ -254,7 +254,7 @@ pub const BindlessDescriptors = struct {
             .{ .type = .combined_image_sampler, .descriptor_count = max_textures },
         };
         const pool = try device.createDescriptorPool(&.{
-            .flags = .{ .update_after_bind_bit = true },
+            .flags = .{ .update_after_bind = true },
             .max_sets = 1,
             .pool_size_count = pool_sizes.len,
             .p_pool_sizes = &pool_sizes,
@@ -264,11 +264,11 @@ pub const BindlessDescriptors = struct {
             .binding = 0,
             .descriptor_type = .combined_image_sampler,
             .descriptor_count = max_textures,
-            .stage_flags = .{ .fragment_bit = true },
+            .stage_flags = .{ .fragment = true },
             .p_immutable_samplers = null,
         }};
         const binding_flags = [_]vk.DescriptorBindingFlags{
-            .{ .partially_bound_bit = true, .update_after_bind_bit = true },
+            .{ .partially_bound = true, .update_after_bind = true },
         };
         const flags_info: vk.DescriptorSetLayoutBindingFlagsCreateInfo = .{
             .binding_count = binding_flags.len,
@@ -276,7 +276,7 @@ pub const BindlessDescriptors = struct {
         };
         const layout = try device.createDescriptorSetLayout(&.{
             .p_next = &flags_info,
-            .flags = .{ .update_after_bind_pool_bit = true },
+            .flags = .{ .update_after_bind_pool = true },
             .binding_count = bindings.len,
             .p_bindings = &bindings,
         }, null);
@@ -511,7 +511,7 @@ pub fn findQueueFamilies(
 
     var graphics_family: ?u32 = null;
     for (queue_families, 0..) |family, i| {
-        if (family.queue_flags.graphics_bit) {
+        if (family.queue_flags.graphics) {
             graphics_family = @intCast(i);
             break;
         }
@@ -530,7 +530,7 @@ pub fn findQueueFamilies(
 
     var compute: u32 = graphics;
     for (queue_families, 0..) |family, i| {
-        if (family.queue_flags.compute_bit and !family.queue_flags.graphics_bit) {
+        if (family.queue_flags.compute and !family.queue_flags.graphics) {
             compute = @intCast(i);
             break;
         }
@@ -538,9 +538,9 @@ pub fn findQueueFamilies(
 
     var transfer: u32 = compute;
     for (queue_families, 0..) |family, i| {
-        if (family.queue_flags.transfer_bit and
-            !family.queue_flags.graphics_bit and
-            !family.queue_flags.compute_bit)
+        if (family.queue_flags.transfer and
+            !family.queue_flags.graphics and
+            !family.queue_flags.compute)
         {
             transfer = @intCast(i);
             break;

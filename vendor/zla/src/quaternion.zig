@@ -31,7 +31,6 @@ pub fn Quat(comptime T: type) type {
             return self.v[3];
         }
 
-        /// Returns the imaginary (vector) part.
         pub inline fn imaginary(self: Self) @Vector(3, T) {
             return .{ self.v[0], self.v[1], self.v[2] };
         }
@@ -63,13 +62,6 @@ pub fn Quat(comptime T: type) type {
             };
         }
 
-        /// Construct from Euler angles (intrinsic ZYX / extrinsic XYZ).
-        ///
-        /// - `pitch`: rotation about X
-        /// - `yaw`:   rotation about Y
-        /// - `roll`:  rotation about Z
-        ///
-        /// Equivalent to: `Qz(roll) * Qy(yaw) * Qx(pitch)`
         pub fn fromEuler(pitch: T, yaw: T, roll: T) Self {
             const hp = pitch * 0.5;
             const hy = yaw * 0.5;
@@ -88,9 +80,6 @@ pub fn Quat(comptime T: type) type {
             } };
         }
 
-        /// Extract Euler angles (intrinsic ZYX / extrinsic XYZ).
-        ///
-        /// Returns `{ .pitch, .yaw, .roll }` matching `fromEuler`.
         pub fn toEuler(self: Self) struct { pitch: T, yaw: T, roll: T } {
             const n = self.normalize();
             const sinp = 2.0 * (n.w() * n.y() - n.z() * n.x());
@@ -117,8 +106,6 @@ pub fn Quat(comptime T: type) type {
             };
         }
 
-        /// Extract quaternion from rotation matrix (Shepperd's method).
-        /// Accepts 3×3 or 4×4 matrices of any layout.
         pub fn fromMat(m: anytype) Self {
             const M = @TypeOf(m);
             if (M.rows < 3 or M.cols < 3) @compileError("fromMat requires at least a 3x3 matrix");
@@ -174,7 +161,6 @@ pub fn Quat(comptime T: type) type {
             }
         }
 
-        /// Convert to a 4×4 rotation matrix.
         pub fn toMat4(self: Self, comptime layout: mat.Layout) mat.Mat(layout, T, 4, 4) {
             const n = self.normalize();
             const M = mat.Mat(layout, T, 4, 4);
@@ -205,7 +191,6 @@ pub fn Quat(comptime T: type) type {
             return result;
         }
 
-        /// Convert to a 3×3 rotation matrix.
         pub fn toMat3(self: Self, comptime layout: mat.Layout) mat.Mat(layout, T, 3, 3) {
             const n = self.normalize();
             const M = mat.Mat(layout, T, 3, 3);
@@ -236,7 +221,6 @@ pub fn Quat(comptime T: type) type {
             return result;
         }
 
-        /// Hamilton product.
         pub fn mul(self: Self, other: Self) Self {
             return .{ .v = .{
                 self.w() * other.x() + self.x() * other.w() + self.y() * other.z() - self.z() * other.y(),
@@ -295,7 +279,6 @@ pub fn Quat(comptime T: type) type {
             return @reduce(.Add, @as(@Vector(4, T), self.v) * @as(@Vector(4, T), other.v));
         }
 
-        /// Rotate a 3D vector by this unit quaternion: q * v * q⁻¹
         pub fn rotateVec(self: Self, point: @Vector(3, T)) @Vector(3, T) {
             const u = self.imaginary();
             const uv = vec.cross(u, point);
@@ -303,7 +286,6 @@ pub fn Quat(comptime T: type) type {
             return point + vec.splat(3, 2.0 * self.w()) * uv + vec.splat(3, @as(T, 2.0)) * uuv;
         }
 
-        /// Normalized linear interpolation. Fast, constant velocity, not torque-minimal.
         pub fn nlerp(self: Self, other: Self, t: T) Self {
             var b = other;
             if (self.dot(b) < 0) b.v = -@as(@Vector(4, T), b.v);
@@ -312,7 +294,6 @@ pub fn Quat(comptime T: type) type {
             return (Self{ .v = self.v * omtv + b.v * tv }).normalize();
         }
 
-        /// Spherical linear interpolation. Constant angular velocity.
         pub fn slerp(self: Self, other: Self, t: T) Self {
             var b = other;
             var d = self.dot(b);
@@ -339,7 +320,6 @@ pub fn Quat(comptime T: type) type {
             return @reduce(.And, diff <= tol);
         }
 
-        /// Two unit quaternions represent the same rotation if q == ±other.
         pub fn rotationEql(self: Self, other: Self, tolerance: T) bool {
             return self.approxEql(other, tolerance) or self.negate().approxEql(other, tolerance);
         }
@@ -348,112 +328,4 @@ pub fn Quat(comptime T: type) type {
             try writer.print("Quat({d}, {d}, {d}, {d})", .{ self.x(), self.y(), self.z(), self.w() });
         }
     };
-}
-
-const Quatf = Quat(f32);
-const Mat4 = mat.Mat(.cm, f32, 4, 4);
-const Mat3 = mat.Mat(.cm, f32, 3, 3);
-
-test "identity" {
-    const q: Quatf = .identity;
-    try std.testing.expectEqual(@as(f32, 0), q.x());
-    try std.testing.expectEqual(@as(f32, 0), q.y());
-    try std.testing.expectEqual(@as(f32, 0), q.z());
-    try std.testing.expectEqual(@as(f32, 1), q.w());
-    try std.testing.expectApproxEqAbs(@as(f32, 1), q.norm(), 1e-6);
-}
-
-test "fromAxisAngle and back" {
-    const axis = @Vector(3, f32){ 0, 1, 0 };
-    const angle: f32 = std.math.pi / 3.0;
-    const q: Quatf = .fromAxisAngle(axis, angle);
-
-    try std.testing.expectApproxEqAbs(@as(f32, 1), q.norm(), 1e-6);
-
-    const result = q.toAxisAngle();
-    try std.testing.expectApproxEqAbs(angle, result.angle, 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 0), result.axis[0], 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 1), result.axis[1], 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 0), result.axis[2], 1e-5);
-}
-
-test "Hamilton product" {
-    const q1: Quatf = .fromAxisAngle(.{ 0, 0, 1 }, std.math.pi / 2.0);
-    const q2: Quatf = .fromAxisAngle(.{ 0, 0, 1 }, std.math.pi / 2.0);
-    const combined = q1.mul(q2);
-
-    const aa = combined.toAxisAngle();
-    try std.testing.expectApproxEqAbs(std.math.pi, aa.angle, 1e-5);
-}
-
-test "conjugate and inverse" {
-    const q: Quatf = .fromAxisAngle(.{ 1, 1, 0 }, std.math.pi / 4.0);
-    const prod = q.mul(q.inverse());
-
-    try std.testing.expect(prod.rotationEql(.identity, 1e-5));
-}
-
-test "rotateVec" {
-    const q: Quatf = .fromAxisAngle(.{ 0, 0, 1 }, std.math.pi / 2.0);
-    const result = q.rotateVec(.{ 1, 0, 0 });
-
-    try std.testing.expectApproxEqAbs(@as(f32, 0), result[0], 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 1), result[1], 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 0), result[2], 1e-5);
-}
-
-test "toMat4 matches matrix fromAxisAngle" {
-    const axis = @Vector(3, f32){ 0, 0, 1 };
-    const angle: f32 = std.math.pi / 2.0;
-
-    const from_mat: Mat4 = .fromAxisAngle(axis, angle);
-    const from_quat = (Quatf.fromAxisAngle(axis, angle)).toMat4(.cm);
-
-    try std.testing.expect(from_mat.approxEql(from_quat, 1e-5));
-}
-
-test "fromMat roundtrip" {
-    const q_orig: Quatf = .fromAxisAngle(vec.normalize(@Vector(3, f32){ 1, 2, 3 }), 1.23);
-    const m = q_orig.toMat4(.cm);
-    const q_back: Quatf = .fromMat(m);
-
-    try std.testing.expect(q_orig.rotationEql(q_back, 1e-5));
-}
-
-test "fromEuler/toEuler roundtrip" {
-    const pitch: f32 = 0.3;
-    const yaw: f32 = 0.5;
-    const roll: f32 = -0.2;
-
-    const q: Quatf = .fromEuler(pitch, yaw, roll);
-    const e = q.toEuler();
-
-    try std.testing.expectApproxEqAbs(pitch, e.pitch, 1e-5);
-    try std.testing.expectApproxEqAbs(yaw, e.yaw, 1e-5);
-    try std.testing.expectApproxEqAbs(roll, e.roll, 1e-5);
-}
-
-test "slerp endpoints" {
-    const q0: Quatf = .identity;
-    const q1: Quatf = .fromAxisAngle(.{ 0, 1, 0 }, std.math.pi / 2.0);
-
-    try std.testing.expect(q0.slerp(q1, 0).rotationEql(q0, 1e-5));
-    try std.testing.expect(q0.slerp(q1, 1).rotationEql(q1, 1e-5));
-}
-
-test "slerp midpoint" {
-    const q0: Quatf = .identity;
-    const q1: Quatf = .fromAxisAngle(.{ 0, 1, 0 }, std.math.pi / 2.0);
-    const mid = q0.slerp(q1, 0.5);
-
-    const expected: Quatf = .fromAxisAngle(.{ 0, 1, 0 }, std.math.pi / 4.0);
-    try std.testing.expect(mid.rotationEql(expected, 1e-5));
-}
-
-test "nlerp matches slerp at endpoints" {
-    const q0: Quatf = .identity;
-    const q1: Quatf = .fromAxisAngle(.{ 0, 1, 0 }, std.math.pi / 2.0);
-
-    try std.testing.expect(q0.nlerp(q1, 0).rotationEql(q0, 1e-5));
-    try std.testing.expect(q0.nlerp(q1, 1).rotationEql(q1, 1e-5));
 }

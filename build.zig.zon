@@ -2,27 +2,27 @@
     .name = .vulkan_tutorial,
     .version = "0.0.0",
     .fingerprint = 0xe6a82ece1521df, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0-dev.3073",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .vulkan_headers = .{
             .url = "git+https://github.com/KhronosGroup/Vulkan-Headers?ref=v1.4.326#d1cd37e925510a167d4abef39340dbdea47d8989",
             .hash = "N-V-__8AAESg9gHKzlANbo03d4Fcb5m_5aZXJXIhYbWzCe4G",
         },
         .vulkan = .{
-            .url = "git+https://github.com/Snektron/vulkan-zig#3adbeefbc833c12656791d304b37a6315b357745",
-            .hash = "vulkan-0.0.0-r7YtxyBsAwD35FvkFhT2xruTNdCByD3TtGw44XWtfun8",
+            .url = "git+https://github.com/Snektron/vulkan-zig#f9688c6f4ebcb930f67044698ddd1322442e714b",
+            .hash = "vulkan-0.0.0-r7Ytx4yGAwDZf0XsT6_L1ol_XUAkyOgOyBqamf8begA0",
         },
         .VulkanMemoryAllocator = .{
             .url = "git+https://github.com/johan0A/VulkanMemoryAllocator#fc1e14f1857c7729db3e92ccd327ee15f96bb11a",
             .hash = "VulkanMemoryAllocator-0.2.0+3.3.0-eK3SgcwSAADf08TGJbYejvFtCCOjkajwTBCYNLJv5KLO",
         },
         .sdl = .{
-            .url = "git+https://github.com/castholm/SDL#1994ca5dbad5a3e3c670a9ab8533d86cfd97bdc0",
-            .hash = "sdl-0.2.6+3.2.20-7uIn9NgjfwHH5a6HhyLHat2nHU3OP5B05QHhKJKuxEex",
+            .url = "git+https://github.com/castholm/SDL#b72b3671502a70e109350ecac90afdc480dcfcc6",
+            .hash = "sdl-0.5.4+3.4.16-SDL--sQ4qAH3kwC19Zs1kxdHplaSDnWl2MUptZD4AItI",
         },
         .tracy = .{
-            .url = "git+https://github.com/johan0A/zig-tracy#4ee06c3d21c13b9863f6fd5c283c4bf6be1f7366",
-            .hash = "tracy-0.13.1-bsH_aofjGQA4Upf_dRTAeCIBjiHhc_ETd4k-ddcwPyeV",
+            .url = "git+https://github.com/johan0A/zig-tracy#e90857ca8d2585402b2b9efaa2e7ba3812b33989",
+            .hash = "tracy-0.13.1-bsH_arXjGQAVua45U_635KvhMcz4RhYyTSurvMnMoaIV",
         },
         .zig_slang_binaries = .{ // TODO: dont vendor it after this is fixed: https://github.com/ziglang/zig/issues/25527
             .path = "vendor/zig-slang-binaries",
